@@ -1,0 +1,11 @@
+# Steam 鉴赏家浏览量预测与受控提升系统依赖清单
+# 安装：pip install -r requirements.txt
+
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+PyYAML>=6.0
+
+# 可选依赖：onepush（多平台推送）。当前版本通知直接使用 requests 调用
+# ntfy，无需安装；如需通过 onepush 对接其他推送渠道可取消注释。
+# onepush>=1.4.1
