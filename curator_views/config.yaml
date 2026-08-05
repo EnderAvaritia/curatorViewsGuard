@@ -27,6 +27,12 @@ ntfy_topic: ""
 # 是否启用每日受控提升；命令行 --no-boost 可临时关闭
 boost_enabled: true
 
+# 执行器子进程命令（可选，调度器/执行器分离）。
+# 支持占位符: {config} 配置文件路径, {need} 目标刷量, {apps} 推荐数量。
+# 留空则在同一进程内直接调用 Booster（向后兼容）。
+# 示例: python cli.py boost --config {config} --target {need} --apps {apps}
+executor_cmd: ""
+
 # ── 预测参数 ──────────────────────────────────────────────────────────────
 
 # 中位数计算窗口（天数）

@@ -6,6 +6,10 @@ beautifulsoup4>=4.12.0
 lxml>=4.9.0
 PyYAML>=6.0
 
+# 时区数据：Windows / 精简 Linux 环境缺少系统时区库时，
+# zoneinfo("Asia/Shanghai") 需要 tzdata 提供 IANA 时区表
+tzdata>=2024.1
+
 # 可选依赖：onepush（多平台推送）。当前版本通知直接使用 requests 调用
 # ntfy，无需安装；如需通过 onepush 对接其他推送渠道可取消注释。
 # onepush>=1.4.1

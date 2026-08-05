@@ -287,7 +287,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     booster = _make_booster(cfg, clan_id, cookie_file, proxy, storage)
 
     sched_cfg = _scheduler_config(cfg, boost_enabled, args.dry_run)
-    summary = run_daily(storage, fetcher, notifier, booster, sched_cfg)
+    executor_cmd = str(cfg.get("executor_cmd", "") or "")
+    summary = run_daily(
+        storage,
+        fetcher,
+        notifier,
+        booster,
+        sched_cfg,
+        executor_cmd=executor_cmd,
+        config_path=str(config_path),
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 

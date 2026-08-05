@@ -43,26 +43,29 @@ def detect_overflow(
     算法要点：
         1. 仅处理同时存在于 history（actual）与 predictions（expected）
            的日期；缺失任一方的日期不参与检测。
-        2. 按时间顺序统计连续候选天数：连续候选达到 consecutive_days
-           时，当前日及其后的连续候选日均标记为 flagged=True。
-           一段连续候选的首个日期因“前一天”不是候选而不被标记。
+        2. 按时间顺序统计连续候选天数：当连续候选达到 consecutive_days
+           时，该连续段内的**全部**候选日均标记为 flagged=True
+           （含连续段的起始日，因为“溢出量 = 这些天的超出部分之和”）。
     """
     if consecutive_days < 1:
         raise ValueError("consecutive_days 必须大于等于 1")
 
     results: list[dict] = []
     candidate_run = 0
+    # 记录当前连续候选段在 results 中的索引，段达标后整段标记 flagged
+    run_indices: list[int] = []
     for item in history:
         date_ts = item["date_ts"]
         expected = predictions.get(date_ts)
         if expected is None:
             # 当日缺少预测值：不参与检测，同时中断连续候选计数
             candidate_run = 0
+            run_indices.clear()
             continue
 
         actual = item["num_views"]
         is_candidate = actual > expected * (1.0 + k)
-        candidate_run = candidate_run + 1 if is_candidate else 0
+        idx = len(results)
         results.append(
             {
                 "date_ts": date_ts,
@@ -70,9 +73,20 @@ def detect_overflow(
                 "expected": expected,
                 "overflow_amount": float(actual - expected),
                 "candidate": is_candidate,
-                "flagged": is_candidate and candidate_run >= consecutive_days,
+                "flagged": False,
             }
         )
+        if is_candidate:
+            candidate_run += 1
+            run_indices.append(idx)
+            if candidate_run >= consecutive_days:
+                # 连续候选达标：该段内全部候选日均标记为恶意刷量，
+                # 使“溢出量 = 连续异常日超出部分之和”完整成立。
+                for run_idx in run_indices:
+                    results[run_idx]["flagged"] = True
+        else:
+            candidate_run = 0
+            run_indices.clear()
 
     return results
 

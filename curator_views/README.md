@@ -10,6 +10,8 @@
 - 浏览量预测：自适应中位数窗口 + 封顶线性趋势回归，启动阶段保守系数抑制误判；
 - 反作弊检测：连续多日超过预期阈值时标记恶意刷量，溢出量自动分摊到后续日期；
 - 受控提升：分批、限速、单 App 上限、按目标比例提前停止，尽量模拟自然流量；
+- 调度器/执行器分离：默认同进程直调 Booster，也可配置 `executor_cmd` 以独立
+  子进程方式唤起执行器刷量（调度器崩了不影响执行器，执行器可被手动单独触发）；
 - 每日完整流程：抓取统计 -> 入库 -> 预测 -> 溢出检测 -> 计算缺口 -> 提升 -> 通知；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
 - 只读检查与数据导出：随时查看最近 7 天与预测摘要，或导出历史统计数据。
@@ -69,6 +71,14 @@ python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no
 - `--dry-run`：演练模式，计算一切但实际不发送提升请求；
 - `--boost`：强制启用提升；`--no-boost`：强制关闭提升（优先于配置）。
 
+### 调度器 / 执行器分离
+
+默认情况下 `run` 在同一进程内直接调用 Booster 刷量。若在 `config.yaml` 中配置
+`executor_cmd`（如 `python cli.py boost --config {config} --target {need} --apps {apps}`），
+`run`（调度器）会把计算出的任务下发给独立执行器子进程执行，执行器完成后
+调度器解析其 JSON 输出（`boosted` 字段）并计入每日简报。两种模式可随时切换，
+执行器也可手动单独触发。
+
 ### check
 
 只读检查：抓取统计数据，打印最近 7 天浏览量与预测摘要。不会产生任何写入
@@ -121,6 +131,7 @@ python curator_views/cli.py version
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
+| `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
 | `trend_cap` | `0.15` | 趋势斜率相对中位数的封顶比例 |
 | `startup_factor` | `0.9` | 启动阶段保守系数 |
