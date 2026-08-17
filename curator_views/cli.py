@@ -107,15 +107,35 @@ exclude_flagged: true
 # 让浏览曲线在无注入的情况下自然回落到真实水平
 cooldown_days: 7
 
+# 双基线检测：长期基线窗口（天数）。即使短期预期被虚高数据污染，
+# 长期基线仍作为独立参照，防止"平台抬升"型刷量漏检
+baseline_days: 60
+
+# 持续上升斜率检测：最近多少天内斜率超过 中位数×slope_threshold 即标记，
+# 防每天温和爬升（单日永不超阈值）的慢性注入
+slope_days: 14
+slope_threshold: 0.02
+
 # ── 基线 / 波动率（可选）──────────────────────────────────────────────────
 
-# 手动基线浏览量：大于 0 时直接使用该固定值作为目标（替代自动预测），
+# 手动基线浏览量：大于 0 时直接使用该固定值作为基准目标（替代自动预测），
 # 例如希望浏览量稳定在 1000 左右就填 1000；为 0 或留空时使用自动预测
 # （中位数 + 趋势）。手动基线模式下溢出检测也以该固定值为参照。
 baseline_views: 0
 
+# 模式切换：stable = 维持稳定（补缺口到基准目标）；growth = 刷量
+# （目标 = 基准 × growth_factor，主动把浏览量刷到更高水平）。
+# 刷量请优先配合 baseline_views 使用（刷到固定目标后稳定）；
+# 若使用自动预测，目标会随中位数水涨船高而持续爬升，慎用。
+boost_mode: stable
+
+# growth 模式下的目标倍率：1.5 表示目标 = 基准 × 1.5。
+# stable 模式下该值不生效。倍率不宜过大，否则曲线形态异常仍可能被
+# Steam 风控察觉。
+growth_factor: 1.5
+
 # 刷量波动率（0~0.3，建议 ≤ 0.15）：每天实际提升量在
-# 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在基线附近自然上下波动，
+# 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在目标附近自然上下波动，
 # 避免收敛成一条笔直的线而显得不自然。过大易触发反作弊误判。
 volatility: 0.10
 
@@ -253,7 +273,12 @@ def _scheduler_config(
         "absorb_days": int(cfg.get("absorb_days", 3)),
         "exclude_flagged": bool(cfg.get("exclude_flagged", True)),
         "cooldown_days": int(cfg.get("cooldown_days", 7)),
+        "baseline_days": int(cfg.get("baseline_days", 60)),
+        "slope_days": int(cfg.get("slope_days", 14)),
+        "slope_threshold": float(cfg.get("slope_threshold", 0.02)),
         "baseline_views": float(cfg.get("baseline_views", 0) or 0),
+        "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
+        "growth_factor": float(cfg.get("growth_factor", 1.0) or 1.0),
         "volatility": float(cfg.get("volatility", 0) or 0),
         "boost_n": int(cfg.get("boost_n", 5)),
         "single_cap": int(cfg.get("single_cap", 300)),

@@ -221,6 +221,73 @@ class TestCooldown:
         assert booster.last_target is not None
 
 
+class TestGrowthMode:
+    def test_growth_mode_multiplies_manual_baseline(self):
+        # manual 基线 200 + growth 1.5 → 目标 300；昨日实际 100 → 缺口 200
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_mode="growth",
+            growth_factor=1.5,
+        )
+        assert summary["boost_mode"] == "growth"
+        assert summary["today_expected"] == 300  # 200 × 1.5
+        assert summary["need"] == 200
+        assert booster.last_target == 200
+
+    def test_stable_mode_ignores_growth_factor(self):
+        # stable 模式 + growth_factor 配置 → 倍率不生效，目标 = 基线
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_mode="stable",
+            growth_factor=1.5,
+        )
+        assert summary["boost_mode"] == "stable"
+        assert summary["today_expected"] == 200
+        assert summary["need"] == 100
+
+    def test_growth_mode_with_auto_prediction(self):
+        # auto 预测（30 天 100 → expected=100）× growth 1.5 → 目标 150
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            boost_mode="growth",
+            growth_factor=1.5,
+        )
+        assert summary["today_expected"] == 150
+        assert summary["need"] == 50
+
+    def test_growth_does_not_flag_own_boost(self):
+        # growth 模式下检测参照同步抬高：曲线被刷到 300（目标=300）不会
+        # 被自己的反作弊标记为恶意刷量
+        stats = make_stats([300] * 30)  # 曲线已稳定在被刷高的水平
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_mode="growth",
+            growth_factor=1.5,
+            consecutive_days=2,
+        )
+        assert summary["today_expected"] == 300
+        assert summary["overflow_flag_count"] == 0
+        assert summary["in_cooldown"] is False
+
+
 class TestFlaggedExclusion:
     def _make_attack_history(self):
         """25 天 100 + 连续 3 天被刷到 250（连续候选 → 全部标记）。"""

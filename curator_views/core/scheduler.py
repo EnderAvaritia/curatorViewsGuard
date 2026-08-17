@@ -19,10 +19,15 @@ import random
 import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from typing import Any, Dict, List
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .anti_cheat import compute_deductions, detect_overflow
+from .anti_cheat import (
+    compute_deductions,
+    detect_drift,
+    detect_overflow,
+)
 from .booster import Booster
 from .fetcher import Fetcher
 from .notifier import Notifier
@@ -171,19 +176,31 @@ def run_daily(
         window_days, trend_cap, startup_factor, trend_min_points,
         outlier_k, consecutive_days, absorb_days,
         boost_n, single_cap, batch_size, target_ratio,
-        baseline_views, volatility, cooldown_days, exclude_flagged,
+        baseline_views, boost_mode, growth_factor,
+        volatility, cooldown_days, exclude_flagged,
+        baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool)
     其中 single_cap / batch_size / target_ratio 会应用到传入的 Booster
     实例（以 config 为准），其余作为预测/检测参数直接传入。
 
     baseline_views：
-        大于 0 时启用手动基线模式：今日期望直接用该固定值，替代自动预测
+        大于 0 时启用手动基线模式：基准目标直接用该固定值，替代自动预测
         （中位数+趋势）。溢出检测的参照也使用该固定值，天然免疫被污染。
         为 0 或未配置时使用自动预测。
 
+    boost_mode / growth_factor：
+        统一的目标计算层：target = 基准 × 倍率。
+        - stable（默认）：倍率恒为 1，维持稳定（补缺口到预测/基线水平）；
+        - growth：倍率为 growth_factor（如 1.5 = 目标比基准高 50%），
+          主动把浏览量刷到更高水平。
+        检测参照与补缺口目标同步使用 target，避免 growth 模式把自己刷的
+        量误判为恶意刷量。注意：growth 模式配手动基线（baseline_views）
+        可刷到固定目标后稳定；配自动预测时目标随中位数水涨船高，会持续
+        爬升，慎用。
+
     volatility：
         刷量波动率（0~0.3，建议 ≤0.15）。>0 时每日实际提升目标在
-        「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕基线自然波动，
+        「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕目标自然波动，
         避免收敛成一条直线。
 
     cooldown_days：
@@ -193,6 +210,11 @@ def run_daily(
     exclude_flagged：
         为 True 时，被标记为恶意刷量的日期不参与预测（剔除出中位数窗口），
         防止虚高数据污染基线；检测/预测迭代至多 3 轮直至标记集收敛。
+
+    baseline_days / slope_days / slope_threshold：
+        双基线检测参数。baseline_days 为长期基线窗口（默认 60 天）；
+        slope_days 与 slope_threshold 为持续上升斜率检测参数
+        （默认最近 14 天斜率 > 中位数 × 2%/天 即标记）。
 
     executor_cmd：
         非空时，刷量通过独立执行器子进程完成（调度器/执行器分离，
@@ -209,9 +231,14 @@ def run_daily(
     absorb_days = int(config.get("absorb_days", 3))
     boost_n = int(config.get("boost_n", 5))
     baseline_views = float(config.get("baseline_views", 0) or 0)
+    boost_mode = str(config.get("boost_mode", "stable")).lower()
+    growth_factor = float(config.get("growth_factor", 1.0) or 1.0)
     volatility = float(config.get("volatility", 0) or 0)
     cooldown_days = int(config.get("cooldown_days", 7))
     exclude_flagged = bool(config.get("exclude_flagged", True))
+    baseline_days = int(config.get("baseline_days", 60))
+    slope_days = int(config.get("slope_days", 14))
+    slope_threshold = float(config.get("slope_threshold", 0.02))
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
 
@@ -256,9 +283,12 @@ def run_daily(
     # 3. 逐日预测 + 异常溢出检测。
     #    被标记为恶意刷量的日期不参与预测（剔除出中位数窗口），防止虚高
     #    数据污染基线；标记集单调累加（只增不减），无新标记即收敛，
-    #    至多迭代 3 轮。手动基线模式（baseline_views > 0）下，预测参照
-    #    直接用固定基线，天然免疫被污染。
+    #    至多迭代 3 轮。
+    #    目标 = 基准 × 倍率：stable 模式倍率为 1（维持稳定）；growth 模式
+    #    倍率为 growth_factor（主动刷高）。检测参照与补缺口目标统一用
+    #    目标值，避免 growth 模式把自己刷的量误判为恶意刷量。
     manual_baseline = baseline_views > 0
+    multiplier = growth_factor if boost_mode == "growth" else 1.0
     confirmed_flagged: set[int] = set()
     history_clean = history_sorted
     overflow: list[dict] = []
@@ -268,10 +298,24 @@ def run_daily(
         history_clean = [
             d for d in history_sorted if d["date_ts"] not in confirmed_flagged
         ]
+        # 长期基线（更长窗口的中位数）：即使短期预期被污染，仍是独立参照
+        long_baseline: float | None = None
+        if baseline_days > 0 and history_clean:
+            base_window = history_clean[-min(len(history_clean), baseline_days):]
+            long_baseline = median(d["num_views"] for d in base_window)
+        # 持续上升斜率检测：慢性爬升型刷量（需要长期基线参照，防止
+        # 把真实增长误判为异常）
+        drift_days = detect_drift(
+            history_clean,
+            slope_days=slope_days,
+            slope_threshold=slope_threshold,
+            long_baseline=long_baseline,
+            k=outlier_k,
+        )
         predictions: Dict[int, float] = {}
         for i, day in enumerate(history_clean):
             if manual_baseline:
-                predictions[day["date_ts"]] = baseline_views
+                predictions[day["date_ts"]] = baseline_views * multiplier
             else:
                 pred = predict_expected(
                     history_clean[: i + 1],
@@ -280,9 +324,11 @@ def run_daily(
                     startup_factor=startup_factor,
                     trend_min_points=trend_min_points,
                 )
-                predictions[day["date_ts"]] = float(pred["expected"])
+                predictions[day["date_ts"]] = float(pred["expected"]) * multiplier
         overflow = detect_overflow(
             history_clean, predictions, outlier_k, consecutive_days,
+            long_baseline=long_baseline,
+            extra_candidates=drift_days,
         )
         if not first_overflow:
             first_overflow = overflow
@@ -300,7 +346,7 @@ def run_daily(
         d for d in history_clean if d["date_ts"] < today_ts
     ]
     if manual_baseline:
-        today_expected = baseline_views
+        base_expected = baseline_views
         startup_applied = False
     else:
         today_pred = predict_expected(
@@ -310,8 +356,9 @@ def run_daily(
             startup_factor=startup_factor,
             trend_min_points=trend_min_points,
         )
-        today_expected = float(today_pred["expected"])
+        base_expected = float(today_pred["expected"])
         startup_applied = bool(today_pred.get("startup_applied", False))
+    today_expected = base_expected * multiplier
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
     #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
@@ -359,6 +406,9 @@ def run_daily(
         "program_start": program_start,
         "startup_applied": startup_applied,
         "baseline_mode": "manual" if manual_baseline else "auto",
+        "boost_mode": boost_mode,
+        "growth_factor": growth_factor,
+        "today_target": round(today_expected, 1),
         "volatility": volatility,
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,

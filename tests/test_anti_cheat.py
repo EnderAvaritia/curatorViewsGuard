@@ -180,3 +180,84 @@ def test_detect_then_deduct_integration():
         BASE_TS + 4 * DAY: pytest.approx(140.0),
         BASE_TS + 5 * DAY: pytest.approx(73.3),
     }
+
+
+# ── detect_overflow：双基线 / 额外候选 ────────────────────────────────────
+
+
+def test_long_baseline_catches_platform_rise():
+    # 预期被虚高数据抬高（expected=300），相对预期不超额；
+    # 但长期基线仍为 100 → 平台抬升被独立参照捕获
+    h = hist([300, 300, 300])
+    p = preds([300] * 3)
+    result = anti_cheat.detect_overflow(h, p, long_baseline=100.0)
+    # 300 > 100 × 1.3 = 130 → 全部候选；连续 3 天 → 全部标记
+    assert [r["candidate"] for r in result] == [True, True, True]
+    assert [r["flagged"] for r in result] == [True, True, True]
+
+
+def test_long_baseline_not_triggered_when_close():
+    # 实际 120，长期基线 100：120 > 130 不成立 → 不候选
+    h = hist([120, 118, 121])
+    p = preds([120, 118, 121])
+    result = anti_cheat.detect_overflow(h, p, long_baseline=100.0)
+    assert all(r["candidate"] is False for r in result)
+
+
+def test_extra_candidates_force_candidate():
+    # extra_candidates 中的日期强制为候选：相对预期与长期基线均不命中
+    h = hist([100, 105, 103])
+    p = preds([100] * 3)
+    extra = {BASE_TS + DAY, BASE_TS + 2 * DAY}
+    result = anti_cheat.detect_overflow(
+        h, p, long_baseline=100.0, extra_candidates=extra,
+    )
+    # 连续 2 天候选 → 整段标记
+    assert [r["candidate"] for r in result] == [False, True, True]
+    assert [r["flagged"] for r in result] == [False, True, True]
+
+
+# ── detect_drift：持续上升斜率检测 ────────────────────────────────────────
+
+
+def test_drift_detects_steady_climb():
+    # 每天 +3%（3 > 100 × 0.02 = 2）→ 斜率超阈值；配合干净长期基线 100，
+    # 只标记窗口内高于 100 × 1.3 = 130 的高位日（100+3i > 130 → i ≥ 11）
+    values = [100 + 3 * i for i in range(14)]
+    h = hist(values)
+    result = anti_cheat.detect_drift(
+        h, slope_days=14, slope_threshold=0.02, long_baseline=100.0,
+    )
+    assert len(result) == 3
+    assert BASE_TS + 13 * DAY in result
+    assert BASE_TS + 10 * DAY not in result  # 130 不高于阈值，不算高位
+
+
+def test_drift_flat_history_no_flag():
+    h = hist([100] * 14)
+    result = anti_cheat.detect_drift(
+        h, slope_days=14, slope_threshold=0.02, long_baseline=100.0,
+    )
+    assert result == set()
+
+
+def test_drift_without_long_baseline_no_flag():
+    # 没有长期基线参照：无法区分真实增长与慢性注入，不产生标记
+    values = [100 + 3 * i for i in range(14)]
+    result = anti_cheat.detect_drift(
+        hist(values), slope_days=14, slope_threshold=0.02,
+    )
+    assert result == set()
+
+
+def test_drift_insufficient_data():
+    h = hist([100, 101, 102])
+    result = anti_cheat.detect_drift(
+        h, slope_days=14, slope_threshold=0.02, long_baseline=100.0,
+    )
+    assert result == set()
+
+
+def test_drift_zero_median_safe():
+    h = hist([0] * 14)
+    assert anti_cheat.detect_drift(h, long_baseline=0.0) == set()
