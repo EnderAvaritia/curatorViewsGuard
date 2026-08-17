@@ -100,6 +100,25 @@ consecutive_days: 2
 # 溢出量分摊到未来多少天（吸收期），用于平滑浏览曲线
 absorb_days: 3
 
+# 被标记为恶意刷量的日期是否剔除出预测（防止虚高数据污染基线）
+exclude_flagged: true
+
+# 标记恶意刷量后，未来多少天内强制不刷量，
+# 让浏览曲线在无注入的情况下自然回落到真实水平
+cooldown_days: 7
+
+# ── 基线 / 波动率（可选）──────────────────────────────────────────────────
+
+# 手动基线浏览量：大于 0 时直接使用该固定值作为目标（替代自动预测），
+# 例如希望浏览量稳定在 1000 左右就填 1000；为 0 或留空时使用自动预测
+# （中位数 + 趋势）。手动基线模式下溢出检测也以该固定值为参照。
+baseline_views: 0
+
+# 刷量波动率（0~0.3，建议 ≤ 0.15）：每天实际提升量在
+# 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在基线附近自然上下波动，
+# 避免收敛成一条笔直的线而显得不自然。过大易触发反作弊误判。
+volatility: 0.10
+
 # ── 受控提升参数 ──────────────────────────────────────────────────────────
 
 # 每日提升使用的最近推荐数量
@@ -232,6 +251,10 @@ def _scheduler_config(
         "outlier_k": float(cfg.get("outlier_k", 0.30)),
         "consecutive_days": int(cfg.get("consecutive_days", 2)),
         "absorb_days": int(cfg.get("absorb_days", 3)),
+        "exclude_flagged": bool(cfg.get("exclude_flagged", True)),
+        "cooldown_days": int(cfg.get("cooldown_days", 7)),
+        "baseline_views": float(cfg.get("baseline_views", 0) or 0),
+        "volatility": float(cfg.get("volatility", 0) or 0),
         "boost_n": int(cfg.get("boost_n", 5)),
         "single_cap": int(cfg.get("single_cap", 300)),
         "batch_size": int(cfg.get("batch_size", 50)),

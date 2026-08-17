@@ -15,6 +15,7 @@
 import json
 import logging
 import os
+import random
 import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -170,9 +171,28 @@ def run_daily(
         window_days, trend_cap, startup_factor, trend_min_points,
         outlier_k, consecutive_days, absorb_days,
         boost_n, single_cap, batch_size, target_ratio,
+        baseline_views, volatility, cooldown_days, exclude_flagged,
         boost_enabled (bool), dry_run (bool)
     其中 single_cap / batch_size / target_ratio 会应用到传入的 Booster
     实例（以 config 为准），其余作为预测/检测参数直接传入。
+
+    baseline_views：
+        大于 0 时启用手动基线模式：今日期望直接用该固定值，替代自动预测
+        （中位数+趋势）。溢出检测的参照也使用该固定值，天然免疫被污染。
+        为 0 或未配置时使用自动预测。
+
+    volatility：
+        刷量波动率（0~0.3，建议 ≤0.15）。>0 时每日实际提升目标在
+        「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕基线自然波动，
+        避免收敛成一条直线。
+
+    cooldown_days：
+        恢复期天数。最近存在被标记为恶意刷量的日期时，恢复期内强制不刷量，
+        让曲线在无注入的情况下自然回落到真实水平。
+
+    exclude_flagged：
+        为 True 时，被标记为恶意刷量的日期不参与预测（剔除出中位数窗口），
+        防止虚高数据污染基线；检测/预测迭代至多 3 轮直至标记集收敛。
 
     executor_cmd：
         非空时，刷量通过独立执行器子进程完成（调度器/执行器分离，
@@ -188,6 +208,10 @@ def run_daily(
     consecutive_days = int(config.get("consecutive_days", 2))
     absorb_days = int(config.get("absorb_days", 3))
     boost_n = int(config.get("boost_n", 5))
+    baseline_views = float(config.get("baseline_views", 0) or 0)
+    volatility = float(config.get("volatility", 0) or 0)
+    cooldown_days = int(config.get("cooldown_days", 7))
+    exclude_flagged = bool(config.get("exclude_flagged", True))
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
 
@@ -229,46 +253,99 @@ def run_daily(
         program_start, len(history_sorted), len(stats),
     )
 
-    # 3. 逐日预测：每个日期用截至当天的历史做一次预测
-    predictions: Dict[int, float] = {}
-    for i, day in enumerate(history_sorted):
-        pred = predict_expected(
-            history_sorted[: i + 1],
+    # 3. 逐日预测 + 异常溢出检测。
+    #    被标记为恶意刷量的日期不参与预测（剔除出中位数窗口），防止虚高
+    #    数据污染基线；标记集单调累加（只增不减），无新标记即收敛，
+    #    至多迭代 3 轮。手动基线模式（baseline_views > 0）下，预测参照
+    #    直接用固定基线，天然免疫被污染。
+    manual_baseline = baseline_views > 0
+    confirmed_flagged: set[int] = set()
+    history_clean = history_sorted
+    overflow: list[dict] = []
+    first_overflow: list[dict] = []
+    max_rounds = 3 if exclude_flagged else 1
+    for _ in range(max_rounds):
+        history_clean = [
+            d for d in history_sorted if d["date_ts"] not in confirmed_flagged
+        ]
+        predictions: Dict[int, float] = {}
+        for i, day in enumerate(history_clean):
+            if manual_baseline:
+                predictions[day["date_ts"]] = baseline_views
+            else:
+                pred = predict_expected(
+                    history_clean[: i + 1],
+                    window_days=window_days,
+                    trend_cap=trend_cap,
+                    startup_factor=startup_factor,
+                    trend_min_points=trend_min_points,
+                )
+                predictions[day["date_ts"]] = float(pred["expected"])
+        overflow = detect_overflow(
+            history_clean, predictions, outlier_k, consecutive_days,
+        )
+        if not first_overflow:
+            first_overflow = overflow
+        new_flagged = {d["date_ts"] for d in overflow if d.get("flagged")}
+        if not new_flagged:
+            break
+        confirmed_flagged |= new_flagged
+
+    # 4. 昨日实际（g_StatsAppViews 最新一条）与今日期望
+    yesterday_actual = 0
+    if history_clean:
+        yesterday_actual = int(history_clean[-1]["num_views"])
+    # Steam 统计滞后一天：今日期望基于全部已入库数据（不含今天）
+    history_without_today = [
+        d for d in history_clean if d["date_ts"] < today_ts
+    ]
+    if manual_baseline:
+        today_expected = baseline_views
+        startup_applied = False
+    else:
+        today_pred = predict_expected(
+            history_without_today,
             window_days=window_days,
             trend_cap=trend_cap,
             startup_factor=startup_factor,
             trend_min_points=trend_min_points,
         )
-        predictions[day["date_ts"]] = float(pred["expected"])
+        today_expected = float(today_pred["expected"])
+        startup_applied = bool(today_pred.get("startup_applied", False))
 
-    # 4. 昨日实际（g_StatsAppViews 最新一条）与今日期望
-    yesterday_actual = 0
-    if history_sorted:
-        yesterday_actual = int(history_sorted[-1]["num_views"])
-    # Steam 统计滞后一天：今日期望基于全部已入库数据（不含今天）
-    history_without_today = [
-        d for d in history_sorted if d["date_ts"] < today_ts
-    ]
-    today_pred = predict_expected(
-        history_without_today,
-        window_days=window_days,
-        trend_cap=trend_cap,
-        startup_factor=startup_factor,
-        trend_min_points=trend_min_points,
-    )
-    today_expected = float(today_pred["expected"])
-    startup_applied = bool(today_pred.get("startup_applied", False))
-
-    # 5. 异常溢出检测与后续扣减
-    overflow = detect_overflow(
-        stats, predictions, outlier_k, consecutive_days,
-    )
-    flagged_days = [d for d in overflow if d.get("flagged")]
+    # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
+    #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
+    #    剔除仅用于净化预测窗口。
+    flagged_days = [d for d in first_overflow if d.get("flagged")]
+    flagged_ts_first = {d["date_ts"] for d in flagged_days}
     deductions = compute_deductions(flagged_days, absorb_days)
     today_deduction = float(deductions.get(today_ts, 0.0))
 
-    # 6. 今日缺口 = 期望 - 昨日实际 - 溢出扣减
+    # 6. 今日缺口 = 期望 - 昨日实际 - 溢出扣减。
+    #    恢复期（最近存在被标记的恶意刷量日）内强制不刷，等待曲线自然回落；
+    #    波动率 > 0 时在缺口附近注入随机抖动，使曲线围绕基线上下波动。
     need = max(0, round(today_expected - yesterday_actual - today_deduction))
+    in_cooldown = False
+    days_since_flagged = -1
+    if flagged_ts_first:
+        latest_flagged_ts = max(flagged_ts_first)
+        days_since_flagged = (today_ts - latest_flagged_ts) // 86400
+        in_cooldown = days_since_flagged < cooldown_days
+    if in_cooldown:
+        logger.info(
+            "处于恶意刷量恢复期（最近标记日距今 %d 天 < %d 天），"
+            "今日强制不刷量。",
+            days_since_flagged, cooldown_days,
+        )
+        need = 0
+    elif volatility > 0 and need > 0:
+        base_need = need
+        jitter = random.uniform(-volatility, volatility)
+        need = max(0, round(need * (1.0 + jitter)))
+        logger.info(
+            "波动率 %.2f: 缺口 %d → 提升目标 %d",
+            volatility, base_need, need,
+        )
 
     # 7. 汇总字典
     summary: Dict[str, Any] = {
@@ -281,6 +358,10 @@ def run_daily(
         "stats_days": len(stats),
         "program_start": program_start,
         "startup_applied": startup_applied,
+        "baseline_mode": "manual" if manual_baseline else "auto",
+        "volatility": volatility,
+        "in_cooldown": in_cooldown,
+        "cooldown_days": cooldown_days,
     }
 
     # 8. 执行受控提升（调度器 / 执行器分离：优先子进程，回退直调）
@@ -309,6 +390,7 @@ def run_daily(
     # 9. 发送每日简报
     warning = (
         summary["overflow_flag_count"] > 0
+        or summary["in_cooldown"]
         or getattr(booster, "aborted", False)
         or "executor_error" in summary
     )
