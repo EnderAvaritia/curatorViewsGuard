@@ -150,6 +150,7 @@ python curator_views/cli.py run --config config.yaml --no-boost
 | 命令 | 作用 |
 | --- | --- |
 | `run` | 每日完整流程（抓取 → 预测 → 检测 → 提升 → 通知） |
+| `daemon` | 守护进程模式：常驻运行，每天到点执行每日流程（配置热重载） |
 | `check` | 只读检查：抓取统计、打印最近 7 天与预测摘要 |
 | `boost` | 手动执行一轮受控提升 |
 | `export` | 从本地数据库导出每日统计数据（json / csv） |
@@ -166,6 +167,23 @@ python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no
 - `--boost` / `--no-boost`：强制开启/关闭提升（优先于配置）。
 - 成功后以 JSON 打印汇总（今日预期、昨日实际、缺口、溢出天数、实际提升数等），
   并在数据库同级目录写入 `curator_views.log`。
+
+### daemon（守护进程模式）
+
+替代 cron / 任务计划程序的常驻方案：进程启动后保持运行，每天到达配置的
+`daily_time`（默认 `10:00`，Asia/Shanghai）自动执行一次每日完整流程。
+**每次循环都会重新加载配置文件**——修改任意配置（含执行时间）无需重启进程。
+
+```bash
+python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | --no-boost]
+```
+
+行为要点：
+- 启动时若今天尚未执行且已过执行时刻，立即补跑一次（重启/崩溃不影响当天任务）；
+- 单次执行失败不退出进程：记录日志后等待下一天（避免失败风暴）；
+- 支持优雅退出：Ctrl+C 或 SIGTERM（POSIX）；
+- 建议配合 systemd（`Restart=always`）或 Windows 任务计划程序/服务包装器
+  保持进程常驻。
 
 ### check
 
@@ -217,6 +235,7 @@ executor_cmd: "python cli.py boost --config {config} --target {need} --apps {app
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才推送 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
+| `daily_time` | `"10:00"` | daemon 模式的每日执行时刻（Asia/Shanghai，HH:MM） |
 | `executor_cmd` | （空） | 执行器子进程命令模板；留空则同进程直调 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
 | `trend_cap` | `0.15` | 趋势斜率相对中位数的封顶比例 |
@@ -244,10 +263,45 @@ executor_cmd: "python cli.py boost --config {config} --target {need} --apps {app
 
 ## 定时调度
 
-建议每天固定时间（**北京时间 10:00**）执行一次 `run`。Steam 统计滞后一天，
+### 方式一：守护进程（daemon，推荐）
+
+常驻运行、配置热重载、失败自动等明天、Ctrl+C/SIGTERM 优雅退出：
+
+```bash
+python curator_views/cli.py daemon --config config.yaml
+```
+
+配合 systemd 保持常驻（进程意外退出自动重启）：
+
+```ini
+# /etc/systemd/system/curator-views.service
+[Unit]
+Description=Steam Curator Views Daemon
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/reflect_steam_curator_views
+ExecStart=/usr/bin/python3 curator_views/cli.py daemon --config /path/to/config.yaml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now curator-views.service
+```
+
+Windows 可用 NSSM 包装：`nssm install curator-views "C:\Path\To\python.exe"
+"C:\Path\To\curator_views\cli.py daemon --config C:\Path\To\config.yaml"`。
+
+### 方式二：外部定时器（cron / 任务计划程序）
+
+每天固定时间（**北京时间 10:00**）执行一次 `run`。Steam 统计滞后一天，
 早上执行可拿到前一天的完整数据。
 
-### Linux（systemd 定时器）
+Linux（systemd 定时器）：
 
 ```ini
 # /etc/systemd/system/curator-views.service

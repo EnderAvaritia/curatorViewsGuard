@@ -63,6 +63,21 @@ python curator_views/cli.py run --config config.yaml --no-boost
 python curator_views/cli.py init-config [--path config.yaml]
 ```
 
+### daemon
+
+守护进程模式：进程常驻运行，每天到达配置的 `daily_time`（默认 `10:00`，
+Asia/Shanghai）自动执行一次每日完整流程。**每次循环重新加载配置文件**，
+修改任意配置（含执行时间）无需重启进程。
+
+```bash
+python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | --no-boost]
+```
+
+- 启动时若今天尚未执行且已过执行时刻，立即补跑一次；
+- 单次执行失败不退出进程，记录日志后等待下一天；
+- Ctrl+C 或 SIGTERM（POSIX）优雅退出；建议配合 systemd `Restart=always`
+  或 NSSM 保持常驻。
+
 ### run
 
 执行每日完整流程：抓取 Steam 统计并入库，逐日预测期望浏览量，检测异常溢出，
@@ -137,6 +152,7 @@ python curator_views/cli.py version
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
+| `daily_time` | `"10:00"` | daemon 模式的每日执行时刻（Asia/Shanghai，HH:MM） |
 | `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
 | `trend_cap` | `0.15` | 趋势斜率相对中位数的封顶比例 |

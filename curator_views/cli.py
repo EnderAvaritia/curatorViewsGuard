@@ -4,6 +4,7 @@
 子命令:
   init-config  生成默认配置文件模板
   run          执行每日完整流程（抓取 -> 预测 -> 溢出检测 -> 受控提升 -> 通知）
+  daemon       守护进程模式：常驻运行，每天到点重载配置并执行每日流程
   check        只读检查：抓取统计，打印最近 7 天与预测摘要（不提升）
   boost        手动执行一轮受控提升
   export       从本地数据库导出每日统计数据（json / csv）
@@ -12,6 +13,7 @@
 用法示例:
   python cli.py init-config
   python cli.py run --config config.yaml
+  python cli.py daemon --config config.yaml
   python cli.py run --config config.yaml --dry-run --no-boost
   python cli.py check --config config.yaml
   python cli.py boost --config config.yaml --target 500 --apps 5 --dry-run
@@ -38,11 +40,14 @@ if str(_ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from curator_views.core.booster import Booster  # noqa: E402
+from curator_views.core.daemon import Daemon  # noqa: E402
 from curator_views.core.fetcher import Fetcher  # noqa: E402
 from curator_views.core.notifier import Notifier  # noqa: E402
 from curator_views.core.predictor import predict_expected  # noqa: E402
 from curator_views.core.scheduler import run_daily  # noqa: E402
 from curator_views.core.storage import Storage  # noqa: E402
+
+logger = logging.getLogger("curator_views.cli")
 
 __version__ = "1.0.0"
 
@@ -74,6 +79,13 @@ ntfy_topic: ""
 
 # 是否启用每日受控提升；命令行 --no-boost 可临时关闭
 boost_enabled: true
+
+# ── 守护进程模式参数 ──────────────────────────────────────────────────────
+
+# 每日执行时刻（Asia/Shanghai，格式 HH:MM）。
+# daemon 模式每天此时执行一次每日流程，且每次执行前都会重新加载
+# 本配置文件——修改此处或任意配置均无需重启进程。
+daily_time: "10:00"
 
 # ── 预测参数 ──────────────────────────────────────────────────────────────
 
@@ -305,26 +317,31 @@ def cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
-        Path(args.config)
+def _execute_daily(
+    cfg: Dict[str, Any],
+    config_path: str,
+    boost_enabled: bool,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    """按配置构建运行时并执行一次每日完整流程（供 run / daemon 复用）。
+
+    Args:
+        cfg: 已加载的配置字典。
+        config_path: 配置文件路径（用于执行器子进程占位符与相对路径解析）。
+        boost_enabled: 是否启用提升（命令行 --boost/--no-boost 优先级高于配置）。
+        dry_run: 演练模式，只计算不实际提升。
+
+    Returns:
+        run_daily 的汇总字典。
+    """
+    cfg_dir = Path(config_path).resolve().parent
+    clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
+    cookie_file = _resolve_path(
+        cfg_dir, _require(cfg, "cookie_file", "（登录 Cookie 文件路径）")
     )
+    db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
+    proxy = cfg.get("proxy") or None
     _check_cookie_file(cookie_file)
-
-    # 日志文件放在数据库同级目录（curator_views.log）
-    log_path = Path(db_path).parent / "curator_views.log"
-    logging.basicConfig(
-        filename=str(log_path),
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        encoding="utf-8",
-    )
-
-    # --no-boost 关闭提升；--boost 强制开启；两者都不传时以配置为准
-    if args.boost is None:
-        boost_enabled = bool(cfg.get("boost_enabled", True))
-    else:
-        boost_enabled = bool(args.boost)
 
     storage = Storage(db_path)
     fetcher = Fetcher(clan_id, cookie_file, proxy)
@@ -334,18 +351,86 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     booster = _make_booster(cfg, clan_id, cookie_file, proxy, storage)
 
-    sched_cfg = _scheduler_config(cfg, boost_enabled, args.dry_run)
+    sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run)
     executor_cmd = str(cfg.get("executor_cmd", "") or "")
-    summary = run_daily(
+    return run_daily(
         storage,
         fetcher,
         notifier,
         booster,
         sched_cfg,
         executor_cmd=executor_cmd,
-        config_path=str(config_path),
+        config_path=config_path,
+    )
+
+
+def _setup_logging(config_path: Path, db_path: str) -> None:
+    """把日志写入数据库同级目录的 curator_views.log。"""
+    log_path = Path(db_path).parent / "curator_views.log"
+    logging.basicConfig(
+        filename=str(log_path),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        encoding="utf-8",
+    )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
+        Path(args.config)
+    )
+    _check_cookie_file(cookie_file)
+    _setup_logging(Path(args.config), db_path)
+
+    # --no-boost 关闭提升；--boost 强制开启；两者都不传时以配置为准
+    if args.boost is None:
+        boost_enabled = bool(cfg.get("boost_enabled", True))
+    else:
+        boost_enabled = bool(args.boost)
+
+    summary = _execute_daily(
+        cfg, str(Path(args.config)), boost_enabled, args.dry_run,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    """守护进程模式：常驻运行，每天到点重载配置并执行每日流程。
+
+    每次循环重新加载配置文件（改配置/执行时间无需重启）；
+    启动时若今天尚未执行且已过执行时刻，立即补跑一次；
+    单次执行失败不退出进程，等待下一天。
+    """
+    config_path = Path(args.config)
+    cfg = _load_config(config_path)
+    cfg_dir = config_path.resolve().parent
+    db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
+    _setup_logging(config_path, db_path)
+
+    def load_daily_time() -> str:
+        # 每次循环重载配置，取每日执行时刻
+        return str(_load_config(config_path).get("daily_time", "10:00"))
+
+    def execute_once() -> None:
+        # 每次执行前重新加载配置，命令行 --boost/--no-boost 覆盖配置
+        cfg = _load_config(config_path)
+        if args.boost is None:
+            boost_enabled = bool(cfg.get("boost_enabled", True))
+        else:
+            boost_enabled = bool(args.boost)
+        summary = _execute_daily(
+            cfg, str(config_path), boost_enabled, args.dry_run,
+        )
+        logger.info(
+            "每日执行完成: %s", json.dumps(summary, ensure_ascii=False),
+        )
+
+    daemon = Daemon(load_daily_time, execute_once)
+    try:
+        daemon.run_forever()
+    except KeyboardInterrupt:
+        logger.info("守护进程被手动中断（Ctrl+C）。")
     return 0
 
 
@@ -448,6 +533,19 @@ def build_parser() -> argparse.ArgumentParser:
     boost_group.add_argument("--no-boost", dest="boost", action="store_false",
                              help="关闭提升（优先于配置中的 boost_enabled）")
     p_run.set_defaults(func=cmd_run)
+
+    p_daemon = sub.add_parser(
+        "daemon", help="守护进程模式：常驻运行，每天到点执行每日流程（配置热重载）"
+    )
+    p_daemon.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
+    p_daemon.add_argument("--dry-run", action="store_true",
+                          help="演练模式：计算缺口但实际不发送提升请求")
+    boost_group_d = p_daemon.add_mutually_exclusive_group()
+    boost_group_d.add_argument("--boost", dest="boost", action="store_true", default=None,
+                               help="强制启用提升")
+    boost_group_d.add_argument("--no-boost", dest="boost", action="store_false",
+                               help="关闭提升（优先于配置中的 boost_enabled）")
+    p_daemon.set_defaults(func=cmd_daemon)
 
     p_check = sub.add_parser("check", help="只读检查：抓取统计并打印最近 7 天与预测摘要")
     p_check.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
