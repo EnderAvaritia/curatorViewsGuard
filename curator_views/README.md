@@ -1,4 +1,4 @@
-# Steam 鉴赏家浏览量预测与受控提升系统
+# CuratorViewsGuard — Steam 鉴赏家浏览量预测与受控提升系统
 
 基于 Steam 鉴赏家组的历史每日浏览量数据，自动预测今日预期浏览量，并通过
 受控、限速的访问方式平滑提升浏览量。系统内置反作弊检测：识别其他小组的
@@ -194,7 +194,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/path/to/reflect_steam_curator_views
+WorkingDirectory=/path/to/CuratorViewsGuard
 ExecStart=/usr/bin/python3 curator_views/cli.py run --config /path/to/config.yaml
 # 日志由 CLI 自动写入数据库同级目录的 curator_views.log
 
@@ -226,8 +226,8 @@ sudo systemctl enable --now curator-views.timer
 2. 触发器：每天 10:00（或按需选择），勾选「已启用」；
 3. 操作 -> 新建 -> 程序或脚本：
    - 程序或脚本：`C:\Path\To\python.exe`
-   - 添加参数：`C:\Path\To\reflect_steam_curator_views\curator_views\cli.py run --config C:\Path\To\config.yaml`
-   - 起始于：`C:\Path\To\reflect_steam_curator_views`
+   - 添加参数：`C:\Path\To\CuratorViewsGuard\curator_views\cli.py run --config C:\Path\To\config.yaml`
+   - 起始于：`C:\Path\To\CuratorViewsGuard`
 4. 条件：建议取消勾选「只有在计算机使用交流电源时才启动此任务」；
 5. 设置：勾选「如果任务失败，重新启动任务」（如 3 次，间隔 5 分钟）。
 

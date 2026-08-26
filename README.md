@@ -1,4 +1,4 @@
-# Steam 鉴赏家浏览量预测与受控提升系统
+# CuratorViewsGuard — Steam 鉴赏家浏览量预测与受控提升系统
 
 基于 Steam 鉴赏家组的历史每日浏览量，自动预测每天应有的浏览量水平，并通过受控、
 限速的方式平滑补充缺口。系统内置**反作弊检测**：识别其他小组恶意刷量造成的
@@ -17,7 +17,7 @@
 ## 项目结构
 
 ```
-reflect_steam_curator_views/
+CuratorViewsGuard/
 ├── steam_curator_views.py   # 旧版全量刷量脚本（仅作行为参考，新系统不依赖它）
 ├── cookie.txt               # Steam 登录 Cookie（敏感，勿提交到版本控制）
 └── curator_views/           # 本系统主体
@@ -280,7 +280,7 @@ Description=Steam Curator Views Daemon
 After=network-online.target
 
 [Service]
-WorkingDirectory=/path/to/reflect_steam_curator_views
+WorkingDirectory=/path/to/CuratorViewsGuard
 ExecStart=/usr/bin/python3 curator_views/cli.py daemon --config /path/to/config.yaml
 Restart=always
 
@@ -311,7 +311,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/path/to/reflect_steam_curator_views
+WorkingDirectory=/path/to/CuratorViewsGuard
 ExecStart=/usr/bin/python3 curator_views/cli.py run --config /path/to/config.yaml
 
 [Install]
@@ -342,8 +342,8 @@ sudo systemctl enable --now curator-views.timer
 2. **触发器**：每天 10:00，勾选「已启用」；
 3. **操作** → 新建 → 程序或脚本：
    - 程序或脚本：`C:\Path\To\python.exe`
-   - 添加参数：`C:\Path\To\reflect_steam_curator_views\curator_views\cli.py run --config C:\Path\To\config.yaml`
-   - 起始于：`C:\Path\To\reflect_steam_curator_views`
+   - 添加参数：`C:\Path\To\CuratorViewsGuard\curator_views\cli.py run --config C:\Path\To\config.yaml`
+   - 起始于：`C:\Path\To\CuratorViewsGuard`
 4. **条件**：建议取消「只有在计算机使用交流电源时才启动此任务」；
 5. **设置**：勾选「如果任务失败，重新启动任务」（如 3 次，间隔 5 分钟）。
 
