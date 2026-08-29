@@ -311,3 +311,22 @@ class TestFlaggedExclusion:
         assert dirty["overflow_flag_count"] == 3
         assert clean["today_expected"] == 100  # 未被污染
         assert dirty["today_expected"] > clean["today_expected"]
+
+
+class TestBoostDistribution:
+    def test_boost_distribution_passed_to_booster(self):
+        # run_daily 应把配置中的 boost_distribution 应用到 Booster 实例
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        run_with(
+            stats, program_start_str(), booster,
+            boost_distribution="exact",
+        )
+        assert booster.distribution == "exact"
+
+    def test_boost_distribution_default_ratio(self):
+        # 未配置时默认 ratio（向后兼容）
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        run_with(stats, program_start_str(), booster)
+        assert booster.distribution == "ratio"

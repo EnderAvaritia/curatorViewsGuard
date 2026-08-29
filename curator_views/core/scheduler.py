@@ -175,13 +175,13 @@ def run_daily(
     config 支持的键：
         window_days, trend_cap, startup_factor, trend_min_points,
         outlier_k, consecutive_days, absorb_days,
-        boost_n, single_cap, batch_size, target_ratio,
+        boost_n, single_cap, batch_size, target_ratio, boost_distribution,
         baseline_views, boost_mode, growth_factor,
         volatility, cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool)
-    其中 single_cap / batch_size / target_ratio 会应用到传入的 Booster
-    实例（以 config 为准），其余作为预测/检测参数直接传入。
+    其中 single_cap / batch_size / target_ratio / boost_distribution 会应用到
+    传入的 Booster 实例（以 config 为准），其余作为预测/检测参数直接传入。
 
     baseline_views：
         大于 0 时启用手动基线模式：基准目标直接用该固定值，替代自动预测
@@ -246,6 +246,9 @@ def run_daily(
     booster.batch_size = int(config.get("batch_size", booster.batch_size))
     booster.single_cap = int(config.get("single_cap", booster.single_cap))
     booster.target_ratio = float(config.get("target_ratio", booster.target_ratio))
+    booster.distribution = str(
+        config.get("boost_distribution", "ratio")
+    ).lower()
 
     today_iso = _today_iso()
     today_ts = _today_epoch()

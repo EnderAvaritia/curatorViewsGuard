@@ -268,6 +268,7 @@ def _make_booster(
         wait_max=float(cfg.get("wait_max", 16.0)),
         max_retries=int(cfg.get("max_retries", 3)),
         target_ratio=float(cfg.get("target_ratio", 0.95)),
+        distribution=str(cfg.get("boost_distribution", "ratio")).lower(),
     )
 
 
@@ -296,6 +297,9 @@ def _scheduler_config(
         "single_cap": int(cfg.get("single_cap", 300)),
         "batch_size": int(cfg.get("batch_size", 50)),
         "target_ratio": float(cfg.get("target_ratio", 0.95)),
+        "boost_distribution": str(
+            cfg.get("boost_distribution", "ratio")
+        ).lower(),
         "boost_enabled": bool(boost_enabled),
         "dry_run": bool(dry_run),
     }

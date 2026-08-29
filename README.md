@@ -256,7 +256,8 @@ executor_cmd: "python cli.py boost --config {config} --target {need} --apps {app
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |
 | `batch_size` | `50` | 每批处理的游戏数量 |
-| `target_ratio` | `0.95` | 累计提升达到目标值的该比例后提前停止 |
+| `target_ratio` | `0.95` | 累计提升达到目标值的该比例后提前停止（仅 ratio 模式生效） |
+| `boost_distribution` | `"ratio"` | 提升分配方式：`ratio` 达到目标比例提前停（默认）；`exact` 按推荐条数精确分配配额，恰好刷满目标（如 500 / 30 条 → 前 20 条各 17 次 + 后 10 条各 16 次） |
 | `threads` | `1` | 并发线程数（建议保持 1 精确计数） |
 | `wait_min` / `wait_max` | `8.0` / `16.0` | 两次请求之间的随机等待区间（秒） |
 | `max_retries` | `3` | 连续请求失败达到该次数后中止任务 |

@@ -4,8 +4,11 @@
 避免触发 Steam 反机器人机制。关键约束：
 - 分批、限速：批次之间及批内请求之间随机等待 wait_min ~ wait_max 秒；
 - 单 App 上限：每个推荐游戏单日最多成功 single_cap 次，达到后跳过；
-- 提前停止：累计成功达到 target_count * target_ratio（默认 95%）即停止，
-  宁可略欠不可超额（超额会制造尖峰风险）；
+- 分配方式（distribution）：
+  * ratio（默认）：累计成功达到 target_count * target_ratio（默认 95%）
+    即提前停止，宁可略欠不可超额（超额会制造尖峰风险）；
+  * exact：按推荐条数精确分配配额（如目标 500、30 条推荐 → 前 20 条各
+    17 次 + 后 10 条各 16 次），全部配额刷满即恰好达成目标，不多不少；
 - 失败中止：连续请求失败达到 max_retries 时中止整个任务并返回部分结果。
 
 批次循环：批大小为 batch_size，所有 App 用尽后从头再切（循环批次），
@@ -92,7 +95,9 @@ class Booster:
         threads: 并发线程数，<=1 为顺序执行（推荐，计数确定）；>1 使用线程池。
         wait_min / wait_max: 两次请求之间的随机等待区间（秒）。
         max_retries: 连续请求失败多少次后中止整个任务。
-        target_ratio: 累计成功达到目标值的该比例后提前停止。
+        target_ratio: 累计成功达到目标值的该比例后提前停止（ratio 模式）。
+        distribution: 提升分配方式，"ratio"（默认，按 target_ratio 提前停）
+            或 "exact"（按推荐条数分配配额，恰好刷满目标）。
     """
 
     def __init__(
@@ -108,6 +113,7 @@ class Booster:
         wait_max: float = 16.0,
         max_retries: int = 3,
         target_ratio: float = 0.95,
+        distribution: str = "ratio",
     ) -> None:
         self.clan_id = clan_id
         self.cookie_file = cookie_file
@@ -120,6 +126,7 @@ class Booster:
         self.wait_max = wait_max
         self.max_retries = max_retries
         self.target_ratio = target_ratio
+        self.distribution = str(distribution).lower()
 
         # 最近一次 run() 是否因连续失败而中止（供调度器判断通知级别）
         self.aborted = False
@@ -165,6 +172,21 @@ class Booster:
         app_ids = [rec["app_id"] for rec in recommendations]
         budget = min(target_count, len(app_ids) * self.single_cap)
 
+        # exact 模式：按推荐条数精确分配配额（目标 500、30 条推荐 → 前 20 条
+        # 各 17 次 + 后 10 条各 16 次），全部配额刷满即恰好达成目标。
+        per_app_quota: Optional[Dict[str, int]] = None
+        if self.distribution == "exact" and app_ids:
+            base, extra = divmod(target_count, len(app_ids))
+            per_app_quota = {
+                app_id: min(base + (1 if idx < extra else 0), self.single_cap)
+                for idx, app_id in enumerate(app_ids)
+            }
+            logger.info(
+                "exact 分配: 目标=%d 条数=%d 基准配额=%d 余数=%d 总配额=%d",
+                target_count, len(app_ids), base, extra,
+                sum(per_app_quota.values()),
+            )
+
         # 提升计划日志（dry_run 同样需要）
         logger.info(
             "提升计划: 目标=%d 预算=%d 单App上限=%d App列表=%s",
@@ -178,8 +200,21 @@ class Booster:
             logger.warning("无可提升的推荐或目标/预算为 0，本轮跳过。")
             return 0
 
-        # 每个 App 的成功计数（用于单 App 上限约束）
+        # 每个 App 的成功计数（用于配额 / 单 App 上限约束）
         per_app_success: Dict[str, int] = {app_id: 0 for app_id in app_ids}
+
+        def app_limit(app_id: str) -> int:
+            """单个 App 本轮最大成功次数（exact 为配额，否则为单日上限）。"""
+            if per_app_quota is not None:
+                return per_app_quota[app_id]
+            return self.single_cap
+
+        def all_at_limit() -> bool:
+            return all(
+                per_app_success[app_id] >= app_limit(app_id)
+                for app_id in app_ids
+            )
+
         cumulative = 0
         consecutive_failures = 0
         target_line = target_count * self.target_ratio
@@ -187,15 +222,17 @@ class Booster:
         for batch_index, batch in enumerate(
             _cyclic_chunks(app_ids, self.batch_size), start=1
         ):
-            # 过滤已达单 App 上限的游戏
+            # 过滤已达配额（或单 App 上限）的游戏
             active = [
                 app_id for app_id in batch
-                if per_app_success[app_id] < self.single_cap
+                if per_app_success[app_id] < app_limit(app_id)
             ]
             if not active:
-                if all(per_app_success[app_id] >= self.single_cap
-                       for app_id in app_ids):
-                    logger.info("全部 App 均达到单日上限，停止提升。")
+                if all_at_limit():
+                    logger.info(
+                        "全部 App 均达到%s，停止提升。",
+                        "分配配额" if per_app_quota is not None else "单日上限",
+                    )
                     break
                 continue
 
@@ -249,7 +286,15 @@ class Booster:
 
             if self.aborted:
                 break
-            if cumulative >= target_line:
+            if per_app_quota is not None:
+                # exact 模式：全部配额刷满即恰好达成目标，无需按比例提前停
+                if all_at_limit():
+                    logger.info(
+                        "exact 分配完成: 累计 %d，全部 %d 条配额已刷满。",
+                        cumulative, len(app_ids),
+                    )
+                    break
+            elif cumulative >= target_line:
                 logger.info(
                     "累计提升 %d 已达目标 %d 的 %.0f%%，提前停止以避免超额。",
                     cumulative, target_count, self.target_ratio * 100,
