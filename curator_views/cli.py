@@ -368,15 +368,38 @@ def _execute_daily(
     )
 
 
-def _setup_logging(config_path: Path, db_path: str) -> None:
-    """把日志写入数据库同级目录的 curator_views.log。"""
+def _setup_logging(
+    config_path: Path, db_path: str, console: bool = False
+) -> Path:
+    """把日志写入数据库同级目录的 curator_views.log。
+
+    Args:
+        config_path: 配置文件路径（仅用于日志上下文，不参与路径计算）。
+        db_path: 数据库路径，日志写在它同级目录。
+        console: 是否同时输出到控制台（daemon 模式需要，否则前台完全静默）。
+
+    Returns:
+        日志文件路径。
+    """
     log_path = Path(db_path).parent / "curator_views.log"
+    file_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(str(log_path), encoding="utf-8"),
+    ]
+    if console:
+        # 控制台只打时间/级别/内容，不重复 logger 名，避免刷屏
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        handlers.append(console_handler)
     logging.basicConfig(
-        filename=str(log_path),
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        encoding="utf-8",
+        format=file_format,
+        handlers=handlers,
+        force=True,
     )
+    return log_path
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -410,7 +433,8 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     cfg = _load_config(config_path)
     cfg_dir = config_path.resolve().parent
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
-    _setup_logging(config_path, db_path)
+    log_path = _setup_logging(config_path, db_path, console=True)
+    logger.info("守护进程日志文件: %s", log_path)
 
     def load_daily_time() -> str:
         # 每次循环重载配置，取每日执行时刻

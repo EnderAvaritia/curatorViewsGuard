@@ -156,6 +156,12 @@ class Daemon:
                     self._now(), last_run_date, daily_time,
                 )
                 logger.info("今日任务完成，下次执行: %s", next_wake)
+            else:
+                logger.info(
+                    "今日无需执行（daily_time=%s），下次执行: %s",
+                    daily_time,
+                    next_wake.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                )
 
             if self._stop:
                 break
