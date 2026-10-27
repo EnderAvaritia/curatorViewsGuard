@@ -7,6 +7,8 @@
 """
 
 import os
+import threading
+import time
 from datetime import datetime
 
 from curator_views.core import status
@@ -302,3 +304,23 @@ class TestDaemonState:
         assert state is not None
         assert state["last_error"] == "模拟执行失败"
         assert state["last_run_date"] == "2026-01-01"
+
+
+class TestStopResponsiveness:
+    def test_stop_wakes_idle_sleep_immediately(self):
+        # 默认睡眠用可中断等待：stop() 后应秒级退出，而不是等满 SLEEP_STEP
+        daemon = Daemon(
+            lambda: "23:59", lambda: None,
+            install_handlers=False,
+            now_fn=lambda: dt(8, 0),
+        )
+        thread = threading.Thread(target=daemon.run_forever, daemon=True)
+        thread.start()
+        time.sleep(0.1)  # 让循环进入等待
+
+        started = time.monotonic()
+        daemon.stop()
+        thread.join(timeout=5.0)
+
+        assert not thread.is_alive()
+        assert time.monotonic() - started < 1.0

@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import signal
-import time
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -93,7 +93,7 @@ class Daemon:
             （"HH:MM"）。通过它实现配置热重载——改配置无需重启。
         execute: 执行一次每日完整流程的回调（由调用方实现，
             内部应重新加载配置并运行 run_daily）。可返回汇总字典。
-        sleeper: 睡眠函数（默认 time.sleep），测试可注入替身。
+        sleeper: 睡眠函数（默认用内部可中断事件等待），测试可注入替身。
         state_path: 状态文件路径；设置后 daemon 会周期性写入运行状态，
             并通过它跨重启保留 last_run_date 等字段。
     """
@@ -109,7 +109,9 @@ class Daemon:
     ) -> None:
         self._load_daily_time = load_daily_time
         self._execute = execute
-        self._sleep = sleeper or time.sleep
+        # 可中断的等待：stop() 会立即唤醒，避免等满一个 SLEEP_STEP（30 秒）
+        self._wake = threading.Event()
+        self._sleep = sleeper or self._wait
         self._now = now_fn or (lambda: datetime.now(_TZ))
         self._stop = False
         self._state_path = state_path
@@ -148,9 +150,14 @@ class Daemon:
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("写入守护进程状态文件失败: %s", exc)
 
+    def _wait(self, timeout: float) -> None:
+        """默认等待实现：可被 stop() 立即唤醒的阻塞等待。"""
+        self._wake.wait(timeout)
+
     def stop(self) -> None:
-        """请求优雅退出：设置停止标志，循环与睡眠会尽快响应。"""
+        """请求优雅退出：设置停止标志，并立即唤醒正在睡眠的循环。"""
         self._stop = True
+        self._wake.set()
 
     def _install_signal_handlers(self) -> None:
         """安装 SIGTERM / SIGINT 处理器，设置停止标志以便优雅退出。"""
