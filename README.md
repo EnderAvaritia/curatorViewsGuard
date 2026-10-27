@@ -196,7 +196,10 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 行为要点：
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次（重启/崩溃不影响当天任务）；
 - 单次执行失败不退出进程：记录日志后等待下一天（避免失败风暴）；
-- 支持优雅退出：Ctrl+C 或 SIGTERM（POSIX）；
+- **同一天不重复执行**：每日流程结束会把 `last_run_date` 写入数据库，daemon
+  每轮到点前都会核对；手动 `run` 与 daemon 谁先执行，当天都只跑一次；
+- **Ctrl+C 立即中断当前执行**并退出（状态文件写 `stopped`）；SIGTERM（systemd
+  stop）则等在途任务收尾后优雅退出；
 - **前台运行时 INFO 日志同时输出到控制台**：启动即打印日志文件路径与下次
   执行时间，执行过程与结果实时可见；文件日志仍写入数据库同级的
   `curator_views.log`；
@@ -240,7 +243,9 @@ python curator_views/cli.py info --config config.yaml --json
 daemon 会把运行状态原子写入 **`db_path` 所在目录下的 `daemon_state.json`**
 （默认即项目根目录）。运行判断优先检查 PID：进程存在即视为运行中；PID 检查
 不可用时回退到心跳时间（90 秒内视为正常）。状态文件中还保留 `last_run_date`，
-因此 daemon 重启后同一天不会重复执行每日流程。
+因此 daemon 重启后同一天不会重复执行每日流程；数据库里也有一份 `last_run_date`
+（由 `run_daily` 每次结束写入），daemon 每轮会核对，手动 `run` 过当天同样不会
+重复执行。
 
 > 说明：长时间执行提升任务时心跳可能暂停，此时存活判断仍以 PID 为准。
 > PID 复用是已知限制（进程退出后 PID 被其他进程复用时会误判为运行中）。

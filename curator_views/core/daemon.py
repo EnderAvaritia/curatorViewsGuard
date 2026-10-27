@@ -96,6 +96,11 @@ class Daemon:
         sleeper: 睡眠函数（默认用内部可中断事件等待），测试可注入替身。
         state_path: 状态文件路径；设置后 daemon 会周期性写入运行状态，
             并通过它跨重启保留 last_run_date 等字段。
+        fallback_last_run_date: 状态文件里没有 last_run_date 时的兜底值
+            （保留给不需要动态刷新的调用方）。
+        last_run_date_provider: 每次循环开始调用的回调，返回最新的已完成日期
+            （通常查数据库）。用于覆盖「daemon 等待期间手动 run 已执行当天」
+            的情况；返回值比内存中的日期新时才会采用。
     """
 
     def __init__(
@@ -106,6 +111,8 @@ class Daemon:
         install_handlers: bool = True,
         now_fn: Optional[Callable[[], datetime]] = None,
         state_path: Optional[str] = None,
+        fallback_last_run_date: str = "",
+        last_run_date_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self._load_daily_time = load_daily_time
         self._execute = execute
@@ -130,6 +137,10 @@ class Daemon:
                 self._last_run_at = previous.get("last_run_at")
                 self._last_summary = previous.get("last_summary")
                 self._last_error = str(previous.get("last_error") or "")
+        # 状态文件没记录时用数据库兜底（手动 run 也会写 last_run_date）
+        if not self._last_run_date:
+            self._last_run_date = fallback_last_run_date
+        self._last_run_date_provider = last_run_date_provider
 
         if install_handlers:
             self._install_signal_handlers()
@@ -160,17 +171,27 @@ class Daemon:
         self._wake.set()
 
     def _install_signal_handlers(self) -> None:
-        """安装 SIGTERM / SIGINT 处理器，设置停止标志以便优雅退出。"""
+        """安装 SIGTERM / SIGINT 处理器。
+
+        SIGTERM：优雅退出，等在途执行收尾；
+        SIGINT（Ctrl+C）：置停止标志并抛 KeyboardInterrupt，立即中断当前执行
+        （否则会被 handler 吞掉，刷量任务要跑完才退出）。
+        """
 
         def _request_stop(signum, frame) -> None:  # noqa: ANN001 - 信号处理器签名
             logger.info("收到信号 %s，准备退出…", signum)
             self.stop()
 
+        def _interrupt(signum, frame) -> None:  # noqa: ANN001 - 信号处理器签名
+            logger.info("收到 SIGINT，中断当前执行并退出…")
+            self.stop()
+            raise KeyboardInterrupt
+
         try:
             signal.signal(signal.SIGTERM, _request_stop)
-            signal.signal(signal.SIGINT, _request_stop)
+            signal.signal(signal.SIGINT, _interrupt)
         except (ValueError, OSError):
-            # 非主线程或平台不支持时跳过；KeyboardInterrupt 仍可中断 sleep
+            # 非主线程或平台不支持时跳过；默认 SIGINT 仍会抛 KeyboardInterrupt
             pass
 
     def _sleep_until(
@@ -193,90 +214,109 @@ class Daemon:
         logger.info("守护进程启动，等待每日任务。")
         last_run_date = self._last_run_date
         started = False
-        while not self._stop:
-            # 每次循环重载配置（可能修改了执行时间）
-            daily_time = self._load_daily_time()
-            now = self._now()
+        try:
+            while not self._stop:
+                # 每轮先同步外部记录（数据库）：daemon 等待期间手动 run 过当天，
+                # 到点后不应再执行一次。
+                if self._last_run_date_provider is not None:
+                    try:
+                        latest = str(
+                            self._last_run_date_provider() or ""
+                        ).strip()
+                    except Exception:  # noqa: BLE001 - 读状态失败不影响主流程
+                        logger.warning(
+                            "读取外部 last_run_date 失败，沿用内存值",
+                            exc_info=True,
+                        )
+                    else:
+                        if latest > last_run_date:
+                            last_run_date = latest
+                            self._last_run_date = latest
+                # 每次循环重载配置（可能修改了执行时间）
+                daily_time = self._load_daily_time()
+                now = self._now()
 
-            if not started:
-                started = True
-                self._state.update({
-                    "pid": os.getpid(),
-                    "started_at": now.isoformat(timespec="seconds"),
-                    "phase": "waiting",
-                    "daily_time": daily_time,
-                    "last_run_date": last_run_date,
-                    "last_run_at": self._last_run_at,
-                    "last_summary": self._last_summary,
-                    "last_error": self._last_error,
-                })
-                self._write_state()
+                if not started:
+                    started = True
+                    self._state.update({
+                        "pid": os.getpid(),
+                        "started_at": now.isoformat(timespec="seconds"),
+                        "phase": "waiting",
+                        "daily_time": daily_time,
+                        "last_run_date": last_run_date,
+                        "last_run_at": self._last_run_at,
+                        "last_summary": self._last_summary,
+                        "last_error": self._last_error,
+                    })
+                    self._write_state()
 
-            should_run, next_wake = plan_next(now, last_run_date, daily_time)
-            next_wake_iso = next_wake.isoformat(timespec="seconds")
-            self._write_state(
-                phase="waiting",
-                daily_time=daily_time,
-                next_wake=next_wake_iso,
-                last_run_date=last_run_date,
-            )
-
-            if should_run:
-                logger.info("到达每日执行时刻 %s，开始执行。", daily_time)
-                # 执行期间旧的 next_wake（今天已过点）已失效，先清空
-                self._write_state(phase="executing", next_wake=None)
-                summary: Any = None
-                error: Optional[str] = None
-                try:
-                    result = self._execute()
-                    if isinstance(result, dict):
-                        summary = result
-                except Exception as exc:  # noqa: BLE001 - 单次失败不退出进程
-                    error = str(exc)
-                    logger.exception("每日执行失败，等待下一天继续: %s", exc)
-
-                last_run_date = self._now().strftime("%Y-%m-%d")
-                run_at = self._now_iso()
-                self._last_run_date = last_run_date
-                self._last_run_at = run_at
-                if summary is not None:
-                    self._last_summary = summary
-                # 成功时清空上次错误；失败时记录本次异常
-                self._last_error = error or ""
-
-                _, next_wake = plan_next(
-                    self._now(), last_run_date, daily_time,
-                )
+                should_run, next_wake = plan_next(now, last_run_date, daily_time)
                 next_wake_iso = next_wake.isoformat(timespec="seconds")
                 self._write_state(
                     phase="waiting",
                     daily_time=daily_time,
                     next_wake=next_wake_iso,
                     last_run_date=last_run_date,
-                    last_run_at=run_at,
-                    last_summary=self._last_summary,
-                    last_error=self._last_error,
-                )
-                logger.info("今日任务完成，下次执行: %s", next_wake)
-            else:
-                logger.info(
-                    "今日无需执行（daily_time=%s），下次执行: %s",
-                    daily_time,
-                    next_wake.strftime("%Y-%m-%d %H:%M:%S %Z"),
                 )
 
-            if self._stop:
-                break
-            self._sleep_until(
-                next_wake,
-                sleep_step,
-                heartbeat=lambda: self._write_state(
-                    phase="waiting",
-                    daily_time=daily_time,
-                    next_wake=next_wake_iso,
-                    last_run_date=last_run_date,
-                ),
-            )
+                if should_run:
+                    logger.info("到达每日执行时刻 %s，开始执行。", daily_time)
+                    # 执行期间旧的 next_wake（今天已过点）已失效，先清空
+                    self._write_state(phase="executing", next_wake=None)
+                    summary: Any = None
+                    error: Optional[str] = None
+                    try:
+                        result = self._execute()
+                        if isinstance(result, dict):
+                            summary = result
+                    except Exception as exc:  # noqa: BLE001 - 单次失败不退出进程
+                        error = str(exc)
+                        logger.exception("每日执行失败，等待下一天继续: %s", exc)
 
-        self._write_state(phase="stopped", stopped_at=self._now_iso())
+                    last_run_date = self._now().strftime("%Y-%m-%d")
+                    run_at = self._now_iso()
+                    self._last_run_date = last_run_date
+                    self._last_run_at = run_at
+                    if summary is not None:
+                        self._last_summary = summary
+                    # 成功时清空上次错误；失败时记录本次异常
+                    self._last_error = error or ""
+
+                    _, next_wake = plan_next(
+                        self._now(), last_run_date, daily_time,
+                    )
+                    next_wake_iso = next_wake.isoformat(timespec="seconds")
+                    self._write_state(
+                        phase="waiting",
+                        daily_time=daily_time,
+                        next_wake=next_wake_iso,
+                        last_run_date=last_run_date,
+                        last_run_at=run_at,
+                        last_summary=self._last_summary,
+                        last_error=self._last_error,
+                    )
+                    logger.info("今日任务完成，下次执行: %s", next_wake)
+                else:
+                    logger.info(
+                        "今日无需执行（daily_time=%s），下次执行: %s",
+                        daily_time,
+                        next_wake.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    )
+
+                if self._stop:
+                    break
+                self._sleep_until(
+                    next_wake,
+                    sleep_step,
+                    heartbeat=lambda: self._write_state(
+                        phase="waiting",
+                        daily_time=daily_time,
+                        next_wake=next_wake_iso,
+                        last_run_date=last_run_date,
+                    ),
+                )
+
+        finally:
+            # 正常退出或 Ctrl+C 中断都要落盘 stopped，避免 info 残留 executing
+            self._write_state(phase="stopped", stopped_at=self._now_iso())
         logger.info("守护进程已退出。")

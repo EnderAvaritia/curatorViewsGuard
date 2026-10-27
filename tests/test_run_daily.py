@@ -330,3 +330,18 @@ class TestBoostDistribution:
         booster = FakeBooster()
         run_with(stats, program_start_str(), booster)
         assert booster.distribution == "ratio"
+
+
+class TestLastRunDateRecord:
+    def test_records_last_run_date_for_daemon_dedupe(self):
+        # run_daily 结束写 last_run_date：手动 run 后启动 daemon 不会再跑一遍
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        summary = run_daily(
+            storage,
+            FakeFetcher(stats),
+            FakeNotifier(),
+            FakeBooster(),
+            {"boost_enabled": False},
+        )
+        assert storage.saved["last_run_date"] == summary["date"]

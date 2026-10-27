@@ -84,11 +84,14 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次；
 - 单次执行失败不退出进程，记录日志后等待下一天；
+- **同一天不重复执行**：`run_daily` 会把 `last_run_date` 写进数据库，daemon
+  每轮到点前会核对它，因此手动 `run` 与 daemon 谁先执行都算当天已完成；
 - 前台运行时 INFO 日志同时输出到控制台（启动即打印日志路径与下次执行时间），
   文件日志仍写入数据库同级的 `curator_views.log`；
-- Ctrl+C 或 SIGTERM（POSIX）优雅退出；建议配合 systemd `Restart=always`
-  或 NSSM 保持常驻。需要释放终端请用 `nohup` / `setsid` / systemd 后台运行，
-  静默本身并不会释放控制台。
+- Ctrl+C 会**立即中断**当前执行并退出（状态文件写入 `stopped`）；SIGTERM
+  （POSIX / systemd stop）则等进行中的任务收尾后优雅退出。建议配合 systemd
+  `Restart=always` 或 NSSM 保持常驻；需要释放终端请用 `nohup` / `setsid` /
+  systemd 后台运行，静默本身并不会释放控制台。
 
 ### info
 

@@ -450,4 +450,8 @@ def run_daily(
     level = "warning" if warning else "info"
     notifier.send("每日简报", _format_summary(summary, dry_run), level=level)
 
+    # 10. 记录当日已执行：daemon 重启后据此避免重复执行同一天；
+    #     手动 run 与 daemon 共用同一状态键，谁先跑都算今天已完成。
+    storage.save_state("last_run_date", today_iso)
+
     return summary

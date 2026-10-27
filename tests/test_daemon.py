@@ -7,9 +7,12 @@
 """
 
 import os
+import signal
 import threading
 import time
 from datetime import datetime
+
+import pytest
 
 from curator_views.core import status
 from curator_views.core.daemon import Daemon, _TZ, plan_next
@@ -324,3 +327,99 @@ class TestStopResponsiveness:
 
         assert not thread.is_alive()
         assert time.monotonic() - started < 1.0
+
+
+class TestLastRunDateSources:
+    def test_fallback_last_run_date_prevents_same_day_run(self):
+        # 状态文件缺失时，构造参数传入的日期同样生效（数据库兜底）
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: "10:00", lambda: calls.append("run"),
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(15, 0),
+            fallback_last_run_date="2026-01-01",
+        )
+        daemon.run_forever()
+        assert calls == []
+
+    def test_provider_skips_run_when_db_already_has_today(self):
+        # daemon 等待期间手动 run 过当天：到点后 provider 返回最新日期 → 不重复执行
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: "10:00", lambda: calls.append("run"),
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(15, 0),
+            last_run_date_provider=lambda: "2026-01-01",
+        )
+        daemon.run_forever()
+        assert calls == []
+
+    def test_provider_failure_does_not_break_daemon(self):
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        def broken_provider():
+            raise RuntimeError("数据库损坏")
+
+        daemon = Daemon(
+            lambda: "10:00", lambda: calls.append("run"),
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(15, 0),
+            last_run_date_provider=broken_provider,
+        )
+        daemon.run_forever()  # 不应抛出，按未执行处理
+        assert calls == ["run"]
+
+
+class TestKeyboardInterrupt:
+    def test_interrupt_during_execute_writes_stopped_state(self, tmp_path):
+        # Ctrl+C 打断执行：异常继续向上抛（CLI 捕获），但状态文件必须是 stopped
+        state_path = tmp_path / "daemon_state.json"
+
+        def execute():
+            raise KeyboardInterrupt
+
+        daemon = Daemon(
+            lambda: "00:00", execute,
+            sleeper=lambda secs: None, install_handlers=False,
+            now_fn=lambda: dt(10, 0),
+            state_path=str(state_path),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            daemon.run_forever()
+
+        state = status.read_state(str(state_path))
+        assert state is not None
+        assert state["phase"] == "stopped"
+        assert state["stopped_at"]
+
+    def test_sigint_handler_raises_and_sets_stop(self):
+        # SIGINT handler 必须抛 KeyboardInterrupt（否则刷量任务不会中断）
+        prev_int = signal.getsignal(signal.SIGINT)
+        prev_term = signal.getsignal(signal.SIGTERM)
+        try:
+            daemon = Daemon(
+                lambda: "10:00", lambda: None,
+                install_handlers=True,
+                now_fn=lambda: dt(8, 0),
+            )
+            handler = signal.getsignal(signal.SIGINT)
+            with pytest.raises(KeyboardInterrupt):
+                handler(signal.SIGINT, None)
+            assert daemon._stop is True
+        finally:
+            signal.signal(signal.SIGINT, prev_int)
+            signal.signal(signal.SIGTERM, prev_term)

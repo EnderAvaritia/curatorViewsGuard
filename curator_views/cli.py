@@ -34,6 +34,7 @@ import csv
 import io
 import json
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -456,6 +457,27 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         # 每次循环重载配置，取每日执行时刻
         return str(_load_config(config_path).get("daily_time", "10:00"))
 
+    def read_db_last_run_date() -> str:
+        """从数据库读取最近一次完成日期（手动 run 也会写这个键）。
+
+        数据库或 kv_store 表不存在时返回空串，绝不因此阻塞守护进程启动。
+        """
+        if not Path(db_path).is_file():
+            return ""
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute(
+                "SELECT value FROM kv_store WHERE key = ?", ("last_run_date",)
+            ).fetchone()
+            return str(row[0]) if row else ""
+        except sqlite3.Error:
+            logger.warning("读取数据库 last_run_date 失败", exc_info=True)
+            return ""
+        finally:
+            if conn is not None:
+                conn.close()
+
     def execute_once() -> Dict[str, Any]:
         # 每次执行前重新加载配置，命令行 --boost/--no-boost 覆盖配置
         cfg = _load_config(config_path)
@@ -472,7 +494,12 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         return summary
 
     state_path = status.default_state_path(db_path)
-    daemon = Daemon(load_daily_time, execute_once, state_path=state_path)
+    daemon = Daemon(
+        load_daily_time,
+        execute_once,
+        state_path=state_path,
+        last_run_date_provider=read_db_last_run_date,
+    )
     try:
         daemon.run_forever()
     except KeyboardInterrupt:
