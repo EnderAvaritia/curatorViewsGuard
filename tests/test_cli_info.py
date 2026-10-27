@@ -135,6 +135,8 @@ class TestInfoHuman:
         assert "守护进程: 运行中" in out
         assert "PID: 12345" in out
         assert "当前阶段: waiting（等待下次执行）" in out
+        assert "上次执行: 2026-10-26 10:00:03" in out
+        assert "下次执行: 2026-10-28 10:00" in out
         assert "配置: 每日执行 10:00；提升已关闭（采集模式）" in out
         assert "数据: 2 天" in out
 
@@ -165,6 +167,27 @@ class TestInfoHuman:
         out = capsys.readouterr().out
         assert "已停止（正常退出）" in out
         assert "上次错误: 模拟执行失败" in out
+        # 未运行时不应把旧状态里的 next_wake 说成“下次执行”
+        assert "上次计划执行: 2026-10-28 10:00" in out
+        assert "下次执行" not in out
+
+    def test_date_only_last_run_is_not_rendered_as_midnight(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        config_path = write_config(tmp_path)
+        db_path = make_db(tmp_path)
+        state_path = write_running_state(db_path)
+        state = status.read_state(state_path)
+        state.pop("last_run_at")
+        status.write_state(state_path, state)
+        monkeypatch.setattr(status, "pid_alive", lambda pid: False)
+
+        code = cli.main(["info", "--config", str(config_path)])
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "上次执行: 2026-10-26" in out
+        assert "2026-10-26 00:00:00" not in out
 
     def test_empty_clan_id_and_missing_cookie_file_are_ok(
         self, tmp_path, capsys

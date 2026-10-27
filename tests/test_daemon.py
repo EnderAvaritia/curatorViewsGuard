@@ -205,7 +205,10 @@ class TestDaemonState:
         def sleeper(secs):
             daemon.stop()
 
+        during_execute = {}
+
         def execute():
+            during_execute.update(status.read_state(str(state_path)) or {})
             return {"need": 5, "boosted": 3}
 
         daemon = Daemon(
@@ -215,6 +218,10 @@ class TestDaemonState:
             state_path=str(state_path),
         )
         daemon.run_forever()
+
+        # 执行期间阶段为 executing，且旧的 next_wake 已失效被清空
+        assert during_execute["phase"] == "executing"
+        assert during_execute["next_wake"] is None
 
         state = status.read_state(str(state_path))
         assert state is not None

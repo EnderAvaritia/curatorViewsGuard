@@ -15,6 +15,7 @@ cookie.txt
 *.db
 *.db-journal
 *.log
+daemon_state.json
 views_history.json
 
 # 系统

@@ -216,7 +216,8 @@ class Daemon:
 
             if should_run:
                 logger.info("到达每日执行时刻 %s，开始执行。", daily_time)
-                self._write_state(phase="executing")
+                # 执行期间旧的 next_wake（今天已过点）已失效，先清空
+                self._write_state(phase="executing", next_wake=None)
                 summary: Any = None
                 error: Optional[str] = None
                 try:

@@ -546,11 +546,14 @@ def _print_info_report(report: Dict[str, Any]) -> None:
         age = daemon["heartbeat_age_seconds"]
         suffix = f"（{round(age)} 秒前）" if age is not None else ""
         print(f"  上次心跳: {_fmt_state_time(daemon['updated_at'])}{suffix}")
-    last_run = daemon["last_run_at"] or daemon["last_run_date"]
-    if last_run:
-        print(f"  上次执行: {_fmt_state_time(last_run)}")
+    if daemon["last_run_at"]:
+        print(f"  上次执行: {_fmt_state_time(daemon['last_run_at'])}")
+    elif daemon["last_run_date"]:
+        # 仅有日期时不要补成 00:00:00，避免误读为凌晨执行
+        print(f"  上次执行: {daemon['last_run_date']}")
     if daemon["next_wake"]:
-        print(f"  下次执行: {_fmt_state_time(daemon['next_wake'], False)}")
+        label = "下次执行" if daemon["running"] else "上次计划执行"
+        print(f"  {label}: {_fmt_state_time(daemon['next_wake'], False)}")
     print(f"  状态文件: {daemon['state_file']}")
     if daemon["last_error"]:
         print(f"  上次错误: {daemon['last_error']}")
