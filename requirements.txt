@@ -13,3 +13,7 @@ tzdata>=2024.1
 # 可选依赖：onepush（多平台推送）。当前版本通知直接使用 requests 调用
 # ntfy，无需安装；如需通过 onepush 对接其他推送渠道可取消注释。
 # onepush>=1.4.1
+
+# 可选依赖：playwright（仅 `cli.py login` 半自动登录 Cookie 需要）。
+# 安装：pip install playwright && playwright install chromium
+# playwright>=1.40.0

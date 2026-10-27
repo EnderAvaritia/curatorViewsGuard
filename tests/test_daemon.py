@@ -6,8 +6,10 @@
   睡眠期间可优雅退出。
 """
 
+import os
 from datetime import datetime
 
+from curator_views.core import status
 from curator_views.core.daemon import Daemon, _TZ, plan_next
 
 
@@ -167,3 +169,129 @@ class TestDaemonLoop:
         )
         daemon.run_forever()
         assert executed == []
+
+
+# ── 状态文件持久化 ────────────────────────────────────────────────────────
+
+
+class TestDaemonState:
+    def test_writes_state_with_pid_and_stopped_phase(self, tmp_path):
+        state_path = tmp_path / "daemon_state.json"
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: "23:59", lambda: None,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(8, 0),
+            state_path=str(state_path),
+        )
+        daemon.run_forever()
+
+        state = status.read_state(str(state_path))
+        assert state is not None
+        assert state["pid"] == os.getpid()
+        assert state["phase"] == "stopped"
+        assert state["started_at"]
+        assert state["updated_at"]
+        assert state["stopped_at"]
+
+    def test_persists_last_run_date_and_summary(self, tmp_path):
+        state_path = tmp_path / "daemon_state.json"
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        def execute():
+            return {"need": 5, "boosted": 3}
+
+        daemon = Daemon(
+            lambda: "00:00", execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(10, 0),
+            state_path=str(state_path),
+        )
+        daemon.run_forever()
+
+        state = status.read_state(str(state_path))
+        assert state is not None
+        assert state["last_run_date"] == "2026-01-01"
+        assert state["last_run_at"]
+        assert state["last_summary"] == {"need": 5, "boosted": 3}
+        assert state["last_error"] == ""
+
+    def test_restart_same_day_does_not_execute_again(self, tmp_path):
+        state_path = tmp_path / "daemon_state.json"
+        first_calls = []
+        first_daemon = None
+
+        def first_sleeper(secs):
+            first_daemon.stop()
+
+        def first_execute():
+            first_calls.append("run")
+
+        first_daemon = Daemon(
+            lambda: "00:00", first_execute,
+            sleeper=first_sleeper, install_handlers=False,
+            now_fn=lambda: dt(0, 1),
+            state_path=str(state_path),
+        )
+        first_daemon.run_forever()
+        assert first_calls == ["run"]
+
+        # 同一天晚些时候重启：从状态文件恢复 last_run_date，不再重复执行
+        second_calls = []
+        second_daemon = None
+
+        def second_sleeper(secs):
+            second_daemon.stop()
+
+        def second_execute():
+            second_calls.append("run")
+
+        second_daemon = Daemon(
+            lambda: "00:00", second_execute,
+            sleeper=second_sleeper, install_handlers=False,
+            now_fn=lambda: dt(15, 0),
+            state_path=str(state_path),
+        )
+        second_daemon.run_forever()
+
+        assert second_calls == []
+        state = status.read_state(str(state_path))
+        assert state["last_run_date"] == "2026-01-01"
+
+    def test_execute_exception_records_last_error_and_keeps_running(
+        self, tmp_path
+    ):
+        state_path = tmp_path / "daemon_state.json"
+        calls = []
+        sleep_calls = []
+        daemon = None
+
+        def execute():
+            calls.append("run")
+            raise RuntimeError("模拟执行失败")
+
+        def sleeper(secs):
+            sleep_calls.append(1)
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: "00:00", execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(10, 0),
+            state_path=str(state_path),
+        )
+        daemon.run_forever()
+
+        assert calls == ["run"]
+        assert sleep_calls  # 异常后仍进入下一轮等待，进程未退出
+        state = status.read_state(str(state_path))
+        assert state is not None
+        assert state["last_error"] == "模拟执行失败"
+        assert state["last_run_date"] == "2026-01-01"

@@ -20,13 +20,14 @@
 CuratorViewsGuard/
 ├── steam_curator_views.py   # 旧版全量刷量脚本（仅作行为参考，新系统不依赖它）
 ├── cookie.txt               # Steam 登录 Cookie（敏感，勿提交到版本控制）
+├── config.yaml              # 本地配置（init-config 生成，含 clan_id / Cookie 路径）
+├── requirements.txt         # Python 依赖清单
 └── curator_views/           # 本系统主体
-    ├── cli.py               # 命令行入口：run / check / boost / export / init-config
-    ├── config.yaml          # 配置文件（init-config 可生成模板）
-    ├── requirements.txt     # Python 依赖清单
+    ├── cli.py               # 命令行入口：run / daemon / check / boost / login / export
     ├── README.md            # 子系统说明
     └── core/
         ├── fetcher.py       # 抓取 g_StatsAppViews 与推荐列表
+        ├── login.py         # Playwright 半自动登录，导出/校验 cookie.txt
         ├── predictor.py     # 中位数 + 封顶趋势预测
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣
         ├── booster.py       # 受控刷量执行器
@@ -113,7 +114,15 @@ CuratorViewsGuard/
 
 ```bash
 # 进入项目根目录
-pip install -r curator_views/requirements.txt
+pip install -r requirements.txt
+```
+
+`login` 命令额外需要 playwright（**可选，不属于默认安装**）。未安装时执行 `login`
+会提示安装。安装命令：
+
+```bash
+pip install playwright
+playwright install chromium
 ```
 
 ## 快速开始
@@ -128,10 +137,14 @@ python curator_views/cli.py init-config
 #    proxy        —— 代理地址（如 http://127.0.0.1:10279），可选
 #    ntfy_url / ntfy_topic —— ntfy 推送（可选）
 
-# 3. 只读巡检：抓取统计并预览预测（不会产生任何提升请求）
+# 3. 半自动登录 Steam，生成 cookie.txt（需要 playwright；会打开浏览器窗口，
+#    在页面里完成密码/验证码/手机确认，脚本自动导出并校验 Cookie）
+python curator_views/cli.py login --config config.yaml
+
+# 4. 只读巡检：抓取统计并预览预测（不会产生任何提升请求）
 python curator_views/cli.py check --config config.yaml
 
-# 4. 执行每日完整流程（抓取-预测-检测-提升-通知）
+# 5. 执行每日完整流程（抓取-预测-检测-提升-通知）
 python curator_views/cli.py run --config config.yaml
 
 # 演练模式：只计算，不真正刷量
@@ -151,8 +164,10 @@ python curator_views/cli.py run --config config.yaml --no-boost
 | --- | --- |
 | `run` | 每日完整流程（抓取 → 预测 → 检测 → 提升 → 通知） |
 | `daemon` | 守护进程模式：常驻运行，每天到点执行每日流程（配置热重载） |
+| `info` | 查看守护进程是否在运行、状态文件与本地数据概况（离线只读） |
 | `check` | 只读检查：抓取统计、打印最近 7 天与预测摘要 |
 | `boost` | 手动执行一轮受控提升 |
+| `login` | 半自动登录 Steam，生成/校验 cookie.txt（可选 playwright） |
 | `export` | 从本地数据库导出每日统计数据（json / csv） |
 | `init-config` | 生成默认配置文件模板 |
 | `version` | 打印版本号 |
@@ -182,8 +197,60 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次（重启/崩溃不影响当天任务）；
 - 单次执行失败不退出进程：记录日志后等待下一天（避免失败风暴）；
 - 支持优雅退出：Ctrl+C 或 SIGTERM（POSIX）；
+- **前台运行时 INFO 日志同时输出到控制台**：启动即打印日志文件路径与下次
+  执行时间，执行过程与结果实时可见；文件日志仍写入数据库同级的
+  `curator_views.log`；
 - 建议配合 systemd（`Restart=always`）或 Windows 任务计划程序/服务包装器
   保持进程常驻。
+
+> 想要「释放终端」只能让进程转入后台（`nohup` / `setsid` / `tmux` / systemd），
+> 静默本身并不释放控制台——进程仍在前台占用终端，只是不打印任何东西。
+
+```bash
+# 后台常驻（日志已由 CLI 写入 curator_views.log，这里只兜住启动期异常）
+nohup python curator_views/cli.py daemon --config config.yaml >/dev/null 2>&1 &
+```
+
+### 如何确认 daemon 在运行
+
+`info` 是本地离线只读命令：只读取状态文件与本地数据库，不要求 `clan_id` /
+Cookie，不访问网络，也不会在数据库不存在时创建空库。
+
+```bash
+python curator_views/cli.py info --config config.yaml
+# 需要脚本化处理时输出原始 JSON
+python curator_views/cli.py info --config config.yaml --json
+```
+
+输出示例：
+
+```
+守护进程: 运行中
+  PID: 12345
+  启动时间: 2026-10-27 18:03:12
+  当前阶段: waiting（等待下次执行）
+  上次心跳: 2026-10-27 18:20:31（12 秒前）
+  上次执行: 2026-10-26 10:00:03
+  下次执行: 2026-10-28 10:00
+  状态文件: E:\...\daemon_state.json
+配置: 每日执行 10:00；提升已关闭（采集模式）；boost_mode=stable
+数据: 12 天（2026-10-15 ~ 2026-10-26）；最新 2026-10-26 1234 次；程序启动日 2026-10-15
+```
+
+daemon 会把运行状态原子写入 **`db_path` 所在目录下的 `daemon_state.json`**
+（默认即项目根目录）。运行判断优先检查 PID：进程存在即视为运行中；PID 检查
+不可用时回退到心跳时间（90 秒内视为正常）。状态文件中还保留 `last_run_date`，
+因此 daemon 重启后同一天不会重复执行每日流程。
+
+> 说明：长时间执行提升任务时心跳可能暂停，此时存活判断仍以 PID 为准。
+> PID 复用是已知限制（进程退出后 PID 被其他进程复用时会误判为运行中）。
+
+在 `info` 出现之前，常用替代确认方式：
+
+- Windows：`tasklist | findstr python`（查看 python 进程是否存在）；
+- Linux / macOS：`ps aux | grep curator_views`；
+- 查看数据库同目录的 `curator_views.log` 是否持续有当天日志（daemon 以
+  `console=True` 运行时也会在终端打印）。
 
 ### check
 
@@ -202,6 +269,68 @@ python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--
 - `--target N`：本轮目标提升次数（必填）；
 - `--apps M`：使用的最近推荐数量（默认取配置 `boost_n`）；
 - `--dry-run`：仅记录提升计划，不发送任何请求。
+
+### login
+
+Steam 没有可靠的纯自动登录：登录页带图形验证码，新设备 / 异地登录往往还要
+Steam Guard 手机 App 确认，全自动填表很容易失败或被风控。因此 `login` 采用
+**Playwright 半自动登录**：脚本打开一个真实的 Chromium 窗口，由你在页面里
+完成登录（密码、验证码、手机确认），程序只负责轮询等待登录标志 Cookie
+`steamLoginSecure` 出现，导出 `steampowered.com` 域下的 Cookie，再用鉴赏家
+后台页面校验有效性，校验通过才原子写入 `cookie.txt`。
+
+用途：生成 / 更新 `cookie.txt`，替代手工从浏览器复制 Cookie；也可用来确认
+现有 Cookie 是否还有效。
+
+安装（可选依赖，**不属于默认安装**）：
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+未安装时执行会报：`执行失败: 未安装 playwright。请运行：pip install playwright && playwright install chromium`。
+
+```bash
+python curator_views/cli.py login --config config.yaml
+```
+
+参数：
+
+- `--config PATH`：配置文件路径（默认 `config.yaml`）；
+- `--validate-only`：只校验已有 `cookie.txt`，不打开浏览器（只读，可用于定时巡检 / 排查 Cookie 是否过期）；
+- `--headless`：无界面模式，通常无法完成验证码 / 手机确认，默认关闭；
+- `--no-validate`：登录后跳过有效性校验直接写入（不推荐）；
+- `--timeout SECONDS`：等待登录完成的超时秒数（默认 300）；
+- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`。
+
+持久化目录默认是 `config.yaml` 同目录下的 `.steam_profile/`（已加入 `.gitignore`），
+登录态保存在里面，**第二次运行通常已是登录状态，无需再输密码**，脚本会直接刷新
+Cookie。
+
+校验失败时**不会覆盖**原有 `cookie.txt`，避免坏 Cookie 顶掉可用的 Cookie。
+
+成功时以 JSON 打印汇总，**不包含 Cookie 内容本身**：
+
+```json
+{"mode": "login", "cookie_file": "cookie.txt", "clan_id": "45519015",
+ "valid": true, "reason": "Cookie 有效", "cookie_count": 12}
+```
+
+- `mode`：`login`（登录）或 `validate`（仅校验）；
+- `valid`：校验结果 `true` / `false` / `null`（`--no-validate` 或配置缺少 `clan_id` 时为 `null`，表示跳过校验）；
+- `reason`：校验结果说明，成功为 `Cookie 有效`，失败为具体原因；
+- `cookie_count`：导出的 Cookie 条数（仅登录模式输出）。
+
+退出码：成功 `0`；校验失败或文件缺失 `1`。
+
+```bash
+# 只校验现有 cookie.txt 是否仍有效（只读，不打开浏览器）
+python curator_views/cli.py login --config config.yaml --validate-only
+```
+
+> Cookie 属于敏感信息。脚本不会把它打印到日志，也不触碰你的密码；请勿将
+> `cookie.txt` 提交到版本控制或分享给他人。
 
 ### export
 
@@ -364,9 +493,10 @@ SQLite 单文件（默认 `views.db`），WAL 模式支持并发读写，包含�
 python -m pytest tests/ -v
 ```
 
-包含 52 个单元测试，覆盖预测边界、溢出检测连续段逻辑、双基线 / 斜率检测、
+包含 81 个单元测试，覆盖预测边界、溢出检测连续段逻辑、双基线 / 斜率检测、
 调度器子进程执行器、时区工具，以及手动基线 / 模式切换 / 波动率 / 恢复期 /
-标记日剔除行为。
+标记日剔除行为；`tests/test_login.py`（13 个）另外覆盖 login 的 Cookie 规范化、
+有效性校验与浏览器超时路径。
 
 ## 常见问题
 
@@ -374,7 +504,9 @@ python -m pytest tests/ -v
 
 Steam 登录态会过期。症状：`admin/overview` 被重定向到公开 curator 页（fetcher 会
 提示"请求被重定向到公开页面（可能 Cookie 已失效或未登录）"）。
-解决：重新登录 Steam，把新的 Cookie 字符串写入 `cookie.txt`。
+解决：先跑 `python curator_views/cli.py login --config config.yaml --validate-only`
+确认是否已失效，再跑 `python curator_views/cli.py login --config config.yaml`
+半自动重新生成 `cookie.txt`。
 
 ### 启动后头几天为什么不刷量
 

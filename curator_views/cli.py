@@ -5,8 +5,10 @@
   init-config  生成默认配置文件模板
   run          执行每日完整流程（抓取 -> 预测 -> 溢出检测 -> 受控提升 -> 通知）
   daemon       守护进程模式：常驻运行，每天到点重载配置并执行每日流程
+  info         查看守护进程是否在运行（本地离线，不触网）
   check        只读检查：抓取统计，打印最近 7 天与预测摘要（不提升）
   boost        手动执行一轮受控提升
+  login        半自动登录 Steam 并生成/校验 cookie.txt（需要 playwright）
   export       从本地数据库导出每日统计数据（json / csv）
   version      打印版本号
 
@@ -14,9 +16,13 @@
   python cli.py init-config
   python cli.py run --config config.yaml
   python cli.py daemon --config config.yaml
+  python cli.py info --config config.yaml
+  python cli.py info --config config.yaml --json
   python cli.py run --config config.yaml --dry-run --no-boost
   python cli.py check --config config.yaml
   python cli.py boost --config config.yaml --target 500 --apps 5 --dry-run
+  python cli.py login --config config.yaml
+  python cli.py login --config config.yaml --validate-only
   python cli.py export --config config.yaml --format csv --out stats.csv
   python cli.py version
 """
@@ -39,9 +45,18 @@ if str(_ROOT) not in sys.path:
 
 import yaml  # noqa: E402
 
+from curator_views.core import status  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
 from curator_views.core.daemon import Daemon  # noqa: E402
 from curator_views.core.fetcher import Fetcher  # noqa: E402
+from curator_views.core.login import (  # noqa: E402
+    DEFAULT_PROFILE_DIR,
+    CookieCheckResult,
+    login_via_browser,
+    normalize_cookie,
+    validate_cookie,
+    write_cookie_file,
+)
 from curator_views.core.notifier import Notifier  # noqa: E402
 from curator_views.core.predictor import predict_expected  # noqa: E402
 from curator_views.core.scheduler import run_daily  # noqa: E402
@@ -228,7 +243,8 @@ def _check_cookie_file(cookie_file: str) -> None:
         _print_error(f"Cookie 文件不存在: {cookie_file}")
         _print_error(
             "提示: 请检查 config.yaml 中的 cookie_file 配置，"
-            "并确保已把登录 Cookie 保存到该文件。"
+            "并确保已把登录 Cookie 保存到该文件"
+            "（可运行 python cli.py login 半自动生成）。"
         )
         sys.exit(1)
 
@@ -440,7 +456,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         # 每次循环重载配置，取每日执行时刻
         return str(_load_config(config_path).get("daily_time", "10:00"))
 
-    def execute_once() -> None:
+    def execute_once() -> Dict[str, Any]:
         # 每次执行前重新加载配置，命令行 --boost/--no-boost 覆盖配置
         cfg = _load_config(config_path)
         if args.boost is None:
@@ -453,12 +469,143 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         logger.info(
             "每日执行完成: %s", json.dumps(summary, ensure_ascii=False),
         )
+        return summary
 
-    daemon = Daemon(load_daily_time, execute_once)
+    state_path = status.default_state_path(db_path)
+    daemon = Daemon(load_daily_time, execute_once, state_path=state_path)
     try:
         daemon.run_forever()
     except KeyboardInterrupt:
         logger.info("守护进程被手动中断（Ctrl+C）。")
+    return 0
+
+
+def _fmt_state_time(value: Any, with_seconds: bool = True) -> str:
+    """把状态文件中的 ISO 时间格式化为本地可读文本；非法值原样/占位返回。"""
+    parsed = status.parse_timestamp(value)
+    if parsed is None:
+        return "-"
+    fmt = "%Y-%m-%d %H:%M:%S" if with_seconds else "%Y-%m-%d %H:%M"
+    return parsed.strftime(fmt)
+
+
+def _collect_info_data(db_path: str) -> Dict[str, Any]:
+    """读取本地数据库的统计摘要；数据库不存在时不创建、返回空值。"""
+    data: Dict[str, Any] = {
+        "days": 0,
+        "first_date": None,
+        "latest_date": None,
+        "latest_views": None,
+        "program_start": None,
+        "last_stats_date": None,
+    }
+    if not Path(db_path).is_file():
+        return data
+
+    storage = Storage(db_path)
+    rows = storage.get_daily_stats()
+    if rows:
+        data["days"] = len(rows)
+        data["first_date"] = status.date_ts_to_iso(rows[0]["date_ts"])
+        data["latest_date"] = status.date_ts_to_iso(rows[-1]["date_ts"])
+        data["latest_views"] = int(rows[-1]["num_views"])
+
+    program_start = storage.load_state("program_start", default="")
+    data["program_start"] = program_start or None
+
+    raw_last_stats = storage.load_state("last_stats_date", default="")
+    if raw_last_stats:
+        try:
+            parsed = json.loads(raw_last_stats)
+        except json.JSONDecodeError:
+            data["last_stats_date"] = raw_last_stats
+        else:
+            if isinstance(parsed, dict):
+                data["last_stats_date"] = parsed.get("last_date") or None
+            else:
+                data["last_stats_date"] = raw_last_stats
+    return data
+
+
+def _print_info_report(report: Dict[str, Any]) -> None:
+    """以中文人类可读格式打印 info 报告。"""
+    daemon = report["daemon"]
+    config = report["config"]
+    data = report["data"]
+
+    print(f"守护进程: {daemon['detail']}")
+    if daemon["pid"] is not None:
+        print(f"  PID: {daemon['pid']}")
+    if daemon["started_at"]:
+        print(f"  启动时间: {_fmt_state_time(daemon['started_at'])}")
+    if daemon["phase"]:
+        print(
+            f"  当前阶段: {daemon['phase']}（{daemon['phase_label']}）"
+        )
+    if daemon["updated_at"]:
+        age = daemon["heartbeat_age_seconds"]
+        suffix = f"（{round(age)} 秒前）" if age is not None else ""
+        print(f"  上次心跳: {_fmt_state_time(daemon['updated_at'])}{suffix}")
+    last_run = daemon["last_run_at"] or daemon["last_run_date"]
+    if last_run:
+        print(f"  上次执行: {_fmt_state_time(last_run)}")
+    if daemon["next_wake"]:
+        print(f"  下次执行: {_fmt_state_time(daemon['next_wake'], False)}")
+    print(f"  状态文件: {daemon['state_file']}")
+    if daemon["last_error"]:
+        print(f"  上次错误: {daemon['last_error']}")
+
+    boost_text = (
+        "提升已开启" if config["boost_enabled"] else "提升已关闭（采集模式）"
+    )
+    print(
+        f"配置: 每日执行 {config['daily_time']}；{boost_text}；"
+        f"boost_mode={config['boost_mode']}"
+    )
+
+    if data["days"]:
+        print(
+            f"数据: {data['days']} 天（{data['first_date']} ~ "
+            f"{data['latest_date']}）；最新 {data['latest_date']} "
+            f"{data['latest_views']} 次；"
+            f"程序启动日 {data['program_start'] or '未知'}"
+        )
+    else:
+        print("数据: 暂无统计数据")
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    """查看守护进程运行状态与本地数据概况。
+
+    只读本地状态文件/数据库，不要求 clan_id 或 Cookie，不触网，
+    数据库不存在时也不会创建空库。
+    """
+    config_path = Path(args.config)
+    cfg = _load_config(config_path)
+    cfg_dir = config_path.resolve().parent
+    db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
+
+    state_path = status.default_state_path(db_path)
+    state = status.read_state(state_path)
+    daemon_info = status.describe_daemon(state)
+    daemon_info["state_file"] = state_path
+    daemon_info["state_file_exists"] = Path(state_path).is_file()
+
+    report = {
+        "daemon": daemon_info,
+        "config": {
+            "daily_time": str(cfg.get("daily_time", "10:00")),
+            "boost_enabled": bool(cfg.get("boost_enabled", True)),
+            "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
+            "db_path": db_path,
+        },
+        "data": _collect_info_data(db_path),
+    }
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _print_info_report(report)
     return 0
 
 
@@ -506,6 +653,84 @@ def cmd_boost(args: argparse.Namespace) -> int:
         "apps": apps,
         "dry_run": bool(args.dry_run),
         "boosted": boosted,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    """半自动登录 Steam 并生成/校验 cookie.txt。
+
+    --validate-only 只校验已有 Cookie；正常模式打开 Chromium 由人类完成登录，
+    导出 Cookie 并通过后台页面校验后才写入文件，避免坏 Cookie 覆盖可用文件。
+    """
+    cfg = _load_config(Path(args.config))
+    cfg_dir = Path(args.config).resolve().parent
+    cookie_file = _resolve_path(
+        cfg_dir, _require(cfg, "cookie_file", "（登录 Cookie 文件路径）")
+    )
+    clan_id = str(cfg.get("clan_id") or "")
+    proxy = cfg.get("proxy") or None
+
+    if args.validate_only:
+        if not Path(cookie_file).is_file():
+            _print_error(f"Cookie 文件不存在: {cookie_file}")
+            _print_error(
+                "提示: 请先运行 "
+                f"`python cli.py login --config {args.config}` 半自动生成。"
+            )
+            return 1
+        raw = Path(cookie_file).read_text(encoding="utf-8")
+        cookie = normalize_cookie(raw)
+        if not clan_id:
+            _print_error("配置缺少 clan_id，无法校验 Cookie 有效性")
+            return 1
+        result: CookieCheckResult = validate_cookie(cookie, clan_id, proxy=proxy)
+        summary = {
+            "mode": "validate",
+            "cookie_file": cookie_file,
+            "clan_id": clan_id,
+            "valid": result.valid,
+            "reason": result.reason,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0 if result.valid else 1
+
+    if args.profile_dir:
+        profile_dir = _resolve_path(cfg_dir, args.profile_dir)
+    else:
+        profile_dir = str(cfg_dir / DEFAULT_PROFILE_DIR)
+    cookie = login_via_browser(
+        profile_dir,
+        timeout_s=args.timeout,
+        headless=args.headless,
+        proxy=proxy,
+    )
+
+    # 未显式跳过且配置了 clan_id 时，校验通过才写文件
+    valid: Optional[bool] = None
+    reason = "已跳过有效性校验"
+    if args.no_validate:
+        reason = "已跳过有效性校验（--no-validate）"
+    elif not clan_id:
+        reason = "配置缺少 clan_id，已跳过有效性校验"
+    else:
+        result = validate_cookie(cookie, clan_id, proxy=proxy)
+        valid = result.valid
+        reason = result.reason
+        if not result.valid:
+            _print_error(f"登录得到的 Cookie 校验失败：{result.reason}")
+            _print_error("已放弃写入，避免覆盖原有 Cookie 文件。")
+            return 1
+
+    write_cookie_file(cookie_file, cookie)
+    summary = {
+        "mode": "login",
+        "cookie_file": cookie_file,
+        "clan_id": clan_id,
+        "valid": valid,
+        "reason": reason,
+        "cookie_count": len(cookie.split("; ")),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
@@ -575,6 +800,15 @@ def build_parser() -> argparse.ArgumentParser:
                                help="关闭提升（优先于配置中的 boost_enabled）")
     p_daemon.set_defaults(func=cmd_daemon)
 
+    p_info = sub.add_parser(
+        "info", help="查看守护进程是否在运行（本地离线，不触网）"
+    )
+    p_info.add_argument("--config", default="config.yaml",
+                        help="配置文件路径（默认 config.yaml）")
+    p_info.add_argument("--json", action="store_true",
+                        help="以 JSON 输出原始报告")
+    p_info.set_defaults(func=cmd_info)
+
     p_check = sub.add_parser("check", help="只读检查：抓取统计并打印最近 7 天与预测摘要")
     p_check.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
     p_check.set_defaults(func=cmd_check)
@@ -588,6 +822,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_boost.add_argument("--dry-run", action="store_true",
                          help="演练模式：仅记录提升计划，不发送任何请求")
     p_boost.set_defaults(func=cmd_boost)
+
+    p_login = sub.add_parser(
+        "login", help="半自动登录 Steam 并生成/校验 cookie.txt（需要 playwright）"
+    )
+    p_login.add_argument("--config", default="config.yaml",
+                         help="配置文件路径（默认 config.yaml）")
+    p_login.add_argument("--validate-only", action="store_true",
+                         help="仅校验已有 Cookie，不打开浏览器")
+    p_login.add_argument("--headless", action="store_true",
+                         help="无界面模式——通常无法完成验证码/手机确认")
+    p_login.add_argument("--no-validate", action="store_true",
+                         help="登录后跳过有效性校验直接写入")
+    p_login.add_argument("--timeout", type=float, default=300.0,
+                         help="等待登录完成的超时秒数（默认 300）")
+    p_login.add_argument("--profile-dir", default=None,
+                         help="浏览器持久化配置目录，默认配置目录下的 .steam_profile")
+    p_login.set_defaults(func=cmd_login)
 
     p_export = sub.add_parser("export", help="导出每日统计数据")
     p_export.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")

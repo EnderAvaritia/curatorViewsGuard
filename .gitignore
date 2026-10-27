@@ -8,6 +8,8 @@ venv/
 
 # 敏感文件
 cookie.txt
+# 浏览器登录态配置目录，含登录 Cookie
+.steam_profile/
 
 # 数据库与运行时产物
 *.db

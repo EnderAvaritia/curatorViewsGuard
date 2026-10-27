@@ -27,8 +27,16 @@
 要求 Python 3.10 及以上版本。
 
 ```bash
-# 进入项目目录后安装依赖
-pip install -r curator_views/requirements.txt
+# 进入项目目录后安装依赖（requirements.txt 位于仓库根目录）
+pip install -r requirements.txt
+```
+
+`login` 命令额外需要 playwright（可选，不属于默认安装）。未安装时执行 `login`
+会提示安装。安装命令：
+
+```bash
+pip install playwright
+playwright install chromium
 ```
 
 ## 快速开始
@@ -38,7 +46,8 @@ pip install -r curator_views/requirements.txt
 python curator_views/cli.py init-config
 
 # 2. 编辑 config.yaml，填写 clan_id（鉴赏家组 ID）与 cookie_file（登录 Cookie 文件）
-#    cookie 文件内容为浏览器中复制的 Steam 登录 Cookie 字符串
+#    Cookie 文件可用 login 命令半自动生成：
+python curator_views/cli.py login --config config.yaml
 
 # 3. 只读检查：抓取统计并预览预测（不会产生任何提升请求）
 python curator_views/cli.py check --config config.yaml
@@ -75,8 +84,27 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次；
 - 单次执行失败不退出进程，记录日志后等待下一天；
+- 前台运行时 INFO 日志同时输出到控制台（启动即打印日志路径与下次执行时间），
+  文件日志仍写入数据库同级的 `curator_views.log`；
 - Ctrl+C 或 SIGTERM（POSIX）优雅退出；建议配合 systemd `Restart=always`
-  或 NSSM 保持常驻。
+  或 NSSM 保持常驻。需要释放终端请用 `nohup` / `setsid` / systemd 后台运行，
+  静默本身并不会释放控制台。
+
+### info
+
+查看守护进程是否在运行：离线只读，不要求 `clan_id` / Cookie，不触网，也
+不会创建空数据库。daemon 在 `db_path` 同级目录写入 `daemon_state.json`，
+`info` 读取它并优先按 PID 判断存活（PID 不可用时回退到 90 秒心跳阈值）。
+
+```bash
+python curator_views/cli.py info --config config.yaml
+python curator_views/cli.py info --config config.yaml --json
+```
+
+人类可读输出包含 PID、当前阶段、心跳、上次/下次执行时间与本地数据概况；
+`--json` 输出同样的原始字典，便于脚本处理。长时间提升期间心跳可能暂停，
+存活仍以 PID 为准；PID 复用是已知限制。状态文件还持久化 `last_run_date`，
+daemon 重启后同一天不会重复执行。
 
 ### run
 
@@ -120,6 +148,33 @@ python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--
 - `--target N`：本轮目标提升次数（必填）；
 - `--apps M`：使用的最近推荐数量（默认取配置中的 `boost_n`）；
 - `--dry-run`：仅记录提升计划，不发送任何请求。
+
+### login
+
+Steam 登录页有验证码、新设备/异地还要 Steam Guard 手机确认，无法可靠全自动。
+`login` 采用 Playwright 半自动登录：打开真实 Chromium 窗口由你完成登录，脚本
+等待 `steamLoginSecure` 出现后导出 Cookie，并校验有效性，通过才写入 `cookie.txt`
+（校验失败不覆盖原文件）。需额外安装 playwright（可选）：
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+```bash
+python curator_views/cli.py login --config config.yaml
+python curator_views/cli.py login --config config.yaml --validate-only
+```
+
+- `--config PATH`：配置文件路径（默认 `config.yaml`）；
+- `--validate-only`：只校验已有 `cookie.txt`，不打开浏览器；
+- `--headless`：无界面模式（通常无法完成验证码/手机确认，默认关闭）；
+- `--no-validate`：登录后跳过校验直接写入（不推荐）；
+- `--timeout SECONDS`：等待登录完成的超时（默认 300）；
+- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`。
+
+登录态保存在持久化目录 `.steam_profile/` 中，第二次运行通常已登录，无需再输密码。
+输出为 JSON 汇总（不含 Cookie 内容）：成功退出码 0，校验失败/文件缺失 1。
 
 ### export
 
