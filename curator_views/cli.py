@@ -185,6 +185,16 @@ boost_mode: stable
 # 白话：growth 模式刷到基准的 1.5 倍；stable 模式下用不上。
 growth_factor: 1.5
 
+# growth 模式下每天相对基准的变化速率（线性），可为负：
+# -0.01 = 每天目标降低基准的 1%，+0.01 = 每天升高 1%；0 = 不随时间变化。
+# 只在 growth 模式下生效，且与 growth_factor 相乘，两个一起写不冲突：
+# growth_factor 管"台阶高低"，growth_rate 管"每天匀速升降"。
+# 生效起点是首次使用该速率的当天；改速率会从改动当天重新起算，
+# 不会因为改配置而让目标突然跳变。
+# 白话：想匀速下滑就填负数（如 -0.01 = 每天降 1%），想匀速上涨填正数；
+# 想每天固定降多少最好配合 baseline_views（固定基准）使用。
+growth_rate: 0.0
+
 # 刷量波动率（0~0.3，建议 ≤ 0.15）：每天实际提升量在
 # 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在目标附近自然上下波动，
 # 避免收敛成一条笔直的线而显得不自然。过大易触发反作弊误判。
@@ -341,6 +351,7 @@ def _scheduler_config(
         "baseline_views": float(cfg.get("baseline_views", 0) or 0),
         "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
         "growth_factor": float(cfg.get("growth_factor", 1.0) or 1.0),
+        "growth_rate": float(cfg.get("growth_rate", 0) or 0),
         "volatility": float(cfg.get("volatility", 0) or 0),
         "boost_n": int(cfg.get("boost_n", 5)),
         "single_cap": int(cfg.get("single_cap", 300)),

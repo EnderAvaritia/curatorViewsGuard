@@ -47,9 +47,9 @@ CuratorViewsGuard/
   等待曲线自然回落。
 - **受控提升**：分批执行、随机间隔限速、单 App 上限、达到目标 95% 提前停止、
   连续失败自动中止，尽量模拟自然访问流量。
-- **稳定 / 刷量模式切换**：`boost_mode: stable` 维持稳定（补缺口到预测/基线水平），
-  `boost_mode: growth` 配合 `growth_factor` 倍率主动刷高目标；检测参照与目标同步，
-  不会把自己刷的量误判为恶意刷量。
+- **稳定 / 刷量 / 缓降模式切换**：`boost_mode: stable` 维持稳定（补缺口到预测/基线水平），
+  `boost_mode: growth` 用 `growth_factor` 调台阶（>1 刷高、<1 压低），再用
+  `growth_rate` 按天线性推进（正数匀速上涨、负数匀速下滑）；两者相乘、互不冲突。
 - **可配置基线 + 波动率**：可手动指定目标浏览量（`baseline_views`），并设置
   波动率（`volatility`）使每日提升量在目标附近随机波动，浏览曲线围绕基线
   自然上下起伏，避免收敛成一条笔直的不自然曲线。
@@ -92,7 +92,9 @@ CuratorViewsGuard/
 ```
 基准预期        = 中位数(最近 14 天) + 趋势修正(≤ 中位数 × 15%)
                （配置 baseline_views > 0 时直接用该固定值）
-今日目标        = 基准预期 × 倍率   （stable 倍率=1；growth 倍率=growth_factor）
+今日目标        = 基准预期 × 倍率 × 速率因子
+                 （stable 倍率=1、速率=1；growth 倍率=growth_factor）
+速率因子        = 1 + growth_rate × 距生效日天数   （线性，≥0；负值即匀速下滑）
 今日需刷量      = 今日目标 − 昨日自然流量 − 溢出抵扣    （≤ 0 则当天不刷）
 昨日自然流量    = 昨日实际 − 昨日刷量（boost_log 台账，缺失时按 0 处理）
                恢复期内强制为 0；波动率 > 0 时在 ±波动率 内随机
@@ -388,7 +390,8 @@ executor_cmd: "python cli.py boost --config {config} --target {need} --apps {app
 | `slope_threshold` | `0.02` | 斜率阈值（相对中位数/天），超阈值视为慢性爬升候选 |
 | `baseline_views` | `0` | 手动目标浏览量；大于 0 时替代自动预测，系统围绕该值刷量 |
 | `boost_mode` | `stable` | 模式切换：`stable` 维持稳定 / `growth` 刷量（目标=基准×倍率） |
-| `growth_factor` | `1.5` | growth 模式的目标倍率（如 1.5 = 比基准高 50%） |
+| `growth_factor` | `1.5` | growth 模式的目标倍率（如 1.5 = 比基准高 50%；小于 1 表示压低台阶，如 0.85） |
+| `growth_rate` | `0` | growth 模式下每天相对基准的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1% 匀速下滑）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
 | `volatility` | `0.10` | 刷量波动率：每日提升量在「缺口 ×(1±波动率)」内随机，使曲线围绕基线波动；建议 ≤ 0.15 |
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |

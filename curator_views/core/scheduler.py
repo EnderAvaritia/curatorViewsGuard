@@ -62,6 +62,50 @@ def _date_to_epoch(date_str: str) -> int:
     return int(datetime(year, month, day, tzinfo=_TZ).timestamp())
 
 
+def _resolve_growth_start(
+    storage: Storage, growth_rate: float, today_iso: str
+) -> str:
+    """返回当前速率生效的起始日；速率变化时把起点重置为今天。
+
+    锚点持久化在 kv_store 中（键 ``growth_rate`` / ``growth_start``）：
+    同一速率跨进程重启仍沿用原起点，保证"每天降 1%"按日历连续推进；
+    一旦速率被改动（含从非 0 改为 0），起点重置为今天，避免历史累计
+    天数突然生效造成目标跳变。
+    """
+    stored_rate = storage.load_state("growth_rate", default="")
+    stored_start = storage.load_state("growth_start", default="")
+    same_rate = False
+    try:
+        same_rate = abs(float(stored_rate) - growth_rate) < 1e-9
+    except (TypeError, ValueError):
+        same_rate = False
+    if not same_rate or not stored_start:
+        storage.save_state("growth_rate", f"{growth_rate:.12g}")
+        storage.save_state("growth_start", today_iso)
+        return today_iso
+    try:
+        _date_to_epoch(stored_start)
+    except (ValueError, IndexError):
+        storage.save_state("growth_start", today_iso)
+        return today_iso
+    return stored_start
+
+
+def _target_multiplier(
+    factor: float, growth_rate: float, drift_start_ts: int, day_ts: int
+) -> float:
+    """计算某天的目标倍率：factor × (1 + growth_rate × 距生效日天数)。
+
+    - ``growth_rate`` 为 0 时只返回 factor（不随时间变化）；
+    - 天数为负（生效日之前的日期）按 0 处理，倍率不会因历史日期穿越；
+    - 结果夹到非负，避免极端负速率把目标算成负数。
+    """
+    if growth_rate == 0 or drift_start_ts <= 0:
+        return max(0.0, factor)
+    days = max(0, (int(day_ts) - drift_start_ts) // 86400)
+    return max(0.0, factor * (1.0 + growth_rate * days))
+
+
 def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
     """把汇总字典格式化为每日简报正文。"""
     mode = "（演练模式，未实际提升）" if dry_run else ""
@@ -196,15 +240,22 @@ def run_daily(
         而不是直接用昨日实际。否则昨天的补量会被当成今天已有的基础重复
         扣减，导致目标补不满并在目标附近两天一摆。台账缺失时按 0 回退。
 
-    boost_mode / growth_factor：
-        统一的目标计算层：target = 基准 × 倍率。
-        - stable（默认）：倍率恒为 1，维持稳定（补缺口到预测/基线水平）；
-        - growth：倍率为 growth_factor（如 1.5 = 目标比基准高 50%），
-          主动把浏览量刷到更高水平。
-        检测参照与补缺口目标同步使用 target，避免 growth 模式把自己刷的
-        量误判为恶意刷量。注意：growth 模式配手动基线（baseline_views）
-        可刷到固定目标后稳定；配自动预测时目标随中位数水涨船高，会持续
-        爬升，慎用。
+boost_mode / growth_factor / growth_rate：
+        统一的目标计算层：target = 基准 × 倍率 × 速率因子。
+        - stable（默认）：倍率恒为 1，速率不生效（维持稳定，补缺口到预测/基线水平）；
+        - growth：倍率为 growth_factor，速率因子为
+          ``1 + growth_rate × 距生效日天数``（天数为日历天，不随重启丢失）。
+        因此 growth_factor 与 growth_rate 是相乘关系、互不冲突：
+        - growth_factor 管"水平"：>1 抬高台阶，<1 压低台阶（如 0.85 表示
+          先允许跌到基准的 85%，跌破了才托住）；
+        - growth_rate 管"斜率"：>0 每天线性抬升（如 0.01 = 每天 +基准的 1%），
+          <0 每天匀速下调（如 -0.01 = 每天 -1% 的基准，即匀速下滑）。
+        只在 growth 模式下生效；stable 模式下两者都被忽略。
+        检测参照与补缺口目标同步：增长时用抬高后的目标，避免把自己刷的量
+        误判为恶意刷量；下调时用自然预期作为参照，避免"实际高于下滑目标"
+        被误判为异常。
+        growth_rate 的生效起点是首次使用该速率的当天（持久化在 kv_store），
+        改动速率会从改动当天重新起算，避免目标突然跳变。
 
     volatility：
         刷量波动率（0~0.3，建议 ≤0.15）。>0 时每日实际提升目标在
@@ -241,6 +292,7 @@ def run_daily(
     baseline_views = float(config.get("baseline_views", 0) or 0)
     boost_mode = str(config.get("boost_mode", "stable")).lower()
     growth_factor = float(config.get("growth_factor", 1.0) or 1.0)
+    growth_rate = float(config.get("growth_rate", 0) or 0)
     volatility = float(config.get("volatility", 0) or 0)
     cooldown_days = int(config.get("cooldown_days", 7))
     exclude_flagged = bool(config.get("exclude_flagged", True))
@@ -295,11 +347,17 @@ def run_daily(
     #    被标记为恶意刷量的日期不参与预测（剔除出中位数窗口），防止虚高
     #    数据污染基线；标记集单调累加（只增不减），无新标记即收敛，
     #    至多迭代 3 轮。
-    #    目标 = 基准 × 倍率：stable 模式倍率为 1（维持稳定）；growth 模式
-    #    倍率为 growth_factor（主动刷高）。检测参照与补缺口目标统一用
-    #    目标值，避免 growth 模式把自己刷的量误判为恶意刷量。
+    #    目标 = 基准 × 倍率 × 速率因子：stable 模式倍率为 1（维持稳定）；
+    #    growth 模式倍率为 growth_factor，速率因子按 growth_rate 线性推进。
+    #    检测参照：增长时用抬高后的目标（避免把自己刷的量误判为恶意刷量），
+    #    下调时用自然预期（避免"实际高于下滑目标"被误判为异常）。
     manual_baseline = baseline_views > 0
     multiplier = growth_factor if boost_mode == "growth" else 1.0
+    drift_start_ts = 0
+    if boost_mode == "growth" and growth_rate != 0:
+        drift_start_ts = _date_to_epoch(
+            _resolve_growth_start(storage, growth_rate, today_iso)
+        )
     confirmed_flagged: set[int] = set()
     history_clean = history_sorted
     overflow: list[dict] = []
@@ -326,7 +384,7 @@ def run_daily(
         predictions: Dict[int, float] = {}
         for i, day in enumerate(history_clean):
             if manual_baseline:
-                predictions[day["date_ts"]] = baseline_views * multiplier
+                base = float(baseline_views)
             else:
                 pred = predict_expected(
                     history_clean[: i + 1],
@@ -335,7 +393,11 @@ def run_daily(
                     startup_factor=startup_factor,
                     trend_min_points=trend_min_points,
                 )
-                predictions[day["date_ts"]] = float(pred["expected"]) * multiplier
+                base = float(pred["expected"])
+            day_multiplier = _target_multiplier(
+                multiplier, growth_rate, drift_start_ts, day["date_ts"]
+            )
+            predictions[day["date_ts"]] = base * max(1.0, day_multiplier)
         overflow = detect_overflow(
             history_clean, predictions, outlier_k, consecutive_days,
             long_baseline=long_baseline,
@@ -384,7 +446,10 @@ def run_daily(
         )
         base_expected = float(today_pred["expected"])
         startup_applied = bool(today_pred.get("startup_applied", False))
-    today_expected = base_expected * multiplier
+    today_multiplier = _target_multiplier(
+        multiplier, growth_rate, drift_start_ts, today_ts
+    )
+    today_expected = base_expected * today_multiplier
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
     #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
@@ -438,6 +503,8 @@ def run_daily(
         "baseline_mode": "manual" if manual_baseline else "auto",
         "boost_mode": boost_mode,
         "growth_factor": growth_factor,
+        "growth_rate": growth_rate,
+        "target_multiplier": round(today_multiplier, 4),
         "today_target": round(today_expected, 1),
         "volatility": volatility,
         "in_cooldown": in_cooldown,

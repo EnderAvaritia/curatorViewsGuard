@@ -7,6 +7,8 @@
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+
 from curator_views.core.scheduler import (
     _TZ,
     _date_to_epoch,
@@ -100,6 +102,7 @@ def run_with(
     program_start: str,
     booster: FakeBooster,
     boost_totals: dict | None = None,
+    saved_state: dict | None = None,
     **config_overrides,
 ) -> dict:
     """以指定配置运行一次 run_daily，返回汇总字典。"""
@@ -124,6 +127,8 @@ def run_with(
     }
     config.update(config_overrides)
     storage = FakeStorage(program_start, boost_totals)
+    if saved_state:
+        storage.saved.update(saved_state)
     fetcher = FakeFetcher(stats)
     notifier = FakeNotifier()
     summary = run_daily(storage, fetcher, notifier, booster, config)
@@ -360,6 +365,101 @@ class TestGrowthMode:
         assert summary["today_expected"] == 300
         assert summary["overflow_flag_count"] == 0
         assert summary["in_cooldown"] is False
+
+
+class TestGrowthRate:
+    """growth_rate：线性升降（负值即匀速下滑），以及与 growth_factor 的乘算。"""
+
+    @staticmethod
+    def _seed_rate(rate: float, days_ago: int) -> dict:
+        """模拟"该速率已生效 days_ago 天"的持久化锚点。"""
+        start_ts = _today_epoch() - days_ago * 86400
+        start_iso = datetime.fromtimestamp(start_ts, tz=_TZ).strftime("%Y-%m-%d")
+        return {"growth_rate": f"{rate:.6f}", "growth_start": start_iso}
+
+    def test_linear_decline_uses_saved_anchor(self):
+        # manual 1000 × 1.0 × (1 - 0.01×10 天) = 900；昨日自然流量 500 → 缺口 400
+        stats = make_stats([500] * 30)
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            saved_state=self._seed_rate(-0.01, 10),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=1.0,
+            growth_rate=-0.01,
+        )
+        assert summary["today_expected"] == 900
+        assert summary["target_multiplier"] == 0.9
+        assert summary["need"] == 400
+        assert booster.last_target == 400
+
+    def test_factor_and_rate_compose(self):
+        # 0.9（台阶）× 0.9（5 天 × -2%）= 0.81 → 1000 → 810
+        stats = make_stats([500] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            saved_state=self._seed_rate(-0.02, 5),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=0.9,
+            growth_rate=-0.02,
+        )
+        assert summary["today_expected"] == pytest.approx(810)
+        assert summary["target_multiplier"] == pytest.approx(0.81)
+
+    def test_rate_change_resets_anchor_to_today(self):
+        # 持久化速率是 -0.02，配置改成 -0.01 → 锚点重置为今天，不累计旧天数
+        stats = make_stats([500] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            saved_state=self._seed_rate(-0.02, 10),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=1.0,
+            growth_rate=-0.01,
+        )
+        assert summary["today_expected"] == 1000
+        assert summary["target_multiplier"] == 1.0
+
+    def test_stable_mode_ignores_growth_rate(self):
+        stats = make_stats([500] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            saved_state=self._seed_rate(-0.01, 10),
+            baseline_views=1000,
+            boost_mode="stable",
+            growth_factor=1.5,
+            growth_rate=-0.01,
+        )
+        assert summary["today_expected"] == 1000
+        assert summary["target_multiplier"] == 1.0
+
+    def test_decline_target_not_flagged_as_overflow(self):
+        # 目标被压到 500，但真实曲线稳定在 1000：检测参照用自然预期 1000，
+        # 不能把"实际高于下滑目标"误判为恶意刷量。
+        stats = make_stats([1000] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=0.5,
+            growth_rate=0.0,
+        )
+        assert summary["today_expected"] == 500
+        assert summary["overflow_flag_count"] == 0
+        assert summary["in_cooldown"] is False
+        assert summary["need"] == 0
 
 
 class TestFlaggedExclusion:
