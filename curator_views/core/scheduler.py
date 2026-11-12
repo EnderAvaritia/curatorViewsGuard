@@ -4,7 +4,8 @@
 1. 抓取并入库 Steam 鉴赏家 g_StatsAppViews 数据（最新一条即昨日）；
 2. 以程序启动日为界过滤历史，只使用启动日之后的数据做预测；
 3. 逐日预测期望浏览量，检测异常溢出并计算后续扣减；
-4. 计算今日缺口 = 今日期望 - 昨日实际 - 溢出扣减；
+4. 计算今日缺口 = 今日期望 - 昨日自然流量 - 溢出扣减
+   （昨日自然流量 = 昨日实际 - 昨日刷量，避免把昨天的补量当成今天的基础）；
 5. 如启用提升且缺口 > 0，调用 Booster 执行受控提升
    （或通过 executor_cmd 唤起独立执行器子进程，见 run_daily）；
 6. 通过 Notifier 发送每日简报（有溢出或提升中止时升级为 warning）。
@@ -68,6 +69,8 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
         f"日期: {summary['date']}",
         f"今日预期浏览量: {summary['today_expected']:.0f}",
         f"昨日实际浏览量: {summary['yesterday_actual']}",
+        f"昨日刷量: {summary.get('yesterday_boosted', 0)}",
+        f"昨日自然流量: {summary.get('yesterday_natural', summary['yesterday_actual'])}",
         f"今日缺口: {summary['need']}",
         f"溢出扣减: {summary['deduction']:.1f}",
         f"溢出异常天数: {summary['overflow_flag_count']}",
@@ -187,6 +190,11 @@ def run_daily(
         大于 0 时启用手动基线模式：基准目标直接用该固定值，替代自动预测
         （中位数+趋势）。溢出检测的参照也使用该固定值，天然免疫被污染。
         为 0 或未配置时使用自动预测。
+
+    昨日刷量补偿：
+        缺口以"昨日自然流量"为基准（昨日实际 − boost_log 记录的昨日刷量），
+        而不是直接用昨日实际。否则昨天的补量会被当成今天已有的基础重复
+        扣减，导致目标补不满并在目标附近两天一摆。台账缺失时按 0 回退。
 
     boost_mode / growth_factor：
         统一的目标计算层：target = 基准 × 倍率。
@@ -340,10 +348,25 @@ def run_daily(
             break
         confirmed_flagged |= new_flagged
 
-    # 4. 昨日实际（g_StatsAppViews 最新一条）与今日期望
+    # 4. 昨日实际（g_StatsAppViews 最新一条）与今日期望。
+    #    注意：昨日实际里包含昨天我们自己刷的量，而今天刷的量只计入今天。
+    #    若直接拿"昨日实际"当今天的自然流量基准，等于把昨天的补量重复扣
+    #    一次，会造成目标永远补不满、并在目标附近来回补/不补（两天一摆）。
+    #    因此从 boost_log 取回昨日刷量，还原"昨日自然流量"作为今日基准。
     yesterday_actual = 0
+    yesterday_boosted = 0
     if history_clean:
-        yesterday_actual = int(history_clean[-1]["num_views"])
+        last_stat = history_clean[-1]
+        yesterday_actual = int(last_stat["num_views"])
+        last_stat_date = datetime.fromtimestamp(
+            int(last_stat["date_ts"]), tz=_TZ
+        ).strftime("%Y-%m-%d")
+        yesterday_boosted = max(
+            0, int(storage.get_boost_total(last_stat_date))
+        )
+    # 台账缺失（旧数据 / 子进程执行器写了别的库）时退化为旧行为（按 0 处理）；
+    # 刷量记录大于实际值时夹到 0，避免自然流量算成负数导致超额补量。
+    yesterday_natural = max(0, yesterday_actual - yesterday_boosted)
     # Steam 统计滞后一天：今日期望基于全部已入库数据（不含今天）
     history_without_today = [
         d for d in history_clean if d["date_ts"] < today_ts
@@ -371,10 +394,12 @@ def run_daily(
     deductions = compute_deductions(flagged_days, absorb_days)
     today_deduction = float(deductions.get(today_ts, 0.0))
 
-    # 6. 今日缺口 = 期望 - 昨日实际 - 溢出扣减。
+    # 6. 今日缺口 = 期望 - 昨日自然流量 - 溢出扣减。
+    #    自然流量已剔除昨日自己刷的量，补多少就只补"自然流量与目标之间"
+    #    的真实差额，不会把昨天的补量当成今天已有的基础重复扣减。
     #    恢复期（最近存在被标记的恶意刷量日）内强制不刷，等待曲线自然回落；
     #    波动率 > 0 时在缺口附近注入随机抖动，使曲线围绕基线上下波动。
-    need = max(0, round(today_expected - yesterday_actual - today_deduction))
+    need = max(0, round(today_expected - yesterday_natural - today_deduction))
     in_cooldown = False
     days_since_flagged = -1
     if flagged_ts_first:
@@ -402,6 +427,8 @@ def run_daily(
         "date": today_iso,
         "today_expected": today_expected,
         "yesterday_actual": yesterday_actual,
+        "yesterday_boosted": yesterday_boosted,
+        "yesterday_natural": yesterday_natural,
         "need": need,
         "deduction": today_deduction,
         "overflow_flag_count": len(flagged_days),

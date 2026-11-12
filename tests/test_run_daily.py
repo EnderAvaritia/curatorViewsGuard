@@ -19,10 +19,11 @@ from curator_views.core.scheduler import (
 
 
 class FakeStorage:
-    def __init__(self, program_start: str) -> None:
+    def __init__(self, program_start: str, boost_totals: dict | None = None) -> None:
         self._program_start = program_start
         self.written_stats = []
         self.saved = {}
+        self.boost_totals = boost_totals or {}
 
     def upsert_daily_stats(self, date_ts: int, num_views: int) -> None:
         self.written_stats.append((date_ts, num_views))
@@ -34,6 +35,9 @@ class FakeStorage:
         if key == "program_start":
             return self._program_start
         return self.saved.get(key, default)
+
+    def get_boost_total(self, date: str) -> int:
+        return int(self.boost_totals.get(date, 0))
 
 
 class FakeFetcher:
@@ -84,10 +88,18 @@ def program_start_str(start_offset_days: int = 30) -> str:
     return datetime.fromtimestamp(start_ts, tz=_TZ).strftime("%Y-%m-%d")
 
 
+def yesterday_str() -> str:
+    """make_stats 最后一条统计的日期（即 run_daily 眼中的"昨日"）。"""
+    return datetime.fromtimestamp(
+        _today_epoch() - 86400, tz=_TZ
+    ).strftime("%Y-%m-%d")
+
+
 def run_with(
     stats: list,
     program_start: str,
     booster: FakeBooster,
+    boost_totals: dict | None = None,
     **config_overrides,
 ) -> dict:
     """以指定配置运行一次 run_daily，返回汇总字典。"""
@@ -111,7 +123,7 @@ def run_with(
         "dry_run": False,
     }
     config.update(config_overrides)
-    storage = FakeStorage(program_start)
+    storage = FakeStorage(program_start, boost_totals)
     fetcher = FakeFetcher(stats)
     notifier = FakeNotifier()
     summary = run_daily(storage, fetcher, notifier, booster, config)
@@ -134,8 +146,70 @@ class TestManualBaseline:
         )
         assert summary["baseline_mode"] == "manual"
         assert summary["today_expected"] == 200
-        assert summary["need"] == 100  # 200 - 昨日实际 100
+        assert summary["need"] == 100  # 200 - 昨日自然流量 100
         assert booster.last_target == 100
+
+
+class TestBoostCompensation:
+    """昨日刷量补偿：缺口基准是“昨日自然流量”，不是“昨日实际”。"""
+
+    def test_need_subtracts_yesterday_boost(self):
+        # 昨日实际 100 里有 40 是我们刷的 → 自然流量 60，缺口 200-60=140
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        summary = run_with(
+            stats,
+            program_start_str(),
+            booster,
+            boost_totals={yesterday_str(): 40},
+            baseline_views=200,
+        )
+        assert summary["yesterday_actual"] == 100
+        assert summary["yesterday_boosted"] == 40
+        assert summary["yesterday_natural"] == 60
+        assert summary["need"] == 140
+        assert booster.last_target == 140
+
+    def test_missing_boost_log_falls_back_to_full_actual(self):
+        # 台账没有记录（旧数据 / 手动修正缺失）→ 按 0 处理，保持旧行为
+        stats = make_stats([100] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=200,
+        )
+        assert summary["yesterday_boosted"] == 0
+        assert summary["yesterday_natural"] == 100
+        assert summary["need"] == 100
+
+    def test_boost_larger_than_actual_clamps_natural_to_zero(self):
+        # 台账 150 > 实际 100：自然流量夹到 0，缺口 = 200，不能补成 250
+        stats = make_stats([100] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            boost_totals={yesterday_str(): 150},
+            baseline_views=200,
+        )
+        assert summary["yesterday_natural"] == 0
+        assert summary["need"] == 200
+
+    def test_growth_mode_also_uses_natural_flow(self):
+        # growth 目标 300；昨日自然 60 → 缺口 240（而不是 300-100=200）
+        stats = make_stats([100] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            boost_totals={yesterday_str(): 40},
+            baseline_views=200,
+            boost_mode="growth",
+            growth_factor=1.5,
+        )
+        assert summary["today_expected"] == 300
+        assert summary["need"] == 240
 
 
 class TestVolatility:
