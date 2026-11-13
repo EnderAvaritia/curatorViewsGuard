@@ -318,11 +318,31 @@ python curator_views/cli.py login --config config.yaml
 - `--headless`：无界面模式，通常无法完成验证码 / 手机确认，默认关闭；
 - `--no-validate`：登录后跳过有效性校验直接写入（不推荐）；
 - `--timeout SECONDS`：等待登录完成的超时秒数（默认 300）；
-- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`。
+- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`；
+- `--cookie-file PATH`：写入的 Cookie 文件路径（默认取配置 `cookie_file`）。
 
 持久化目录默认是 `config.yaml` 同目录下的 `.steam_profile/`（已加入 `.gitignore`），
 登录态保存在里面，**第二次运行通常已是登录状态，无需再输密码**，脚本会直接刷新
 Cookie。
+
+#### 统计 / 刷量使用两份 Cookie
+
+如果想让「看统计」和「刷量」用不同账号，配置：
+
+```yaml
+cookie_file: "cookie_stats.txt"        # 统计：需要鉴赏家管理员登录
+boost_cookie_file: "cookie_boost.txt"  # 刷量：任意可访问商店的账号
+```
+
+`boost_cookie_file` 留空时复用 `cookie_file`（旧配置行为不变）。分别生成两份
+Cookie（不同账号需用不同 `--profile-dir` 保存登录态）：
+
+```bash
+python curator_views/cli.py login --config config.yaml \
+  --cookie-file cookie_stats.txt --profile-dir .steam_profile_stats
+python curator_views/cli.py login --config config.yaml \
+  --cookie-file cookie_boost.txt --profile-dir .steam_profile_boost
+```
 
 校验失败时**不会覆盖**原有 `cookie.txt`，避免坏 Cookie 顶掉可用的 Cookie。
 
@@ -407,7 +427,8 @@ boost_list_file: "boost_plan.txt"
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，**必填** |
-| `cookie_file` | `cookie.txt` | Steam 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
+| `cookie_file` | `cookie.txt` | 统计用 Steam 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
+| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；留空则复用 `cookie_file`，填了可让统计与刷量使用不同账号 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279` |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |

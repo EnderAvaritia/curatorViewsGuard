@@ -85,6 +85,14 @@ clan_id: ""
 # 白话：放登录凭据的文件，跑一次 login 就会自动生成；没有就先不填。
 cookie_file: "cookie.txt"
 
+# 刷量专用的 Steam 登录 Cookie 文件路径（可选，相对本文件所在目录）。
+# 留空则复用上面的 cookie_file。想用不同账号分别"看统计"和"刷量"时填这里，
+# 例如用主号看后台统计、用小号刷量；该 Cookie 用
+# `python cli.py login --cookie-file boost_cookie.txt --profile-dir .steam_profile_boost`
+# 单独生成（不同账号需配合不同的 --profile-dir 保存登录态）。
+# 白话：刷量想换个小号就填这里；不填就和统计共用同一个号。
+boost_cookie_file: ""
+
 # 代理地址（可选），如 http://127.0.0.1:10279；留空表示不使用代理
 # 白话：国内直连 Steam 不稳就填代理，稳定就留空。
 proxy: ""
@@ -296,8 +304,31 @@ def _require(cfg: Dict[str, Any], key: str, hint: str = "") -> str:
     return str(value)
 
 
-def _check_cookie_file(cookie_file: str) -> bool:
+def _resolve_cookie_paths(
+    cfg: Dict[str, Any], cfg_dir: Path
+) -> tuple[str, str]:
+    """解析两份 Cookie 路径：(统计用, 刷量用)。
+
+    - 统计用读取 ``cookie_file``（访问鉴赏家后台，通常必须登录）；
+    - 刷量用读取 ``boost_cookie_file``，留空时回落到 ``cookie_file``，
+      保持旧配置行为不变。
+    """
+    stats_value = str(cfg.get("cookie_file", "") or "").strip()
+    stats_cookie = _resolve_path(cfg_dir, stats_value) if stats_value else ""
+    boost_value = str(cfg.get("boost_cookie_file", "") or "").strip()
+    if boost_value:
+        boost_cookie = _resolve_path(cfg_dir, boost_value)
+    else:
+        boost_cookie = stats_cookie
+    return stats_cookie, boost_cookie
+
+
+def _check_cookie_file(cookie_file: str, label: str = "Cookie") -> bool:
     """检查 Cookie 文件是否可用；缺失时不终止，改为未登录模式继续。
+
+    Args:
+        cookie_file: Cookie 文件路径；空串表示未配置。
+        label: 提示用的名称（如“统计 Cookie” / “刷量 Cookie”）。
 
     Returns:
         True: Cookie 文件存在，按登录模式运行；
@@ -305,13 +336,13 @@ def _check_cookie_file(cookie_file: str) -> bool:
     """
     if not cookie_file:
         print(
-            "提示: 未配置 cookie_file，将以未登录（游客）模式运行。",
+            f"提示: 未配置{label}，将以未登录（游客）模式运行。",
             file=sys.stderr,
         )
         return False
     if not Path(cookie_file).is_file():
         print(
-            f"警告: Cookie 文件不存在: {cookie_file}，"
+            f"警告: {label} 文件不存在: {cookie_file}，"
             "将以未登录（游客）模式继续；"
             "抓取后台统计可能失败（可运行 python cli.py login 生成）。",
             file=sys.stderr,
@@ -320,18 +351,36 @@ def _check_cookie_file(cookie_file: str) -> bool:
     return True
 
 
+def _check_cookie_files(stats_cookie: str, boost_cookie: str) -> None:
+    """分别检查统计 / 刷量 Cookie；两者路径相同时只提示一次。"""
+    _check_cookie_file(stats_cookie, "统计 Cookie")
+    if boost_cookie != stats_cookie:
+        _check_cookie_file(boost_cookie, "刷量 Cookie")
+
+
 def _build_runtime(
     config_path: Path,
-) -> tuple[Dict[str, Any], Path, str, str, str, Optional[str]]:
-    """加载配置并解析公共路径，返回 (cfg, cfg_dir, clan_id, cookie_file, db_path, proxy)。"""
+) -> tuple[Dict[str, Any], Path, str, str, str, str, Optional[str]]:
+    """加载配置并解析公共路径。
+
+    Returns:
+        (cfg, cfg_dir, clan_id, 统计Cookie, 刷量Cookie, db_path, proxy)
+    """
     cfg = _load_config(config_path)
     cfg_dir = config_path.resolve().parent
     clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
-    cookie_value = str(cfg.get("cookie_file", "") or "").strip()
-    cookie_file = _resolve_path(cfg_dir, cookie_value) if cookie_value else ""
+    cookie_file, boost_cookie_file = _resolve_cookie_paths(cfg, cfg_dir)
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
     proxy = cfg.get("proxy") or None
-    return cfg, cfg_dir, clan_id, cookie_file, db_path, proxy
+    return (
+        cfg,
+        cfg_dir,
+        clan_id,
+        cookie_file,
+        boost_cookie_file,
+        db_path,
+        proxy,
+    )
 
 
 def _make_booster(
@@ -429,11 +478,10 @@ def _execute_daily(
     """
     cfg_dir = Path(config_path).resolve().parent
     clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
-    cookie_value = str(cfg.get("cookie_file", "") or "").strip()
-    cookie_file = _resolve_path(cfg_dir, cookie_value) if cookie_value else ""
+    cookie_file, boost_cookie_file = _resolve_cookie_paths(cfg, cfg_dir)
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
     proxy = cfg.get("proxy") or None
-    _check_cookie_file(cookie_file)
+    _check_cookie_files(cookie_file, boost_cookie_file)
 
     storage = Storage(db_path)
     fetcher = Fetcher(clan_id, cookie_file, proxy)
@@ -441,7 +489,9 @@ def _execute_daily(
         ntfy_url=str(cfg.get("ntfy_url", "") or ""),
         ntfy_topic=str(cfg.get("ntfy_topic", "") or ""),
     )
-    booster = _make_booster(cfg, clan_id, cookie_file, proxy, storage)
+    booster = _make_booster(
+        cfg, clan_id, boost_cookie_file, proxy, storage
+    )
 
     sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run, cfg_dir)
     executor_cmd = str(cfg.get("executor_cmd", "") or "")
@@ -491,10 +541,10 @@ def _setup_logging(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
-        Path(args.config)
-    )
-    _check_cookie_file(cookie_file)
+    (
+        cfg, _cfg_dir, _clan_id, _cookie_file,
+        _boost_cookie_file, db_path, _proxy,
+    ) = _build_runtime(Path(args.config))
     _setup_logging(Path(args.config), db_path)
 
     # --no-boost 关闭提升；--boost 强制开启；两者都不传时以配置为准
@@ -741,10 +791,11 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
-        Path(args.config)
-    )
-    _check_cookie_file(cookie_file)
+    (
+        cfg, cfg_dir, clan_id, cookie_file,
+        _boost_cookie_file, db_path, proxy,
+    ) = _build_runtime(Path(args.config))
+    _check_cookie_file(cookie_file, "统计 Cookie")
 
     fetcher = Fetcher(clan_id, cookie_file, proxy)
     history = fetcher.fetch_stats()
@@ -769,13 +820,16 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_boost(args: argparse.Namespace) -> int:
-    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
-        Path(args.config)
-    )
-    _check_cookie_file(cookie_file)
+    (
+        cfg, cfg_dir, clan_id, _cookie_file,
+        boost_cookie_file, db_path, proxy,
+    ) = _build_runtime(Path(args.config))
+    _check_cookie_file(boost_cookie_file, "刷量 Cookie")
 
     storage = Storage(db_path)
-    booster = _make_booster(cfg, clan_id, cookie_file, proxy, storage)
+    booster = _make_booster(
+        cfg, clan_id, boost_cookie_file, proxy, storage
+    )
     apps = args.apps if args.apps is not None else int(cfg.get("boost_n", 5))
     boosted = booster.run(args.target, apps, args.dry_run)
 
@@ -790,16 +844,23 @@ def cmd_boost(args: argparse.Namespace) -> int:
 
 
 def cmd_login(args: argparse.Namespace) -> int:
-    """半自动登录 Steam 并生成/校验 cookie.txt。
+    """半自动登录 Steam 并生成/校验 Cookie 文件。
 
     --validate-only 只校验已有 Cookie；正常模式打开 Chromium 由人类完成登录，
     导出 Cookie 并通过后台页面校验后才写入文件，避免坏 Cookie 覆盖可用文件。
+
+    统计与刷量使用两份 Cookie 时，用 ``--cookie-file`` 指定写入目标，
+    并配合 ``--profile-dir`` 为不同账号保存独立登录态。
     """
     cfg = _load_config(Path(args.config))
     cfg_dir = Path(args.config).resolve().parent
-    cookie_file = _resolve_path(
-        cfg_dir, _require(cfg, "cookie_file", "（登录 Cookie 文件路径）")
-    )
+    stats_cookie, _boost_cookie = _resolve_cookie_paths(cfg, cfg_dir)
+    if args.cookie_file:
+        cookie_file = _resolve_path(cfg_dir, args.cookie_file)
+    elif stats_cookie:
+        cookie_file = stats_cookie
+    else:
+        cookie_file = str(cfg_dir / "cookie.txt")
     clan_id = str(cfg.get("clan_id") or "")
     proxy = cfg.get("proxy") or None
 
@@ -868,9 +929,10 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    cfg, cfg_dir, clan_id, cookie_file, db_path, proxy = _build_runtime(
-        Path(args.config)
-    )
+    (
+        _cfg, _cfg_dir, _clan_id, _cookie_file,
+        _boost_cookie_file, db_path, _proxy,
+    ) = _build_runtime(Path(args.config))
     storage = Storage(db_path)
     rows = storage.get_daily_stats()
 
@@ -969,6 +1031,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="等待登录完成的超时秒数（默认 300）")
     p_login.add_argument("--profile-dir", default=None,
                          help="浏览器持久化配置目录，默认配置目录下的 .steam_profile")
+    p_login.add_argument("--cookie-file", default=None,
+                         help="写入的 Cookie 文件路径（默认取配置 cookie_file）")
     p_login.set_defaults(func=cmd_login)
 
     p_export = sub.add_parser("export", help="导出每日统计数据")

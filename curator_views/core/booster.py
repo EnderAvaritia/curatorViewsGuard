@@ -393,7 +393,9 @@ class Booster:
         return session
 
     def _load_cookie(self) -> str:
-        """从 cookie 文件读取 cookie 字符串；失败仅警告，绝不打印内容。"""
+        """从 cookie 文件读取 cookie 字符串；未配置/失败仅警告，绝不打印内容。"""
+        if not self.cookie_file:
+            return ""
         try:
             with open(self.cookie_file, "r", encoding="utf-8") as fh:
                 return fh.read().strip()

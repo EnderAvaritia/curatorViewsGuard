@@ -1,4 +1,6 @@
-"""未配置 / 缺失 cookie_file 时以未登录（游客）模式运行的行为测试。"""
+"""Cookie 相关行为测试：未登录回退与统计/刷量双 Cookie 解析。"""
+
+from pathlib import Path
 
 from curator_views import cli
 from curator_views.core.fetcher import Fetcher
@@ -40,6 +42,59 @@ class TestCliCookieCheck:
         config.write_text(
             'clan_id: "123"\ndb_path: "views.db"\n', encoding="utf-8"
         )
-        _, _, clan_id, cookie_file, _, _ = cli._build_runtime(config)
+        _, _, clan_id, cookie_file, boost_cookie, _, _ = cli._build_runtime(
+            config
+        )
         assert clan_id == "123"
         assert cookie_file == ""
+        assert boost_cookie == ""
+
+
+class TestResolveCookiePaths:
+    def test_boost_falls_back_to_stats_cookie(self, tmp_path):
+        stats, boost = cli._resolve_cookie_paths(
+            {"cookie_file": "stats.txt"}, tmp_path
+        )
+        assert stats == str(tmp_path / "stats.txt")
+        assert boost == stats
+
+    def test_separate_cookies(self, tmp_path):
+        stats, boost = cli._resolve_cookie_paths(
+            {
+                "cookie_file": "stats.txt",
+                "boost_cookie_file": "boost.txt",
+            },
+            tmp_path,
+        )
+        assert stats == str(tmp_path / "stats.txt")
+        assert boost == str(tmp_path / "boost.txt")
+
+    def test_boost_only_cookie(self, tmp_path):
+        stats, boost = cli._resolve_cookie_paths(
+            {"boost_cookie_file": "boost.txt"}, tmp_path
+        )
+        assert stats == ""
+        assert boost == str(tmp_path / "boost.txt")
+
+    def test_both_unset(self, tmp_path):
+        assert cli._resolve_cookie_paths({}, tmp_path) == ("", "")
+
+    def test_build_runtime_returns_separate_cookies(self, tmp_path):
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            'clan_id: "123"\n'
+            'cookie_file: "stats.txt"\n'
+            'boost_cookie_file: "boost.txt"\n',
+            encoding="utf-8",
+        )
+        (
+            _cfg,
+            _cfg_dir,
+            _clan_id,
+            stats_cookie,
+            boost_cookie,
+            _db,
+            _proxy,
+        ) = cli._build_runtime(config)
+        assert Path(stats_cookie) == tmp_path / "stats.txt"
+        assert Path(boost_cookie) == tmp_path / "boost.txt"

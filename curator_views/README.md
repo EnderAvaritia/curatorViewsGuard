@@ -201,10 +201,23 @@ python curator_views/cli.py login --config config.yaml --validate-only
 - `--headless`：无界面模式（通常无法完成验证码/手机确认，默认关闭）；
 - `--no-validate`：登录后跳过校验直接写入（不推荐）；
 - `--timeout SECONDS`：等待登录完成的超时（默认 300）；
-- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`。
+- `--profile-dir PATH`：自定义浏览器持久化目录，默认配置目录下的 `.steam_profile`；
+- `--cookie-file PATH`：写入的 Cookie 文件路径（默认取配置 `cookie_file`）。
 
 登录态保存在持久化目录 `.steam_profile/` 中，第二次运行通常已登录，无需再输密码。
 输出为 JSON 汇总（不含 Cookie 内容）：成功退出码 0，校验失败/文件缺失 1。
+
+统计与刷量需要不同账号时，配置 `boost_cookie_file` 并在登录时指定目标文件
+（不同账号需用不同 `--profile-dir`）：
+
+```bash
+python curator_views/cli.py login --config config.yaml \
+  --cookie-file cookie_stats.txt --profile-dir .steam_profile_stats
+python curator_views/cli.py login --config config.yaml \
+  --cookie-file cookie_boost.txt --profile-dir .steam_profile_boost
+```
+
+`boost_cookie_file` 留空时刷量复用 `cookie_file`，旧配置行为不变。
 
 ### export
 
@@ -231,7 +244,8 @@ python curator_views/cli.py version
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，必填 |
-| `cookie_file` | `cookie.txt` | 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
+| `cookie_file` | `cookie.txt` | 统计用登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
+| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；留空则复用 `cookie_file`，填了可让统计与刷量使用不同账号 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`，留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
