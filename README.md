@@ -334,8 +334,10 @@ cookie_file: "cookie_stats.txt"        # 统计：需要鉴赏家管理员登录
 boost_cookie_file: "cookie_boost.txt"  # 刷量：任意可访问商店的账号
 ```
 
-`boost_cookie_file` 留空时复用 `cookie_file`（旧配置行为不变）。分别生成两份
-Cookie（不同账号需用不同 `--profile-dir` 保存登录态）：
+`boost_cookie_file` 留空时刷量以**未登录（游客）模式**运行，不会复用
+`cookie_file`。从旧版本升级、只配置了 `cookie_file` 的话，若希望刷量也带
+登录态，需要显式把 `boost_cookie_file` 指向同一个文件。分别生成两份 Cookie
+（不同账号需用不同 `--profile-dir` 保存登录态）：
 
 ```bash
 python curator_views/cli.py login --config config.yaml \
@@ -428,7 +430,7 @@ boost_list_file: "boost_plan.txt"
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，**必填** |
 | `cookie_file` | `cookie.txt` | 统计用 Steam 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
-| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；留空则复用 `cookie_file`，填了可让统计与刷量使用不同账号 |
+| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；与 `cookie_file` 完全独立，留空则刷量以未登录（游客）模式运行 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279` |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
@@ -647,8 +649,11 @@ python -m pytest tests/ -v
 `cookie_file` 留空或文件不存在时，程序以**未登录（游客）模式**运行：请求不
 携带 Cookie，CLI 只打印提示/警告而不退出。Steam 后台统计
 （`g_StatsAppViews`）通常需要登录，因此 `run` / `check` 可能因抓不到统计而
-失败；`boost` 访问游戏页面本身可匿名进行。需要完整功能时仍建议运行 `login`
-生成 Cookie。
+失败。
+
+刷量使用独立的 `boost_cookie_file`，留空时同样是游客模式；它**不会**回退
+复用 `cookie_file`。需要完整功能时，请分别用 `login --cookie-file` 生成统计
+与刷量两份 Cookie。
 
 ### Cookie 失效 / 抓取报"未找到 g_StatsAppViews"
 

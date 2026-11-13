@@ -86,11 +86,13 @@ clan_id: ""
 cookie_file: "cookie.txt"
 
 # 刷量专用的 Steam 登录 Cookie 文件路径（可选，相对本文件所在目录）。
-# 留空则复用上面的 cookie_file。想用不同账号分别"看统计"和"刷量"时填这里，
-# 例如用主号看后台统计、用小号刷量；该 Cookie 用
+# 与 cookie_file 完全独立：留空则刷量以未登录（游客）模式运行，
+# 不会复用上面的 cookie_file；要用登录态刷量必须在这里填路径。
+# 想用不同账号分别"看统计"和"刷量"时填这里，例如用主号看后台统计、
+# 用小号刷量；该 Cookie 用
 # `python cli.py login --cookie-file boost_cookie.txt --profile-dir .steam_profile_boost`
 # 单独生成（不同账号需配合不同的 --profile-dir 保存登录态）。
-# 白话：刷量想换个小号就填这里；不填就和统计共用同一个号。
+# 白话：刷量想用哪个号就填哪个号的 Cookie 文件；不填就是游客刷量。
 boost_cookie_file: ""
 
 # 代理地址（可选），如 http://127.0.0.1:10279；留空表示不使用代理
@@ -310,16 +312,13 @@ def _resolve_cookie_paths(
     """解析两份 Cookie 路径：(统计用, 刷量用)。
 
     - 统计用读取 ``cookie_file``（访问鉴赏家后台，通常必须登录）；
-    - 刷量用读取 ``boost_cookie_file``，留空时回落到 ``cookie_file``，
-      保持旧配置行为不变。
+    - 刷量用读取 ``boost_cookie_file``，两者完全独立；留空时刷量以
+      未登录（游客）模式运行，**不会**回退复用 ``cookie_file``。
     """
     stats_value = str(cfg.get("cookie_file", "") or "").strip()
     stats_cookie = _resolve_path(cfg_dir, stats_value) if stats_value else ""
     boost_value = str(cfg.get("boost_cookie_file", "") or "").strip()
-    if boost_value:
-        boost_cookie = _resolve_path(cfg_dir, boost_value)
-    else:
-        boost_cookie = stats_cookie
+    boost_cookie = _resolve_path(cfg_dir, boost_value) if boost_value else ""
     return stats_cookie, boost_cookie
 
 

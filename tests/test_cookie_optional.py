@@ -51,12 +51,13 @@ class TestCliCookieCheck:
 
 
 class TestResolveCookiePaths:
-    def test_boost_falls_back_to_stats_cookie(self, tmp_path):
+    def test_boost_does_not_fall_back_to_stats_cookie(self, tmp_path):
+        # boost_cookie_file 留空 → 刷量走游客模式，不复用统计 Cookie
         stats, boost = cli._resolve_cookie_paths(
             {"cookie_file": "stats.txt"}, tmp_path
         )
         assert stats == str(tmp_path / "stats.txt")
-        assert boost == stats
+        assert boost == ""
 
     def test_separate_cookies(self, tmp_path):
         stats, boost = cli._resolve_cookie_paths(

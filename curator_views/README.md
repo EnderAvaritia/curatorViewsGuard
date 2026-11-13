@@ -217,7 +217,9 @@ python curator_views/cli.py login --config config.yaml \
   --cookie-file cookie_boost.txt --profile-dir .steam_profile_boost
 ```
 
-`boost_cookie_file` 留空时刷量复用 `cookie_file`，旧配置行为不变。
+`boost_cookie_file` 与 `cookie_file` 完全独立：留空时刷量以未登录（游客）模式
+运行，不会复用 `cookie_file`。旧配置若希望刷量带登录态，需显式把
+`boost_cookie_file` 指向同一文件。
 
 ### export
 
@@ -245,7 +247,7 @@ python curator_views/cli.py version
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，必填 |
 | `cookie_file` | `cookie.txt` | 统计用登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
-| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；留空则复用 `cookie_file`，填了可让统计与刷量使用不同账号 |
+| `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；与 `cookie_file` 完全独立，留空则刷量以未登录（游客）模式运行 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`，留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
