@@ -50,7 +50,8 @@ playwright install chromium
 # 1. 生成默认配置文件（位于当前目录 config.yaml）
 python curator_views/cli.py init-config
 
-# 2. 编辑 config.yaml，填写 clan_id（鉴赏家组 ID）与 cookie_file（登录 Cookie 文件）
+# 2. 编辑 config.yaml，填写 clan_id（鉴赏家组 ID）；cookie_file 可选
+#    （留空/文件不存在则未登录运行，后台统计可能抓取失败）
 #    Cookie 文件可用 login 命令半自动生成：
 python curator_views/cli.py login --config config.yaml
 
@@ -230,7 +231,7 @@ python curator_views/cli.py version
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，必填 |
-| `cookie_file` | `cookie.txt` | 登录 Cookie 文件路径 |
+| `cookie_file` | `cookie.txt` | 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`，留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |

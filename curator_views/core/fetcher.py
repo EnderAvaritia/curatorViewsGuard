@@ -52,7 +52,7 @@ class Fetcher:
     def __init__(
         self,
         clan_id: str,
-        cookie_file: str,
+        cookie_file: str = "",
         proxy: Optional[str] = None,
         timeout: float = 30.0,
     ) -> None:
@@ -60,7 +60,8 @@ class Fetcher:
 
         Args:
             clan_id: Steam 鉴赏家组 ID。
-            cookie_file: 存放登录 Cookie 的文本文件路径。
+            cookie_file: 存放登录 Cookie 的文本文件路径。留空或文件不存在
+                时以未登录（游客）模式运行：不发送 Cookie 请求头。
             proxy: 可选代理地址，如 http://127.0.0.1:10279。
             timeout: 单次请求超时时间（秒），默认 30 秒。
         """
@@ -71,19 +72,23 @@ class Fetcher:
         self._session = self._make_session()
 
     def _load_cookie(self) -> str:
-        """读取 Cookie 文件并去除首尾空白。"""
-        with open(self._cookie_file, "r", encoding="utf-8") as f:
-            return f.read().strip()
+        """读取 Cookie 文件并去除首尾空白；未配置或文件不存在时返回空串。"""
+        if not self._cookie_file:
+            return ""
+        try:
+            with open(self._cookie_file, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return ""
 
     def _make_session(self) -> requests.Session:
-        """构造带 Cookie 与可选代理的 requests.Session。"""
+        """构造带 Cookie（若可用）与可选代理的 requests.Session。"""
         session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "Cookie": self._load_cookie(),
-            }
-        )
+        headers = {"User-Agent": USER_AGENT}
+        cookie = self._load_cookie()
+        if cookie:
+            headers["Cookie"] = cookie
+        session.headers.update(headers)
         if self._proxy:
             session.proxies.update(
                 {"http": self._proxy, "https": self._proxy}

@@ -142,9 +142,9 @@ playwright install chromium
 # 1. 生成默认配置文件
 python curator_views/cli.py init-config
 
-# 2. 编辑 config.yaml，填写必填项：
-#    clan_id      —— Steam 鉴赏家组 ID（纯数字，如 45519015）
-#    cookie_file  —— 存放 Steam 登录 Cookie 的文本文件
+# 2. 编辑 config.yaml，填写配置：
+#    clan_id      —— Steam 鉴赏家组 ID（纯数字，如 45519015），必填
+#    cookie_file  —— 登录 Cookie 文件，可选；留空/文件不存在则以未登录模式运行
 #    proxy        —— 代理地址（如 http://127.0.0.1:10279），可选
 #    ntfy_url / ntfy_topic —— ntfy 推送（可选）
 
@@ -407,7 +407,7 @@ boost_list_file: "boost_plan.txt"
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `clan_id` | （空） | Steam 鉴赏家组 ID，纯数字，**必填** |
-| `cookie_file` | `cookie.txt` | Steam 登录 Cookie 文件路径 |
+| `cookie_file` | `cookie.txt` | Steam 登录 Cookie 文件路径；留空或文件不存在时以未登录（游客）模式运行，不发送 Cookie |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279` |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
@@ -620,6 +620,14 @@ python -m pytest tests/ -v
 有效性校验与浏览器超时路径。
 
 ## 常见问题
+
+### 不设置 cookie_file 会怎样
+
+`cookie_file` 留空或文件不存在时，程序以**未登录（游客）模式**运行：请求不
+携带 Cookie，CLI 只打印提示/警告而不退出。Steam 后台统计
+（`g_StatsAppViews`）通常需要登录，因此 `run` / `check` 可能因抓不到统计而
+失败；`boost` 访问游戏页面本身可匿名进行。需要完整功能时仍建议运行 `login`
+生成 Cookie。
 
 ### Cookie 失效 / 抓取报"未找到 g_StatsAppViews"
 

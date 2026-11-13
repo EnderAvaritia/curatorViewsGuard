@@ -79,7 +79,10 @@ DEFAULT_CONFIG = r"""# Steam 鉴赏家浏览量预测与受控提升系统配置
 clan_id: ""
 
 # 存放 Steam 登录 Cookie 的文本文件路径（相对本文件所在目录）
-# 白话：放登录凭据的文件，跑一次 login 就会自动生成。
+# 留空或文件不存在时以未登录（游客）模式运行（不发送 Cookie）。
+# 注意：Steam 后台统计通常需要登录，未登录时抓取统计可能失败；
+# 仅访问游戏页面刷量的场景一般不受影响。
+# 白话：放登录凭据的文件，跑一次 login 就会自动生成；没有就先不填。
 cookie_file: "cookie.txt"
 
 # 代理地址（可选），如 http://127.0.0.1:10279；留空表示不使用代理
@@ -293,16 +296,28 @@ def _require(cfg: Dict[str, Any], key: str, hint: str = "") -> str:
     return str(value)
 
 
-def _check_cookie_file(cookie_file: str) -> None:
-    """确认 Cookie 文件存在，否则给出清晰错误提示。"""
-    if not Path(cookie_file).is_file():
-        _print_error(f"Cookie 文件不存在: {cookie_file}")
-        _print_error(
-            "提示: 请检查 config.yaml 中的 cookie_file 配置，"
-            "并确保已把登录 Cookie 保存到该文件"
-            "（可运行 python cli.py login 半自动生成）。"
+def _check_cookie_file(cookie_file: str) -> bool:
+    """检查 Cookie 文件是否可用；缺失时不终止，改为未登录模式继续。
+
+    Returns:
+        True: Cookie 文件存在，按登录模式运行；
+        False: 未配置或文件不存在，调用方应以未登录（游客）模式继续。
+    """
+    if not cookie_file:
+        print(
+            "提示: 未配置 cookie_file，将以未登录（游客）模式运行。",
+            file=sys.stderr,
         )
-        sys.exit(1)
+        return False
+    if not Path(cookie_file).is_file():
+        print(
+            f"警告: Cookie 文件不存在: {cookie_file}，"
+            "将以未登录（游客）模式继续；"
+            "抓取后台统计可能失败（可运行 python cli.py login 生成）。",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _build_runtime(
@@ -312,9 +327,8 @@ def _build_runtime(
     cfg = _load_config(config_path)
     cfg_dir = config_path.resolve().parent
     clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
-    cookie_file = _resolve_path(
-        cfg_dir, _require(cfg, "cookie_file", "（登录 Cookie 文件路径）")
-    )
+    cookie_value = str(cfg.get("cookie_file", "") or "").strip()
+    cookie_file = _resolve_path(cfg_dir, cookie_value) if cookie_value else ""
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
     proxy = cfg.get("proxy") or None
     return cfg, cfg_dir, clan_id, cookie_file, db_path, proxy
@@ -415,9 +429,8 @@ def _execute_daily(
     """
     cfg_dir = Path(config_path).resolve().parent
     clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
-    cookie_file = _resolve_path(
-        cfg_dir, _require(cfg, "cookie_file", "（登录 Cookie 文件路径）")
-    )
+    cookie_value = str(cfg.get("cookie_file", "") or "").strip()
+    cookie_file = _resolve_path(cfg_dir, cookie_value) if cookie_value else ""
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
     proxy = cfg.get("proxy") or None
     _check_cookie_file(cookie_file)
