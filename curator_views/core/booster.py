@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 from bs4 import BeautifulSoup
 
-from .fetcher import Fetcher
+from .fetcher import Fetcher, read_cookie_file
 from .storage import Storage
 
 logger = logging.getLogger("curator_views.booster")
@@ -393,12 +393,15 @@ class Booster:
         return session
 
     def _load_cookie(self) -> str:
-        """从 cookie 文件读取 cookie 字符串；未配置/失败仅警告，绝不打印内容。"""
-        if not self.cookie_file:
-            return ""
+        """从 cookie 文件读取 cookie 字符串；未配置/文件缺失仅警告，绝不打印内容。
+
+        Raises:
+            CookieFileError: 文件存在但内容损坏（非 UTF-8 / 含非 ASCII 字符）。
+        """
         try:
-            with open(self.cookie_file, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
+            return read_cookie_file(self.cookie_file)
+        except FileNotFoundError:
+            return ""
         except OSError as exc:
             logger.warning(
                 "读取 cookie 文件失败（%s），将尝试匿名访问。", exc,

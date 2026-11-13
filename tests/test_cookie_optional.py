@@ -2,8 +2,16 @@
 
 from pathlib import Path
 
+import pytest
+
 from curator_views import cli
-from curator_views.core.fetcher import Fetcher
+from curator_views.core.booster import Booster
+from curator_views.core.fetcher import (
+    CookieFileError,
+    Fetcher,
+    read_cookie_file,
+)
+from curator_views.core.storage import Storage
 
 
 class TestFetcherWithoutCookie:
@@ -20,6 +28,66 @@ class TestFetcherWithoutCookie:
         path.write_text("  steamLoginSecure=abc;  \n", encoding="utf-8")
         fetcher = Fetcher("123", str(path))
         assert fetcher._session.headers["Cookie"] == "steamLoginSecure=abc;"
+
+
+class TestCookieFileValidation:
+    """Cookie 文件损坏时应给出可读错误，而不是 latin-1 编码异常。"""
+
+    def test_read_cookie_file_returns_stripped_ascii_cookie(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("  a=1; b=2  \n", encoding="utf-8")
+        assert read_cookie_file(str(path)) == "a=1; b=2"
+
+    def test_truncated_cookie_with_ellipsis_raises_clear_error(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("a" * 512 + "…" + "b=2", encoding="utf-8")
+
+        with pytest.raises(CookieFileError) as excinfo:
+            Fetcher("123", str(path))
+
+        message = str(excinfo.value)
+        assert "第 513 个字符" in message
+        assert "U+2026" in message
+        assert "省略号" in message
+
+    def test_newline_inside_cookie_raises_clear_error(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("a=1\nb=2", encoding="utf-8")
+
+        with pytest.raises(CookieFileError) as excinfo:
+            Fetcher("123", str(path))
+
+        assert "U+000A" in str(excinfo.value)
+
+    def test_non_utf8_cookie_file_raises_clear_error(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_bytes(b"\xff\xfe\x00")
+
+        with pytest.raises(CookieFileError) as excinfo:
+            Fetcher("123", str(path))
+
+        assert "UTF-8" in str(excinfo.value)
+
+    def test_booster_propagates_cookie_file_error(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("a=1…", encoding="utf-8")
+        booster = Booster(
+            clan_id="123",
+            cookie_file=str(path),
+            proxy=None,
+            storage=Storage(str(tmp_path / "views.db")),
+            batch_size=50,
+            single_cap=300,
+            threads=1,
+            wait_min=0.0,
+            wait_max=0.0,
+            max_retries=3,
+            target_ratio=0.95,
+            distribution="ratio",
+        )
+
+        with pytest.raises(CookieFileError):
+            booster._load_cookie()
 
 
 class TestCliCookieCheck:

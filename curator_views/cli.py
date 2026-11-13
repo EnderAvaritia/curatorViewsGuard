@@ -50,7 +50,11 @@ from curator_views.core import status  # noqa: E402
 from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
 from curator_views.core.daemon import Daemon  # noqa: E402
-from curator_views.core.fetcher import Fetcher  # noqa: E402
+from curator_views.core.fetcher import (  # noqa: E402
+    CookieFileError,
+    Fetcher,
+    validate_cookie_header,
+)
 from curator_views.core.login import (  # noqa: E402
     DEFAULT_PROFILE_DIR,
     CookieCheckResult,
@@ -873,6 +877,11 @@ def cmd_login(args: argparse.Namespace) -> int:
             return 1
         raw = Path(cookie_file).read_text(encoding="utf-8")
         cookie = normalize_cookie(raw)
+        try:
+            validate_cookie_header(cookie)
+        except CookieFileError as exc:
+            _print_error(str(exc))
+            return 1
         if not clan_id:
             _print_error("配置缺少 clan_id，无法校验 Cookie 有效性")
             return 1

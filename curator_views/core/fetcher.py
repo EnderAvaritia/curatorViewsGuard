@@ -32,6 +32,77 @@ USER_AGENT = (
 # 匹配页面内 JS 变量 g_StatsAppViews = [...]（约 364 天的每日浏览量）
 STATS_REGEX = re.compile(r"g_StatsAppViews\s*=\s*(\[.*?\]);", re.S)
 
+
+class CookieFileError(RuntimeError):
+    """Cookie 文件内容不可用（非 UTF-8，或含无法放入 HTTP 头的字符）。"""
+
+
+def _describe_bad_cookie_chars(text: str) -> str:
+    """列出文本中无法放入 HTTP 头的字符（最多 3 个，含位置与码点）。"""
+    bad = []
+    for index, char in enumerate(text):
+        code = ord(char)
+        # HTTP 头按 latin-1 编码，只允许可见 ASCII 与空格
+        if code != 0x20 and not 0x21 <= code <= 0x7E:
+            bad.append((index, char, code))
+            if len(bad) >= 3:
+                break
+    return "、".join(
+        f"第 {index + 1} 个字符 {char!r}（U+{code:04X}）"
+        for index, char, code in bad
+    )
+
+
+def validate_cookie_header(cookie: str) -> None:
+    """校验 Cookie 字符串能否安全放入 HTTP 请求头。
+
+    ``requests`` / ``http.client`` 发送请求时会用 latin-1 编码 Cookie 头，
+    一旦混入非 ASCII 字符（复制粘贴截断常见的 ``…``）或换行，就会抛出
+    含义不明的 ``UnicodeEncodeError`` / ``ValueError``。这里提前校验，
+    给出可操作的提示。
+
+    Args:
+        cookie: 待校验的 Cookie 字符串。
+
+    Raises:
+        CookieFileError: Cookie 含有无法放入 HTTP 头的字符。
+    """
+    bad = _describe_bad_cookie_chars(cookie)
+    if bad:
+        raise CookieFileError(
+            f"Cookie 含无法放入 HTTP 请求头的字符：{bad}。"
+            "常见原因是 Cookie 在复制/粘贴时被截断（例如出现省略号 '…'）"
+            "或带有换行；请重新运行 `python cli.py login` 生成完整 Cookie。"
+        )
+
+
+def read_cookie_file(path: str) -> str:
+    """读取 Cookie 文件并校验其可安全放入 HTTP 请求头。
+
+    Args:
+        path: Cookie 文件路径；空串表示未配置，直接返回空串。
+
+    Returns:
+        去除首尾空白后的 Cookie 字符串。
+
+    Raises:
+        FileNotFoundError: 文件不存在。
+        CookieFileError: 文件不是 UTF-8，或含无法放入 HTTP 头的字符。
+    """
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except UnicodeDecodeError as exc:
+        raise CookieFileError(
+            f"Cookie 文件不是有效的 UTF-8 文本（{path}）：{exc}；"
+            "请重新运行 `python cli.py login` 生成。"
+        ) from exc
+    cookie = text.strip()
+    validate_cookie_header(cookie)
+    return cookie
+
 # 推荐列表接口的固定查询参数（count=300 保证取到足够多的近期推荐）
 RECOMMENDATION_PARAMS = {
     "query": "",
@@ -72,12 +143,13 @@ class Fetcher:
         self._session = self._make_session()
 
     def _load_cookie(self) -> str:
-        """读取 Cookie 文件并去除首尾空白；未配置或文件不存在时返回空串。"""
-        if not self._cookie_file:
-            return ""
+        """读取 Cookie 文件；未配置或文件不存在时返回空串。
+
+        Raises:
+            CookieFileError: 文件存在但内容损坏（非 UTF-8 / 含非 ASCII 字符）。
+        """
         try:
-            with open(self._cookie_file, "r", encoding="utf-8") as f:
-                return f.read().strip()
+            return read_cookie_file(self._cookie_file)
         except FileNotFoundError:
             return ""
 
