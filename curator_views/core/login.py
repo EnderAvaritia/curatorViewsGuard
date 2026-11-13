@@ -13,7 +13,6 @@ Steam 没有稳定可靠的纯无头登录方式：登录页带图形验证码�
 """
 
 import os
-import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -22,7 +21,12 @@ from typing import Any, Callable, Dict, Iterable, Optional
 
 import requests
 
-from curator_views.core.fetcher import STATS_REGEX, STATS_URL, USER_AGENT
+from curator_views.core.fetcher import (
+    STATS_REGEX,
+    STATS_URL,
+    USER_AGENT,
+    normalize_cookie,
+)
 
 # Steam 登录页地址
 LOGIN_URL = "https://store.steampowered.com/login/"
@@ -32,31 +36,6 @@ DEFAULT_PROFILE_DIR = ".steam_profile"
 
 # 登录成功的标志 Cookie 名称
 _LOGIN_COOKIE_NAME = "steamLoginSecure"
-
-
-def normalize_cookie(raw: str) -> str:
-    """把从浏览器复制来的原始 Cookie 字符串规范化。
-
-    处理常见的复制粘贴噪声：换行、``Cookie:`` / ``cookie:`` 前缀、
-    结尾分号与多余空白。除分割/拼接外不改变 ``name=value`` 内容本身。
-
-    Args:
-        raw: 原始 Cookie 字符串（可含换行、前缀、结尾分号）。
-
-    Returns:
-        以 ``"; "`` 连接、无结尾分号的规范字符串；空输入返回空串。
-    """
-    if not raw:
-        return ""
-    text = raw.strip()
-    if text[:7].lower() == "cookie:":
-        text = text[7:]
-    fragments = []
-    for piece in re.split(r"[;\r\n]+", text):
-        piece = piece.strip()
-        if piece:
-            fragments.append(piece)
-    return "; ".join(fragments)
 
 
 def build_cookie_string(cookies: Iterable[Dict[str, Any]]) -> str:

@@ -53,13 +53,13 @@ from curator_views.core.daemon import Daemon  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
     CookieFileError,
     Fetcher,
+    extract_cookie,
     validate_cookie_header,
 )
 from curator_views.core.login import (  # noqa: E402
     DEFAULT_PROFILE_DIR,
     CookieCheckResult,
     login_via_browser,
-    normalize_cookie,
     validate_cookie,
     write_cookie_file,
 )
@@ -876,7 +876,7 @@ def cmd_login(args: argparse.Namespace) -> int:
             )
             return 1
         raw = Path(cookie_file).read_text(encoding="utf-8")
-        cookie = normalize_cookie(raw)
+        cookie = extract_cookie(raw)
         try:
             validate_cookie_header(cookie)
         except CookieFileError as exc:

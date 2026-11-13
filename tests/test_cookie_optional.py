@@ -27,7 +27,7 @@ class TestFetcherWithoutCookie:
         path = tmp_path / "cookie.txt"
         path.write_text("  steamLoginSecure=abc;  \n", encoding="utf-8")
         fetcher = Fetcher("123", str(path))
-        assert fetcher._session.headers["Cookie"] == "steamLoginSecure=abc;"
+        assert fetcher._session.headers["Cookie"] == "steamLoginSecure=abc"
 
 
 class TestCookieFileValidation:
@@ -50,15 +50,6 @@ class TestCookieFileValidation:
         assert "U+2026" in message
         assert "省略号" in message
 
-    def test_newline_inside_cookie_raises_clear_error(self, tmp_path):
-        path = tmp_path / "cookie.txt"
-        path.write_text("a=1\nb=2", encoding="utf-8")
-
-        with pytest.raises(CookieFileError) as excinfo:
-            Fetcher("123", str(path))
-
-        assert "U+000A" in str(excinfo.value)
-
     def test_non_utf8_cookie_file_raises_clear_error(self, tmp_path):
         path = tmp_path / "cookie.txt"
         path.write_bytes(b"\xff\xfe\x00")
@@ -67,6 +58,56 @@ class TestCookieFileValidation:
             Fetcher("123", str(path))
 
         assert "UTF-8" in str(excinfo.value)
+
+
+class TestBrowserCookiePaste:
+    """兼容浏览器复制的 Cookie 值 / 请求头 / cURL。"""
+
+    def test_single_line_cookie_header(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("Cookie: a=1; b=2\n", encoding="utf-8")
+        assert read_cookie_file(str(path)) == "a=1; b=2"
+
+    def test_multi_line_request_headers_ignore_other_headers(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text(
+            "Accept: */*\n"
+            "Cookie: a=1; b=2\n"
+            "User-Agent: 中文浏览器\n"
+            "Referer: https://store.steampowered.com/\n",
+            encoding="utf-8",
+        )
+        assert read_cookie_file(str(path)) == "a=1; b=2"
+
+    def test_multiple_cookie_lines_take_last(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text(
+            "cookie: old=1\nCookie: new=2\n", encoding="utf-8"
+        )
+        assert read_cookie_file(str(path)) == "new=2"
+
+    def test_curl_header_flag(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text(
+            "curl 'https://store.steampowered.com/' \\\n"
+            "  -H 'Cookie: a=1; b=2' \\\n"
+            "  -H 'User-Agent: Firefox'\n",
+            encoding="utf-8",
+        )
+        assert read_cookie_file(str(path)) == "a=1; b=2"
+
+    def test_curl_cookie_flag(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text(
+            "curl https://store.steampowered.com/ -b 'a=1; b=2'\n",
+            encoding="utf-8",
+        )
+        assert read_cookie_file(str(path)) == "a=1; b=2"
+
+    def test_plain_multiline_cookie_pairs(self, tmp_path):
+        path = tmp_path / "cookie.txt"
+        path.write_text("a=1;\nb=2\n", encoding="utf-8")
+        assert read_cookie_file(str(path)) == "a=1; b=2"
 
     def test_booster_propagates_cookie_file_error(self, tmp_path):
         path = tmp_path / "cookie.txt"

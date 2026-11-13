@@ -37,6 +37,83 @@ class CookieFileError(RuntimeError):
     """Cookie 文件内容不可用（非 UTF-8，或含无法放入 HTTP 头的字符）。"""
 
 
+# 行首的 "Cookie:" 前缀（大小写不敏感）
+_COOKIE_PREFIX_RE = re.compile(r"^\s*cookie\s*:\s*", re.I)
+# 请求头块中的 Cookie 行；同一段文本有多行时取最后一条
+_COOKIE_HEADER_LINE_RE = re.compile(r"(?im)^[ \t]*cookie[ \t]*:[ \t]*([^\r\n]+)")
+# cURL 的 -H/--header（值是 "Cookie: ..."）与 -b/--cookie（值就是 Cookie）
+_CURL_COOKIE_RE = re.compile(
+    r"(-H|--header|-b|--cookie)\s+(['\"])(.*?)\2", re.S | re.I
+)
+# shell 中反斜杠换行的续行写法，常见于 "Copy as cURL"
+_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n")
+
+
+def normalize_cookie(raw: str) -> str:
+    """把 Cookie 字符串规范化成单行 ``a=1; b=2`` 形式。
+
+    兼容浏览器复制出来的常见噪声：``Cookie:`` 前缀、多行（每个 Cookie
+    一行）、行尾多余分号、cURL 的反斜杠续行。不改变 ``name=value`` 本身。
+
+    Args:
+        raw: 原始 Cookie 文本（可含前缀、换行、续行符）。
+
+    Returns:
+        以 ``"; "`` 连接、无结尾分号的字符串；空输入返回空串。
+    """
+    text = raw.strip()
+    prefix = _COOKIE_PREFIX_RE.match(text)
+    if prefix:
+        text = text[prefix.end():]
+    text = _LINE_CONTINUATION_RE.sub("", text)
+    pieces = [
+        piece.strip()
+        for piece in re.split(r"[;\r\n]+", text)
+        if piece.strip()
+    ]
+    return "; ".join(pieces)
+
+
+def _extract_curl_cookie(text: str) -> Optional[str]:
+    """从 cURL 命令中提取 Cookie；找不到 Cookie 参数时返回 None。"""
+    found: list[str] = []
+    for match in _CURL_COOKIE_RE.finditer(text):
+        flag = match.group(1).lower()
+        value = match.group(3).strip()
+        if value.lower().startswith("cookie:"):
+            found.append(value[len("cookie:"):])
+        elif flag in ("-b", "--cookie"):
+            found.append(value)
+    return "; ".join(found) if found else None
+
+
+def extract_cookie(raw: str) -> str:
+    """从纯 Cookie、浏览器请求头块或 cURL 命令中提取并规范化 Cookie。
+
+    支持三种常见的浏览器粘贴形式：
+
+    - 纯 Cookie 值：``a=1; b=2``
+    - 单行或多行请求头块：``Cookie: a=1; b=2``（其余请求头会被忽略）
+    - ``Copy as cURL``：``-H 'Cookie: ...'`` 或 ``-b '...'``
+
+    Args:
+        raw: 文件或剪贴板中的原始文本。
+
+    Returns:
+        规范化后的 Cookie 字符串；空输入返回空串。
+    """
+    text = raw.lstrip("\ufeff").strip()
+    if not text:
+        return ""
+    curl = _extract_curl_cookie(text)
+    if curl is not None:
+        return normalize_cookie(curl)
+    header_lines = _COOKIE_HEADER_LINE_RE.findall(text)
+    if header_lines:
+        return normalize_cookie(header_lines[-1])
+    return normalize_cookie(text)
+
+
 def _describe_bad_cookie_chars(text: str) -> str:
     """列出文本中无法放入 HTTP 头的字符（最多 3 个，含位置与码点）。"""
     bad = []
@@ -71,23 +148,24 @@ def validate_cookie_header(cookie: str) -> None:
     if bad:
         raise CookieFileError(
             f"Cookie 含无法放入 HTTP 请求头的字符：{bad}。"
-            "常见原因是 Cookie 在复制/粘贴时被截断（例如出现省略号 '…'）"
-            "或带有换行；请重新运行 `python cli.py login` 生成完整 Cookie。"
+            "若这些字符来自被截断的 Cookie（如结尾的省略号 '…'），"
+            "复制时缺失的内容无法恢复，请重新完整复制 Cookie，"
+            "或运行 `python cli.py login` 重新生成。"
         )
 
 
 def read_cookie_file(path: str) -> str:
-    """读取 Cookie 文件并校验其可安全放入 HTTP 请求头。
+    """读取 Cookie 文件，兼容浏览器复制的请求头 / cURL，并校验请求头安全。
 
     Args:
         path: Cookie 文件路径；空串表示未配置，直接返回空串。
 
     Returns:
-        去除首尾空白后的 Cookie 字符串。
+        规范化后的 Cookie 字符串。
 
     Raises:
         FileNotFoundError: 文件不存在。
-        CookieFileError: 文件不是 UTF-8，或含无法放入 HTTP 头的字符。
+        CookieFileError: 文件不是 UTF-8，或 Cookie 含无法放入 HTTP 头的字符。
     """
     if not path:
         return ""
@@ -99,7 +177,7 @@ def read_cookie_file(path: str) -> str:
             f"Cookie 文件不是有效的 UTF-8 文本（{path}）：{exc}；"
             "请重新运行 `python cli.py login` 生成。"
         ) from exc
-    cookie = text.strip()
+    cookie = extract_cookie(text)
     validate_cookie_header(cookie)
     return cookie
 
