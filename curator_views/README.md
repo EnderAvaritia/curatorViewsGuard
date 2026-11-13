@@ -167,6 +167,32 @@ boost_list_file: "boost_plan.txt"
 python curator_views/cli.py check --config config.yaml
 ```
 
+### forecast
+
+只读推算未来 N 天的目标浏览量、假设自然流量与刷量缺口，用于正式运行前判断配置是否
+会空转或超载。**不写数据库、不建库、不触网（除非 `--fetch`）**。
+
+```bash
+python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
+  [--natural trend|target] [--set KEY=VALUE ...] [--json]
+```
+
+- `--days N`：预测天数，默认 7，必须 >= 1；
+- `--fetch`：额外从 Steam 在线抓取最新统计，只在内存使用、绝不写库；要求 `clan_id` 非空；
+- `--natural trend|target`：假设自然流量的方式。`trend` 表示按当前趋势延续，
+  `target` 表示最终收敛到目标；
+- `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
+- `--json`：输出 rows / warnings / summary / source 完整结构。
+
+forecast 只以只读 URI 打开数据库，只执行 `SELECT`，不会写 `last_run_date`、不会写
+growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只
+读取 `kv_store`，速率一致才沿用，否则按预测首日重新起算（不写回）。
+
+需要注意：Steam 统计滞后一天，首日基准需要假设上一日实际，未来自然流量只是外推，
+所以结果是**估算不是精确预测**。forecast 输出的是托底目标 `base × multiplier`；
+`run_daily` 的检测参照是 `base × max(1, multiplier)`，`growth_factor < 1` 时二者不同。
+异常标记未持久化，`in_cooldown` 恒为 false。
+
 ### boost
 
 手动执行一轮受控提升（不经过预测/检测流程，直接提升指定次数）。

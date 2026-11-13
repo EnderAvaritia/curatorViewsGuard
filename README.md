@@ -23,12 +23,13 @@ CuratorViewsGuard/
 ├── config.yaml              # 本地配置（init-config 生成，含 clan_id / Cookie 路径）
 ├── requirements.txt         # Python 依赖清单
 └── curator_views/           # 本系统主体
-    ├── cli.py               # 命令行入口：run / daemon / check / boost / login / export
+    ├── cli.py               # 命令行入口：run / daemon / check / forecast / boost / login / export
     ├── README.md            # 子系统说明
     └── core/
         ├── fetcher.py       # 抓取 g_StatsAppViews 与推荐列表
         ├── login.py         # Playwright 半自动登录，导出/校验 cookie.txt
         ├── predictor.py     # 中位数 + 封顶趋势预测
+        ├── forecast.py      # 未来 N 天目标 / 缺口估算（纯函数，只读）
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣
         ├── booster.py       # 受控刷量执行器
         ├── scheduler.py     # 每日闭环编排 + 子进程执行器
@@ -60,8 +61,8 @@ CuratorViewsGuard/
   方式唤起执行器刷量——调度器崩溃不影响执行器，执行器可随时手动单独触发。
 - **每日完整闭环**：抓取统计 → 入库 → 预测 → 溢出检测 → 计算缺口 → 提升 → 通知。
 - **通知推送**：可选 ntfy 推送（异常/每日简报），未配置时退化为日志记录。
-- **只读巡检与导出**：`check` 命令随时查看最近 7 天与预测摘要；`export` 导出
-  全部历史数据为 JSON / CSV。
+- **只读巡检与导出**：`check` 命令随时查看最近 7 天与预测摘要；`forecast` 推算未来
+  N 天的目标与缺口（可用于配置 what-if）；`export` 导出全部历史数据为 JSON / CSV。
 - **跨平台**：Windows（任务计划程序）与 Linux（systemd）均可部署。
 
 ## 工作原理
@@ -177,6 +178,7 @@ python curator_views/cli.py run --config config.yaml --no-boost
 | `daemon` | 守护进程模式：常驻运行，每天到点执行每日流程（配置热重载） |
 | `info` | 查看守护进程是否在运行、状态文件与本地数据概况（离线只读） |
 | `check` | 只读检查：抓取统计、打印最近 7 天与预测摘要 |
+| `forecast` | 只读推算未来 N 天的目标 / 假设自然流量 / 刷量缺口（不写库） |
 | `boost` | 手动执行一轮受控提升 |
 | `login` | 半自动登录 Steam，生成/校验 cookie.txt（可选 playwright） |
 | `export` | 从本地数据库导出每日统计数据（json / csv） |
@@ -274,6 +276,57 @@ daemon 会把运行状态原子写入 **`db_path` 所在目录下的 `daemon_sta
 
 ```bash
 python curator_views/cli.py check --config config.yaml
+```
+
+### forecast
+
+只读推算未来 N 天的目标浏览量、假设自然流量与刷量缺口，用于正式运行前判断当前配置
+是否会让系统空转（缺口恒为 0）或超载（缺口超过单日容量）。**不写数据库、不建库、
+默认不触网**。
+
+```bash
+python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
+  [--natural trend|target] [--set KEY=VALUE ...] [--json]
+```
+
+- `--days N`：预测天数，默认 7，必须 >= 1；
+- `--fetch`：额外从 Steam 在线抓取最新统计，只在内存使用、绝不写库；要求 `clan_id` 非空；
+- `--natural trend|target`：假设自然流量的方式。`trend`（默认）表示按当前趋势延续，
+  `target` 表示最终收敛到目标；
+- `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
+- `--json`：输出 `rows` / `warnings` / `summary` / `source` 完整结构。
+
+它是只读的：以只读 URI 打开数据库，只执行 `SELECT`，不写 `last_run_date`、不写
+growth 锚点、不启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只从
+`kv_store` 读取，速率一致才沿用，否则按预测首日重新起算（不写回）。
+
+注意这是**估算不是精确预测**：Steam 统计滞后一天，首日基准需要假设上一日实际，未来
+自然流量只是外推。forecast 输出的是托底目标 `base × multiplier`；而 `run` 的检测参照
+是 `base × max(1, multiplier)`，`growth_factor < 1` 时两者不同，别把托底目标当成检测
+参照。异常标记未持久化，因此 `in_cooldown` 恒为 `false`。
+
+```bash
+# 未来 7 天按当前配置会刷多少
+python curator_views/cli.py forecast --config config.yaml --days 7
+
+# what-if：把倍率改成 1.5 再算一遍
+python curator_views/cli.py forecast --config config.yaml --set growth_factor=1.5
+```
+
+输出示例：
+
+```
+预测区间: 2026-11-14 ~ 2026-11-20（7 天）
+数据来源: 本地数据库 E:\...\views.db（34 天，最新 2026-11-13 = 1234 次）
+参数: boost_mode=growth factor=0.85 rate=-0.01 基线=auto 波动率=0.10
+
+日期            基准    倍率     目标  假设自然    缺口
+2026-11-14    1234.0  0.842   1038.4     1234       0
+...
+
+汇总: 7 天预计刷量 0；目标 1038.4 → 975.5
+提示:
+  - [need_all_zero] 预测区间 2026-11-14 ~ 2026-11-20 内目标始终低于假设自然流量，系统不会产生刷量。
 ```
 
 ### boost（手动执行器）

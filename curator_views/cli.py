@@ -7,6 +7,7 @@
   daemon       守护进程模式：常驻运行，每天到点重载配置并执行每日流程
   info         查看守护进程是否在运行（本地离线，不触网）
   check        只读检查：抓取统计，打印最近 7 天与预测摘要（不提升）
+  forecast     只读推算未来 N 天的目标 / 假设自然流量 / 刷量缺口
   boost        手动执行一轮受控提升
   login        半自动登录 Steam 并生成/校验 cookie.txt（需要 playwright）
   export       从本地数据库导出每日统计数据（json / csv）
@@ -20,6 +21,8 @@
   python cli.py info --config config.yaml --json
   python cli.py run --config config.yaml --dry-run --no-boost
   python cli.py check --config config.yaml
+  python cli.py forecast --config config.yaml --days 7
+  python cli.py forecast --config config.yaml --set growth_factor=1.5 --json
   python cli.py boost --config config.yaml --target 500 --apps 5 --dry-run
   python cli.py login --config config.yaml
   python cli.py login --config config.yaml --validate-only
@@ -36,6 +39,7 @@ import json
 import logging
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -50,6 +54,7 @@ from curator_views.core import status  # noqa: E402
 from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
 from curator_views.core.daemon import Daemon  # noqa: E402
+from curator_views.core.forecast import forecast_days  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
     CookieFileError,
     Fetcher,
@@ -65,7 +70,11 @@ from curator_views.core.login import (  # noqa: E402
 )
 from curator_views.core.notifier import Notifier  # noqa: E402
 from curator_views.core.predictor import predict_expected  # noqa: E402
-from curator_views.core.scheduler import run_daily  # noqa: E402
+from curator_views.core.scheduler import (  # noqa: E402
+    _TZ,
+    _date_to_epoch,
+    run_daily,
+)
 from curator_views.core.storage import Storage  # noqa: E402
 
 logger = logging.getLogger("curator_views.cli")
@@ -962,6 +971,253 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _coerce_override(raw: str, existing: Any) -> Any:
+    """按配置中已有值的类型推断 --set 覆盖值；键不存在时按字面量猜测。"""
+    text = raw.strip()
+    if isinstance(existing, bool):
+        return text.lower() in ("1", "true", "yes", "on")
+    if isinstance(existing, int):
+        try:
+            return int(text)
+        except ValueError:
+            return raw
+    if isinstance(existing, float):
+        try:
+            return float(text)
+        except ValueError:
+            return raw
+    if existing is not None:
+        return raw
+    lowered = text.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return raw
+
+
+def _apply_overrides(cfg: Dict[str, Any], items: list[str]) -> None:
+    """把 --set key=value 覆盖到配置字典，用于 what-if 估算。"""
+    for item in items:
+        key, sep, raw = item.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            _print_error(f"--set 参数格式应为 key=value: {item}")
+            sys.exit(1)
+        cfg[key] = _coerce_override(raw, cfg.get(key))
+
+
+def _read_forecast_db(db_path: str) -> tuple[list[dict], Dict[str, str]]:
+    """以只读 URI 打开数据库，返回 (daily_stats, kv_store)。
+
+    绝不执行建表/写入，也不启用 WAL；数据库文件内容与 mtime 保持不变。
+    """
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT date_ts, num_views FROM daily_stats ORDER BY date_ts ASC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        history = [
+            {"date_ts": int(row[0]), "num_views": int(row[1])} for row in rows
+        ]
+        kv: Dict[str, str] = {}
+        try:
+            for key, value in conn.execute("SELECT key, value FROM kv_store"):
+                kv[str(key)] = str(value)
+        except sqlite3.OperationalError:
+            pass
+    finally:
+        conn.close()
+    return history, kv
+
+
+def _forecast_start_epoch() -> int:
+    """预测首日：明天 00:00（Asia/Shanghai）；Steam 统计滞后一天。"""
+    tomorrow = datetime.now(_TZ) + timedelta(days=1)
+    return int(
+        tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+
+
+def _print_forecast_report(
+    result: Dict[str, Any],
+    config: Dict[str, Any],
+    source: Dict[str, Any],
+    fetched: bool,
+    db_path: str,
+) -> None:
+    """以中文对齐表格打印 forecast 结果。"""
+    rows = result["rows"]
+    summary = result["summary"]
+    print(
+        f"预测区间: {summary['first_date']} ~ {summary['last_date']}"
+        f"（{summary['days']} 天）"
+    )
+    source_text = "Steam 在线抓取" if fetched else f"本地数据库 {db_path}"
+    print(
+        f"数据来源: {source_text}（{source['history_days']} 天，"
+        f"最新 {source['latest_date']} = {source['latest_views']} 次）"
+    )
+    baseline = float(config.get("baseline_views", 0) or 0)
+    baseline_text = "auto" if baseline <= 0 else f"{baseline:g}"
+    print(
+        f"参数: boost_mode={config.get('boost_mode', 'stable')} "
+        f"factor={float(config.get('growth_factor', 1.0)):g} "
+        f"rate={float(config.get('growth_rate', 0)):g} "
+        f"基线={baseline_text} "
+        f"波动率={float(config.get('volatility', 0)):.2f}"
+    )
+    print()
+    print(
+        f"{'日期':<12}{'基准':>8}{'倍率':>8}{'目标':>9}"
+        f"{'假设自然':>9}{'缺口':>8}"
+    )
+    for row in rows:
+        print(
+            f"{row['date']:<12}{row['base']:>8.1f}{row['multiplier']:>8.3f}"
+            f"{row['target']:>9.1f}{row['assumed_natural']:>9}{row['need']:>8}"
+        )
+    print()
+    print(
+        f"汇总: {summary['days']} 天预计刷量 {summary['total_need']}；"
+        f"目标 {summary['target_first']:.1f} → {summary['target_last']:.1f}"
+    )
+    if result["warnings"]:
+        print("提示:")
+        for warning in result["warnings"]:
+            print(f"  - [{warning['code']}] {warning['message']}")
+
+
+def cmd_forecast(args: argparse.Namespace) -> int:
+    """只读推算未来 N 天的目标、假设自然流量与刷量缺口。
+
+    默认只读本地数据库、不触网；--fetch 才在线抓取（仅在内存使用，不写库）。
+    --set 可覆盖任意配置键做 what-if；数据库不存在或无历史时以 1 退出，绝不建库。
+    """
+    if args.days < 1:
+        _print_error("--days 必须 >= 1")
+        return 1
+
+    config_path = Path(args.config)
+    cfg = _load_config(config_path)
+    cfg_dir = config_path.resolve().parent
+    _apply_overrides(cfg, getattr(args, "set", None) or [])
+
+    sched_cfg = _scheduler_config(
+        cfg, bool(cfg.get("boost_enabled", True)), True, cfg_dir
+    )
+    db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
+    if not Path(db_path).is_file():
+        _print_error(f"数据库不存在: {db_path}")
+        _print_error(
+            "提示: forecast 只读，不会自动创建空库；请先运行 run 积累数据。"
+        )
+        return 1
+
+    try:
+        history, kv = _read_forecast_db(db_path)
+    except sqlite3.Error as exc:
+        _print_error(f"读取数据库失败: {exc}")
+        return 1
+
+    if getattr(args, "fetch", False):
+        clan_id = str(cfg.get("clan_id") or "").strip()
+        if not clan_id:
+            _print_error("--fetch 需要配置 clan_id")
+            return 1
+        cookie_file, _boost_cookie = _resolve_cookie_paths(cfg, cfg_dir)
+        fetcher = Fetcher(clan_id, cookie_file, cfg.get("proxy") or None)
+        fetched = fetcher.fetch_stats()
+        merged = {
+            int(item["date_ts"]): int(item["num_views"]) for item in history
+        }
+        merged.update(
+            {
+                int(item["date_ts"]): int(item["num_views"])
+                for item in fetched
+            }
+        )
+        history = [
+            {"date_ts": ts, "num_views": views}
+            for ts, views in sorted(merged.items())
+        ]
+
+    # 程序启动日同样只读；缺失或非法时不过滤（从最早一条开始）
+    program_start = kv.get("program_start", "").strip()
+    if program_start:
+        try:
+            program_start_epoch = _date_to_epoch(program_start)
+        except (ValueError, IndexError):
+            program_start_epoch = 0
+        if program_start_epoch:
+            history = [
+                item for item in history
+                if item["date_ts"] >= program_start_epoch
+            ]
+
+    if not history:
+        _print_error("数据库中没有历史统计数据（或 program_start 之后无数据）。")
+        return 1
+
+    # growth 锚点只读：速率一致且起点可解析才沿用，否则按预测首日重新起算
+    growth_start_ts = 0
+    try:
+        stored_rate = float(kv.get("growth_rate", ""))
+        stored_start = kv.get("growth_start", "").strip()
+        if stored_start and abs(
+            stored_rate - float(sched_cfg["growth_rate"])
+        ) < 1e-9:
+            growth_start_ts = _date_to_epoch(stored_start)
+    except (TypeError, ValueError, IndexError):
+        growth_start_ts = 0
+
+    start_ts = _forecast_start_epoch()
+    result = forecast_days(
+        history,
+        sched_cfg,
+        start_ts,
+        days=args.days,
+        growth_start_ts=growth_start_ts,
+        natural_mode=args.natural,
+    )
+    latest = history[-1]
+    latest_date = datetime.fromtimestamp(
+        int(latest["date_ts"]), tz=_TZ
+    ).strftime("%Y-%m-%d")
+    source = {
+        "mode": "fetch" if args.fetch else "local",
+        "db_path": db_path,
+        "history_days": len(history),
+        "latest_date": latest_date,
+        "latest_views": int(latest["num_views"]),
+        "program_start": program_start or None,
+        "growth_start_ts": growth_start_ts,
+        "start_ts": start_ts,
+        "natural_mode": args.natural,
+    }
+    if args.json:
+        payload = {
+            "rows": result["rows"],
+            "warnings": result["warnings"],
+            "summary": result["summary"],
+            "source": source,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    _print_forecast_report(result, sched_cfg, source, args.fetch, db_path)
+    return 0
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     print(f"curator_views {__version__}")
     return 0
@@ -1049,6 +1305,26 @@ def build_parser() -> argparse.ArgumentParser:
                           help="导出格式（默认 json）")
     p_export.add_argument("--out", default=None, help="输出文件路径（缺省打印到标准输出）")
     p_export.set_defaults(func=cmd_export)
+
+    p_forecast = sub.add_parser(
+        "forecast", help="只读预测未来 N 天的目标/自然流量/缺口（不写库）"
+    )
+    p_forecast.add_argument("--config", default="config.yaml",
+                            help="配置文件路径（默认 config.yaml）")
+    p_forecast.add_argument("--days", type=int, default=7,
+                            help="预测天数（默认 7，必须 >= 1）")
+    p_forecast.add_argument("--fetch", action="store_true",
+                            help="额外从 Steam 在线抓取最新统计（仅内存，不写库）")
+    p_forecast.add_argument("--natural", choices=["trend", "target"],
+                            default="trend",
+                            help="假设自然流量模式：trend 按趋势延续 / "
+                                 "target 收敛到目标（默认 trend）")
+    p_forecast.add_argument("--set", action="append", default=[],
+                            metavar="KEY=VALUE",
+                            help="覆盖配置项做 what-if，可重复")
+    p_forecast.add_argument("--json", action="store_true",
+                            help="输出完整 JSON（含 rows/warnings/summary/source）")
+    p_forecast.set_defaults(func=cmd_forecast)
 
     p_init = sub.add_parser("init-config", help="生成默认配置文件模板")
     p_init.add_argument("--path", default="config.yaml", help="生成的配置文件路径（默认 config.yaml）")
