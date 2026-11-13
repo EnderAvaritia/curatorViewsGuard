@@ -21,7 +21,7 @@ import shlex
 import subprocess
 from datetime import datetime, timedelta, timezone
 from statistics import median
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .anti_cheat import (
@@ -29,6 +29,7 @@ from .anti_cheat import (
     detect_drift,
     detect_overflow,
 )
+from .boost_list import consume_next, peek_next
 from .booster import Booster
 from .fetcher import Fetcher
 from .notifier import Notifier
@@ -121,8 +122,23 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
         f"统计数据天数: {summary['stats_days']}",
         f"程序启动日: {summary['program_start']}",
         f"启动期加权: {'是' if summary['startup_applied'] else '否'}",
-        f"实际提升: {summary['boosted']} {mode}",
     ]
+    list_status = summary.get("boost_list_status", "disabled")
+    if list_status != "disabled":
+        labels = {
+            "active": "使用中",
+            "empty": "已用完",
+            "missing": "文件缺失",
+            "error": "读取失败",
+            "cooldown": "恢复期暂停",
+            "consume_error": "消费失败",
+        }
+        lines.append(
+            f"刷量列表: {labels.get(list_status, list_status)}"
+            f"（今日 {summary.get('boost_list_amount') or 0}，"
+            f"剩余 {summary.get('boost_list_remaining', 0)} 行）"
+        )
+    lines.append(f"实际提升: {summary['boosted']} {mode}")
     return "\n".join(lines)
 
 
@@ -226,7 +242,8 @@ def run_daily(
         baseline_views, boost_mode, growth_factor,
         volatility, cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
-        boost_enabled (bool), dry_run (bool)
+        boost_enabled (bool), dry_run (bool),
+        boost_list_file (str)
     其中 single_cap / batch_size / target_ratio / boost_distribution 会应用到
     传入的 Booster 实例（以 config 为准），其余作为预测/检测参数直接传入。
 
@@ -279,6 +296,15 @@ boost_mode / growth_factor / growth_rate：
         非空时，刷量通过独立执行器子进程完成（调度器/执行器分离，
         例如 "python cli.py boost --config {config} --target {need} --apps {apps}"）；
         为空时回退为在当前进程内直接调用 Booster（向后兼容）。
+
+    boost_list_file：
+        可选。非空时启用"每日刷量列表"模式：列表文件一行一个刷量数量，
+        每天取第一条有效行作为当日提升目标，覆盖按预测/基线算出的缺口。
+        成功提升（boosted > 0）后把该行从文件删除，实现"刷完一行删一行"。
+        以下情况不消费列表行：dry_run、boost_enabled=False、恢复期
+        （cooldown）、缺口为 0、提升完全失败。列表为空或文件缺失时今日
+        不刷量（不会回退到自动预测，避免列表模式被悄悄绕过）；文件缺失
+        属于配置错误，简报会标记为 warning。
     """
     # ── 读取配置（带默认值）──────────────────────────────────────────────
     window_days = int(config.get("window_days", 14))
@@ -301,6 +327,7 @@ boost_mode / growth_factor / growth_rate：
     slope_threshold = float(config.get("slope_threshold", 0.02))
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
+    boost_list_file = str(config.get("boost_list_file", "") or "").strip()
 
     # Booster 的执行参数以 config 为准（调用方构建实例时可先给默认值）
     booster.batch_size = int(config.get("batch_size", booster.batch_size))
@@ -487,6 +514,46 @@ boost_mode / growth_factor / growth_rate：
             volatility, base_need, need,
         )
 
+    # 6.5 每日刷量列表模式：以列表首行数量覆盖上面算出的缺口。
+    #     - 列表为空/文件缺失 → 今日不刷（不回退到自动预测，避免绕过列表）；
+    #     - 恢复期（刚被恶意刷量）优先于列表，列表行保留到明天；
+    #     - 波动率只作用于自动缺口，列表数值视为明确要求，不做随机抖动。
+    list_amount: Optional[int] = None
+    list_remaining = 0
+    list_status = "disabled"
+    if boost_list_file:
+        try:
+            list_amount, list_remaining = peek_next(boost_list_file)
+        except FileNotFoundError:
+            list_status = "missing"
+            logger.error(
+                "刷量列表文件不存在: %s，今日不刷量（请检查 boost_list_file 配置）。",
+                boost_list_file,
+            )
+            need = 0
+        except OSError as exc:
+            list_status = "error"
+            logger.error("读取刷量列表失败: %s，今日不刷量。", exc)
+            need = 0
+        else:
+            if list_amount is None:
+                list_status = "empty"
+                logger.info("刷量列表已用完（无有效行），今日不刷量。")
+                need = 0
+            elif in_cooldown:
+                list_status = "cooldown"
+                logger.info(
+                    "恢复期内不刷量，列表首行 %d 保留到明天。", list_amount,
+                )
+                need = 0
+            else:
+                list_status = "active"
+                logger.info(
+                    "列表模式: 今日目标 %d（剩余 %d 行，原缺口 %d）",
+                    list_amount, list_remaining, need,
+                )
+                need = list_amount
+
     # 7. 汇总字典
     summary: Dict[str, Any] = {
         "date": today_iso,
@@ -509,6 +576,9 @@ boost_mode / growth_factor / growth_rate：
         "volatility": volatility,
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,
+        "boost_list_status": list_status,
+        "boost_list_amount": list_amount,
+        "boost_list_remaining": list_remaining,
     }
 
     # 8. 执行受控提升（调度器 / 执行器分离：优先子进程，回退直调）
@@ -534,12 +604,41 @@ boost_mode / growth_factor / growth_rate：
     else:
         logger.info("boost_enabled=False，跳过提升（缺口 %d）。", need)
 
+    # 8.5 列表模式：成功提升后消费掉今天使用的行（“刷完一行删一行”）。
+    #     dry_run / 未开启提升 / 提升完全失败时保留该行，明天继续用。
+    if list_status == "active" and boost_enabled and need > 0:
+        if dry_run:
+            logger.info(
+                "dry_run 模式：不消费列表行（首行 %d 保留）。", list_amount,
+            )
+        elif summary["boosted"] > 0:
+            try:
+                consumed = consume_next(boost_list_file)
+            except (OSError, ValueError) as exc:
+                logger.error(
+                    "消费列表行失败（今日目标 %d）: %s", list_amount, exc,
+                )
+                summary["boost_list_status"] = "consume_error"
+            else:
+                list_remaining = max(0, list_remaining - 1)
+                summary["boost_list_consumed"] = consumed
+                summary["boost_list_remaining"] = list_remaining
+                logger.info(
+                    "列表已消费一行: %d（剩余 %d 行）",
+                    consumed, list_remaining,
+                )
+        else:
+            logger.warning(
+                "今日提升成功 0 次，列表首行 %d 保留到下次。", list_amount,
+            )
+
     # 9. 发送每日简报
     warning = (
         summary["overflow_flag_count"] > 0
         or summary["in_cooldown"]
         or getattr(booster, "aborted", False)
         or "executor_error" in summary
+        or summary["boost_list_status"] in ("missing", "error", "consume_error")
     )
     level = "warning" if warning else "info"
     notifier.send("每日简报", _format_summary(summary, dry_run), level=level)

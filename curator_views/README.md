@@ -17,6 +17,8 @@
   两者相乘，检测参照不会把自己刷的量误判为恶意刷量；
 - 受控提升：分批、限速、单 App 上限、按目标比例提前停止，尽量模拟自然流量；
   配置 `volatility` 波动率后，每日提升量在缺口附近随机，曲线围绕基线自然波动；
+- 每日刷量列表：配置 `boost_list_file` 后按列表逐行刷量，一行一个数量，
+  每天消费首行并在成功后删除该行（刷完一行删一行）；
 - 缺口按昨日自然流量计算：从 `boost_log` 台账扣除昨日自己刷的量，避免把昨天的
   补量当成今天已有的基础重复扣减（否则目标补不满、还会两天一摆）；
 - 调度器/执行器分离：默认同进程直调 Booster，也可配置 `executor_cmd` 以独立
@@ -134,6 +136,27 @@ python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no
 调度器解析其 JSON 输出（`boosted` 字段）并计入每日简报。两种模式可随时切换，
 执行器也可手动单独触发。
 
+### 每日刷量列表（可选）
+
+配置 `boost_list_file` 指向一个文本文件后，每日提升目标改为按列表逐行读取：
+
+```yaml
+boost_list_file: "boost_plan.txt"
+```
+
+```text
+# 一行一个刷量数量，空行和 # 注释会被忽略
+500
+400   # 行尾注释也支持
+0     # 0 表示当天不刷（该行仍会被消费）
+```
+
+每天取第一条有效行覆盖计算出的缺口，成功提升后从文件中删除该行
+（原子写回，其余行与换行符保持不变）。列表用完或文件缺失时当天不刷量，
+不会回退到自动预测；恢复期、`--dry-run`、`boost_enabled: false`、提升完全
+失败时均不消费列表行。列表数值仍受 `single_cap` / `target_ratio` 等执行参数
+约束，需要精确刷满可配合 `target_ratio: 1.0` 或 `boost_distribution: exact`。
+
 ### check
 
 只读检查：抓取统计数据，打印最近 7 天浏览量与预测摘要。不会产生任何写入
@@ -215,6 +238,7 @@ python curator_views/cli.py version
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
 | `daily_time` | `"10:00"` | daemon 模式的每日执行时刻（Asia/Shanghai，HH:MM） |
 | `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
+| `boost_list_file` | （空） | 每日刷量列表文件路径；非空时一行一个刷量数，每天消费首行，成功刷完后删除该行 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
 | `trend_cap` | `0.15` | 趋势斜率相对中位数的封顶比例 |
 | `startup_factor` | `0.9` | 启动阶段保守系数 |

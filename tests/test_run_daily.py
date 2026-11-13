@@ -5,6 +5,7 @@
 """
 
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -519,3 +520,143 @@ class TestLastRunDateRecord:
             {"boost_enabled": False},
         )
         assert storage.saved["last_run_date"] == summary["date"]
+
+
+class ZeroBooster(FakeBooster):
+    """模拟提升完全失败（返回 0，模拟网络/Cookie 问题）。"""
+
+    def run(self, target_count: int, n_recommendations: int = 5,
+            dry_run: bool = False) -> int:
+        self.last_target = target_count
+        self.calls.append((target_count, n_recommendations, dry_run))
+        return 0
+
+
+class TestBoostList:
+    """每日刷量列表：首行覆盖缺口，成功后消费一行，异常情况保留。"""
+
+    @staticmethod
+    def _write(tmp_path, text: str) -> str:
+        path = tmp_path / "boost_list.txt"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_list_amount_overrides_need_and_is_consumed(self, tmp_path):
+        # 自动缺口 100（200 - 100），列表首行 500 → 今日目标 500；成功后删掉首行
+        list_path = self._write(tmp_path, "500\n200\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert summary["boost_list_status"] == "active"
+        assert summary["need"] == 500
+        assert booster.last_target == 500
+        assert summary["boost_list_consumed"] == 500
+        assert summary["boost_list_remaining"] == 1
+        assert Path(list_path).read_text(encoding="utf-8") == "200\n"
+
+    def test_comments_and_blank_lines_are_preserved(self, tmp_path):
+        list_path = self._write(tmp_path, "# 计划\n\n500\n# 尾注\n200\n")
+        run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert (
+            Path(list_path).read_text(encoding="utf-8")
+            == "# 计划\n\n# 尾注\n200\n"
+        )
+
+    def test_dry_run_does_not_consume(self, tmp_path):
+        list_path = self._write(tmp_path, "500\n200\n")
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=200,
+            boost_list_file=list_path,
+            dry_run=True,
+        )
+        assert summary["need"] == 500
+        assert "boost_list_consumed" not in summary
+        assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"
+
+    def test_boost_disabled_does_not_consume(self, tmp_path):
+        list_path = self._write(tmp_path, "500\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+            boost_enabled=False,
+        )
+        assert summary["need"] == 500
+        assert booster.last_target is None
+        assert "boost_list_consumed" not in summary
+        assert Path(list_path).read_text(encoding="utf-8") == "500\n"
+
+    def test_failed_boost_keeps_line(self, tmp_path):
+        list_path = self._write(tmp_path, "500\n200\n")
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            ZeroBooster(),
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert summary["boosted"] == 0
+        assert "boost_list_consumed" not in summary
+        assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"
+
+    def test_empty_list_skips_boost(self, tmp_path):
+        list_path = self._write(tmp_path, "# 用完了\n\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert summary["boost_list_status"] == "empty"
+        assert summary["need"] == 0
+        assert booster.last_target is None
+
+    def test_missing_file_skips_boost(self, tmp_path):
+        list_path = str(tmp_path / "missing.txt")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert summary["boost_list_status"] == "missing"
+        assert summary["need"] == 0
+        assert booster.last_target is None
+
+    def test_cooldown_keeps_line(self, tmp_path):
+        # 25 天 100 + 连续 2 天被刷到 250 → 进入恢复期；列表行保留到恢复期结束
+        list_path = self._write(tmp_path, "500\n200\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 25 + [250, 250, 90, 90, 90]),
+            program_start_str(),
+            booster,
+            cooldown_days=7,
+            boost_list_file=list_path,
+        )
+        assert summary["in_cooldown"] is True
+        assert summary["boost_list_status"] == "cooldown"
+        assert summary["need"] == 0
+        assert booster.last_target is None
+        assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"

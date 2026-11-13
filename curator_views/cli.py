@@ -47,6 +47,7 @@ if str(_ROOT) not in sys.path:
 import yaml  # noqa: E402
 
 from curator_views.core import status  # noqa: E402
+from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
 from curator_views.core.daemon import Daemon  # noqa: E402
 from curator_views.core.fetcher import Fetcher  # noqa: E402
@@ -201,6 +202,18 @@ growth_rate: 0.0
 # 白话：每天刷的量随机上下浮动 10%，让曲线更像真人、不像机器画的直线。
 volatility: 0.10
 
+# ── 每日刷量列表（可选）──────────────────────────────────────────────────
+
+# 刷量列表文件路径（相对本文件所在目录），留空表示不使用列表模式。
+# 列表文件一行一个刷量数量（整数），每天取第一行作为当日提升目标，
+# 成功刷完后自动从文件里删除该行；空行与 # 开头的注释行会被忽略。
+# 启用后列表数值直接覆盖按预测/基线算出的缺口；列表用完或文件缺失时
+# 当天不刷量（不会回退到自动预测）。恢复期（cooldown）内暂停刷量，
+# 列表行保留到恢复期结束；dry_run 与提升完全失败时也不会消费该行。
+# 白话：想按自己排的计划每天刷固定量，就把数字一行一个写进这个文件，
+# 程序每天用掉最上面一行、用完删掉一行。
+boost_list_file: ""
+
 # ── 受控提升参数 ──────────────────────────────────────────────────────────
 
 # 每日提升使用的最近推荐数量
@@ -332,9 +345,10 @@ def _make_booster(
 
 
 def _scheduler_config(
-    cfg: Dict[str, Any], boost_enabled: bool, dry_run: bool
+    cfg: Dict[str, Any], boost_enabled: bool, dry_run: bool, cfg_dir: Path
 ) -> Dict[str, Any]:
     """把配置映射为调度器 run_daily 所需的 config 字典。"""
+    list_file = str(cfg.get("boost_list_file", "") or "").strip()
     return {
         "window_days": int(cfg.get("window_days", 14)),
         "trend_cap": float(cfg.get("trend_cap", 0.15)),
@@ -362,6 +376,7 @@ def _scheduler_config(
         ).lower(),
         "boost_enabled": bool(boost_enabled),
         "dry_run": bool(dry_run),
+        "boost_list_file": _resolve_path(cfg_dir, list_file) if list_file else "",
     }
 
 
@@ -415,7 +430,7 @@ def _execute_daily(
     )
     booster = _make_booster(cfg, clan_id, cookie_file, proxy, storage)
 
-    sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run)
+    sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run, cfg_dir)
     executor_cmd = str(cfg.get("executor_cmd", "") or "")
     return run_daily(
         storage,
@@ -636,6 +651,20 @@ def _print_info_report(report: Dict[str, Any]) -> None:
         f"boost_mode={config['boost_mode']}"
     )
 
+    if config.get("boost_list_file"):
+        labels = {
+            "active": "使用中",
+            "empty": "已用完",
+            "missing": "文件缺失",
+            "error": "读取失败",
+        }
+        label = labels.get(config.get("boost_list_status", ""), "未知")
+        remaining = config.get("boost_list_remaining")
+        suffix = f"，剩余 {remaining} 行" if remaining is not None else ""
+        print(
+            f"刷量列表: {label}{suffix}（{config['boost_list_file']}）"
+        )
+
     if data["days"]:
         print(
             f"数据: {data['days']} 天（{data['first_date']} ~ "
@@ -664,6 +693,19 @@ def cmd_info(args: argparse.Namespace) -> int:
     daemon_info["state_file"] = state_path
     daemon_info["state_file_exists"] = Path(state_path).is_file()
 
+    list_value = str(cfg.get("boost_list_file", "") or "").strip()
+    list_path = _resolve_path(cfg_dir, list_value) if list_value else ""
+    list_remaining: Optional[int] = None
+    list_status = "disabled"
+    if list_path:
+        try:
+            _, list_remaining = peek_next(list_path)
+            list_status = "active" if list_remaining > 0 else "empty"
+        except FileNotFoundError:
+            list_status = "missing"
+        except OSError:
+            list_status = "error"
+
     report = {
         "daemon": daemon_info,
         "config": {
@@ -671,6 +713,9 @@ def cmd_info(args: argparse.Namespace) -> int:
             "boost_enabled": bool(cfg.get("boost_enabled", True)),
             "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
             "db_path": db_path,
+            "boost_list_file": list_path,
+            "boost_list_remaining": list_remaining,
+            "boost_list_status": list_status,
         },
         "data": _collect_info_data(db_path),
     }
