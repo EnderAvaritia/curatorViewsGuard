@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .predictor import predict_expected
 from .scheduler import _TZ, _target_multiplier
@@ -33,6 +33,7 @@ def forecast_days(
     days: int = 7,
     growth_start_ts: int = 0,
     natural_mode: str = "trend",
+    first_natural: Optional[int] = None,
 ) -> Dict[str, Any]:
     """逐日推算未来 ``days`` 天的目标、假设自然流量与刷量缺口。
 
@@ -45,12 +46,19 @@ def forecast_days(
         growth_start_ts: 已解析好的 growth 速率起点 epoch；0 表示按 ``start_ts`` 起算。
         natural_mode: ``"trend"`` 假设自然流量按当前趋势延续；``"target"`` 假设
             自然流量最终收敛到目标（首日用初始历史预测值，之后用上一天目标）。
+        first_natural: 非 None 时启用“今日视角”：每天的假设自然流量固定为该值
+            （通常为最新实际 − 最新刷量，即 ``run_daily`` 的“昨日自然流量”）。
+            此时忽略 ``natural_mode``；刷量只抬高实际浏览量，不会抬高自然流量，
+            因此每一天的缺口都会重新按 ``target - first_natural`` 计算，与
+            ``run_daily`` 的每日补缺口口径一致。
 
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
           ``predict_expected(local_history)["expected"]``；
         - ``multiplier``：复用 ``scheduler._target_multiplier``；stable 模式倍率恒为 1.0；
         - ``target = base * multiplier``；
+        - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
+          ``natural_mode`` 推算；
         - ``need = max(0, round(target - assumed_natural))``，未来日不做溢出扣减；
         - 把假设日按 ``num_views = assumed_natural + need`` 回填进 ``local_history``，
           使后续天的预测窗口包含前面已刷的量。
@@ -108,7 +116,10 @@ def forecast_days(
         multiplier = _target_multiplier(factor, growth_rate, drift_start, date_ts)
         target = base * multiplier
 
-        if natural_mode == "trend":
+        if first_natural is not None:
+            # 今日视角：自然流量不含刷量，刷完当天也不会抬高次日的自然基准
+            assumed_natural = max(0, int(first_natural))
+        elif natural_mode == "trend":
             assumed_natural = int(round(prediction))
         else:  # target：首日用初始预测，之后收敛到上一天目标
             assumed_natural = int(round(previous_target))

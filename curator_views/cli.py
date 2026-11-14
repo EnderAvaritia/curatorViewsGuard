@@ -22,6 +22,7 @@
   python cli.py run --config config.yaml --dry-run --no-boost
   python cli.py check --config config.yaml
   python cli.py forecast --config config.yaml --days 7
+  python cli.py forecast --config config.yaml --today --fetch
   python cli.py forecast --config config.yaml --set growth_factor=1.5 --json
   python cli.py boost --config config.yaml --target 500 --apps 5 --dry-run
   python cli.py login --config config.yaml
@@ -73,6 +74,7 @@ from curator_views.core.predictor import predict_expected  # noqa: E402
 from curator_views.core.scheduler import (  # noqa: E402
     _TZ,
     _date_to_epoch,
+    _today_epoch,
     run_daily,
 )
 from curator_views.core.storage import Storage  # noqa: E402
@@ -1012,8 +1014,13 @@ def _apply_overrides(cfg: Dict[str, Any], items: list[str]) -> None:
         cfg[key] = _coerce_override(raw, cfg.get(key))
 
 
-def _read_forecast_db(db_path: str) -> tuple[list[dict], Dict[str, str]]:
-    """以只读 URI 打开数据库，返回 (daily_stats, kv_store)。
+def _read_forecast_db(
+    db_path: str,
+) -> tuple[list[dict], Dict[str, str], Dict[str, int]]:
+    """以只读 URI 打开数据库，返回 (daily_stats, kv_store, boost_totals)。
+
+    ``boost_totals`` 按日期（YYYY-MM-DD）汇总 boost_log，供 --today 口径
+    扣除昨日自己刷的量；旧库没有 boost_log 时返回空字典。
 
     绝不执行建表/写入，也不启用 WAL；数据库文件内容与 mtime 保持不变。
     """
@@ -1035,9 +1042,18 @@ def _read_forecast_db(db_path: str) -> tuple[list[dict], Dict[str, str]]:
                 kv[str(key)] = str(value)
         except sqlite3.OperationalError:
             pass
+        boost_totals: Dict[str, int] = {}
+        try:
+            for date, total in conn.execute(
+                "SELECT date, COALESCE(SUM(count), 0) AS total "
+                "FROM boost_log GROUP BY date"
+            ):
+                boost_totals[str(date)] = int(total)
+        except sqlite3.OperationalError:
+            pass
     finally:
         conn.close()
-    return history, kv
+    return history, kv, boost_totals
 
 
 def _forecast_start_epoch() -> int:
@@ -1058,15 +1074,22 @@ def _print_forecast_report(
     """以中文对齐表格打印 forecast 结果。"""
     rows = result["rows"]
     summary = result["summary"]
+    today_mode = source.get("perspective") == "today"
     print(
         f"预测区间: {summary['first_date']} ~ {summary['last_date']}"
-        f"（{summary['days']} 天）"
+        f"（{summary['days']} 天{'，今日视角' if today_mode else ''}）"
     )
     source_text = "Steam 在线抓取" if fetched else f"本地数据库 {db_path}"
     print(
         f"数据来源: {source_text}（{source['history_days']} 天，"
         f"最新 {source['latest_date']} = {source['latest_views']} 次）"
     )
+    if today_mode:
+        print(
+            f"今日口径: 昨日实际 {source['yesterday_actual']} - 刷量 "
+            f"{source['yesterday_boosted']} = 自然 {source['yesterday_natural']}；"
+            "未来日假设自然不变"
+        )
     baseline = float(config.get("baseline_views", 0) or 0)
     baseline_text = "auto" if baseline <= 0 else f"{baseline:g}"
     print(
@@ -1091,6 +1114,11 @@ def _print_forecast_report(
         f"汇总: {summary['days']} 天预计刷量 {summary['total_need']}；"
         f"目标 {summary['target_first']:.1f} → {summary['target_last']:.1f}"
     )
+    if today_mode:
+        print(
+            "说明: 今日视角复用 run 的缺口公式；不含反作弊溢出扣减、恢复期、"
+            "波动率与刷量列表。"
+        )
     if result["warnings"]:
         print("提示:")
         for warning in result["warnings"]:
@@ -1124,7 +1152,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        history, kv = _read_forecast_db(db_path)
+        history, kv, boost_totals = _read_forecast_db(db_path)
     except sqlite3.Error as exc:
         _print_error(f"读取数据库失败: {exc}")
         return 1
@@ -1168,6 +1196,39 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         _print_error("数据库中没有历史统计数据（或 program_start 之后无数据）。")
         return 1
 
+    # --today：与 run_daily 同一口径——首日自然流量 = 最新实际 − 最新刷量，
+    # 并且只使用“今天之前”的历史；未来日假设自然流量不变（刷量不算自然），
+    # 所以每天的缺口都会重新按 target − 自然流量 计算。
+    today_mode = bool(getattr(args, "today", False))
+    first_natural: Optional[int] = None
+    yesterday_actual: Optional[int] = None
+    yesterday_boosted: Optional[int] = None
+    stale_warning: Optional[str] = None
+    if today_mode:
+        start_ts = _today_epoch()
+        prior = [item for item in history if item["date_ts"] < start_ts]
+        if not prior:
+            _print_error("--today 需要今天之前至少一天的历史数据。")
+            return 1
+        yesterday = prior[-1]
+        yesterday_date = datetime.fromtimestamp(
+            int(yesterday["date_ts"]), tz=_TZ
+        ).strftime("%Y-%m-%d")
+        yesterday_actual = int(yesterday["num_views"])
+        yesterday_boosted = int(boost_totals.get(yesterday_date, 0))
+        first_natural = max(0, yesterday_actual - yesterday_boosted)
+        if int(yesterday["date_ts"]) < start_ts - 86400:
+            expected_date = datetime.fromtimestamp(
+                start_ts - 86400, tz=_TZ
+            ).strftime("%Y-%m-%d")
+            stale_warning = (
+                f"本地库最新只到 {yesterday_date}，早于昨天 {expected_date}；"
+                "今日缺口按该日自然流量计算，建议加 --fetch 或先运行 run。"
+            )
+        history = prior
+    else:
+        start_ts = _forecast_start_epoch()
+
     # growth 锚点只读：速率一致且起点可解析才沿用，否则按预测首日重新起算
     growth_start_ts = 0
     try:
@@ -1180,7 +1241,6 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     except (TypeError, ValueError, IndexError):
         growth_start_ts = 0
 
-    start_ts = _forecast_start_epoch()
     result = forecast_days(
         history,
         sched_cfg,
@@ -1188,7 +1248,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         days=args.days,
         growth_start_ts=growth_start_ts,
         natural_mode=args.natural,
+        first_natural=first_natural,
     )
+    if stale_warning:
+        result["warnings"].append(
+            {"code": "stale_history", "message": stale_warning}
+        )
     latest = history[-1]
     latest_date = datetime.fromtimestamp(
         int(latest["date_ts"]), tz=_TZ
@@ -1203,6 +1268,10 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "growth_start_ts": growth_start_ts,
         "start_ts": start_ts,
         "natural_mode": args.natural,
+        "perspective": "today" if today_mode else "tomorrow",
+        "yesterday_actual": yesterday_actual,
+        "yesterday_boosted": yesterday_boosted,
+        "yesterday_natural": first_natural,
     }
     if args.json:
         payload = {
@@ -1319,6 +1388,10 @@ def build_parser() -> argparse.ArgumentParser:
                             default="trend",
                             help="假设自然流量模式：trend 按趋势延续 / "
                                  "target 收敛到目标（默认 trend）")
+    p_forecast.add_argument("--today", action="store_true",
+                            help="今日视角：从今天算起，首日自然流量 = "
+                                 "最新实际 - 最新刷量（与 run 缺口口径一致，"
+                                 "忽略 --natural）")
     p_forecast.add_argument("--set", action="append", default=[],
                             metavar="KEY=VALUE",
                             help="覆盖配置项做 what-if，可重复")

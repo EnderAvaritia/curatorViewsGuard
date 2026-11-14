@@ -1,15 +1,18 @@
 """forecast_days 纯函数与 forecast 子命令的测试。
 
 覆盖：恒定历史下的空转、growth 抬高、倍率归零、手动基线、stable、
-trend / target 两种自然流量假设、容量告警、空历史、日期回填与只读 DB。
+trend / target 两种自然流量假设、--today 今日视角（固定自然流量）、
+容量告警、空历史、日期回填与只读 DB。
 """
 
+import json
 import re
 import sqlite3
+from datetime import datetime
 
 from curator_views import cli
 from curator_views.core.forecast import forecast_days
-from curator_views.core.scheduler import _date_to_epoch
+from curator_views.core.scheduler import _TZ, _date_to_epoch, _today_epoch
 
 DAY = 86400
 START_TS = _date_to_epoch("2026-11-14")
@@ -105,6 +108,43 @@ class TestForecastDays:
         )
         assert all(row["multiplier"] == 1.0 for row in result["rows"])
 
+    def test_today_natural_holds_flat_and_repeats_gap(self):
+        # 今日视角：自然流量固定为 400（实际 1000 − 刷量 600），
+        # 目标 1000 × 1.5 = 1500 → 每天缺口都是 1100，
+        # 不会因为昨天已经刷过就把今天的缺口抹平。
+        result = forecast_days(
+            make_history(days=10, views=1000),
+            make_config(
+                baseline_views=1000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+            ),
+            START_TS,
+            days=3,
+            first_natural=400,
+        )
+        rows = result["rows"]
+        assert [row["assumed_natural"] for row in rows] == [400, 400, 400]
+        assert [row["need"] for row in rows] == [1100, 1100, 1100]
+        assert result["summary"]["total_need"] == 3300
+
+    def test_first_natural_overrides_natural_mode(self):
+        config = make_config(
+            baseline_views=1000.0,
+            boost_mode="growth",
+            growth_factor=1.5,
+        )
+        trend = forecast_days(
+            make_history(), config, START_TS, days=2,
+            natural_mode="trend", first_natural=400,
+        )
+        target = forecast_days(
+            make_history(), config, START_TS, days=2,
+            natural_mode="target", first_natural=400,
+        )
+        assert [row["need"] for row in trend["rows"]] == [1100, 1100]
+        assert [row["need"] for row in target["rows"]] == [1100, 1100]
+
     def test_trend_and_target_natural_modes_differ(self):
         config = make_config(boost_mode="growth", growth_factor=1.5)
         trend = forecast_days(make_history(), config, START_TS, days=3,
@@ -180,6 +220,46 @@ def make_readonly_db(tmp_path):
     return db_path
 
 
+def _iso(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), tz=_TZ).strftime("%Y-%m-%d")
+
+
+def make_today_db(tmp_path, boost: int = 100, end_offset: int = 1):
+    """相对“今天”建库：最后一条是 end_offset 天前（默认昨天）。
+
+    额外写入 boost_log，用于验证 --today 会从昨日实际里扣掉昨日刷量。
+    """
+    db_path = tmp_path / "views.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE daily_stats (date_ts INTEGER PRIMARY KEY, num_views INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE boost_log (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "date TEXT, count INTEGER, note TEXT, created_at TEXT)"
+    )
+    conn.execute("CREATE TABLE kv_store (key TEXT PRIMARY KEY, value TEXT)")
+    end_ts = _today_epoch() - DAY * end_offset
+    # 20 天数据，超过 window_days=14，避免触发启动期 0.9 系数
+    for i in range(20):
+        conn.execute(
+            "INSERT INTO daily_stats (date_ts, num_views) VALUES (?, ?)",
+            (end_ts - DAY * (19 - i), 1000),
+        )
+    conn.execute(
+        "INSERT INTO kv_store (key, value) VALUES ('program_start', ?)",
+        (_iso(end_ts - DAY * 19),),
+    )
+    conn.execute(
+        "INSERT INTO boost_log (date, count, note, created_at) "
+        "VALUES (?, ?, '', '')",
+        (_iso(end_ts), boost),
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
 class TestForecastCli:
     def test_cli_is_readonly_and_prints_dates(self, tmp_path, capsys):
         config_path = tmp_path / "config.yaml"
@@ -206,3 +286,78 @@ class TestForecastCli:
         assert "（3 天）" in out
         assert len(set(re.findall(r"\d{4}-\d{2}-\d{2}", out))) >= 3
         assert not (tmp_path / "views.db-wal").exists()
+
+    def test_cli_today_uses_yesterday_natural(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=100)
+        before = db_path.read_bytes()
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--today",
+                "--days",
+                "3",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        assert db_path.read_bytes() == before
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["perspective"] == "today"
+        assert payload["source"]["yesterday_actual"] == 1000
+        assert payload["source"]["yesterday_boosted"] == 100
+        assert payload["source"]["yesterday_natural"] == 900
+        assert [row["assumed_natural"] for row in payload["rows"]] == [900] * 3
+        assert [row["need"] for row in payload["rows"]] == [100] * 3
+
+    def test_cli_today_prints_perspective(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--today",
+                "--days",
+                "2",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "今日视角" in out
+        assert "今日口径" in out
+        assert "缺口公式" in out
+
+    def test_cli_today_warns_when_history_is_stale(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, end_offset=3)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--today",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert "stale_history" in {item["code"] for item in payload["warnings"]}

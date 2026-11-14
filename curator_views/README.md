@@ -126,7 +126,8 @@ daemon 重启后同一天不会重复执行。
 python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no-boost]
 ```
 
-- `--dry-run`：演练模式，计算一切但实际不发送提升请求；
+- `--dry-run`：演练模式，计算一切但实际不发送提升请求，也不发简报、不写库
+  （统计 / 状态 / `last_run_date` / growth 锚点），不会把当天标记为已执行；
 - `--boost`：强制启用提升；`--no-boost`：强制关闭提升（优先于配置）。
 
 ### 调度器 / 执行器分离
@@ -174,11 +175,14 @@ python curator_views/cli.py check --config config.yaml
 
 ```bash
 python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
-  [--natural trend|target] [--set KEY=VALUE ...] [--json]
+  [--today] [--natural trend|target] [--set KEY=VALUE ...] [--json]
 ```
 
 - `--days N`：预测天数，默认 7，必须 >= 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，只在内存使用、绝不写库；要求 `clan_id` 非空；
+- `--today`：今日视角，从今天 00:00 起算，首日自然流量 = 最新实际 − 最新刷量，
+  未来日假设自然不变（与 `run` 的缺口公式一致，适合看“今天该刷多少”）；
+  会忽略 `--natural`，本地库不是最新时给出 `stale_history` 提示；
 - `--natural trend|target`：假设自然流量的方式。`trend` 表示按当前趋势延续，
   `target` 表示最终收敛到目标；
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
@@ -189,9 +193,10 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 读取 `kv_store`，速率一致才沿用，否则按预测首日重新起算（不写回）。
 
 需要注意：Steam 统计滞后一天，首日基准需要假设上一日实际，未来自然流量只是外推，
-所以结果是**估算不是精确预测**。forecast 输出的是托底目标 `base × multiplier`；
+所以结果是**估算不是精确预测**。默认首日是明天 00:00；`--today` 时改为今天 00:00，
+并用昨日实际减去昨日刷量作为自然流量。forecast 输出的是托底目标 `base × multiplier`；
 `run_daily` 的检测参照是 `base × max(1, multiplier)`，`growth_factor < 1` 时二者不同。
-异常标记未持久化，`in_cooldown` 恒为 false。
+异常标记未持久化，`in_cooldown` 恒为 false；`--today` 也不含恢复期、波动率与刷量列表。
 
 ### boost
 

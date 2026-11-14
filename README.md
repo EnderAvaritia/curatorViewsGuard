@@ -120,7 +120,7 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
                           写 boost_log、发 ntfy 简报
                                       │
                                       ▼
-                 写 last_run_date（daemon 据此同日去重）
+                 写 last_run_date（daemon 据此同日去重；dry-run 不写）
 ```
 
 ### 3.2 核心公式
@@ -418,6 +418,9 @@ python curator_views/cli.py check --config config.yaml
 # 6. 只读估算未来 7 天的目标与缺口
 python curator_views/cli.py forecast --config config.yaml --days 7
 
+# 6b. 只看今天该刷多少（首日自然流量 = 昨日实际 − 昨日刷量）
+python curator_views/cli.py forecast --config config.yaml --today --fetch
+
 # 7. 演练模式：完整计算但不真正刷量
 python curator_views/cli.py run --config config.yaml --dry-run
 
@@ -686,7 +689,9 @@ x = 日期序号（最近 N 天，N = window_days × 2，默认 28 天）
 python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no-boost]
 ```
 
-- `--dry-run`：演练模式，计算一切但不发送提升请求，也不发送执行器子进程；
+- `--dry-run`：演练模式，计算一切但不发送提升请求、不发送执行器子进程、不发简报；
+  也不写数据库（`daily_stats` / `boost_log`）与状态（`program_start` /
+  `last_stats_date` / `last_run_date` / growth 锚点），不会把当天标记为已执行；
 - `--boost` / `--no-boost`：强制开启/关闭提升，优先于配置 `boost_enabled`。
 
 成功后以 JSON 打印汇总（日期、今日预期、昨日实际/刷量/自然流量、缺口、溢出
@@ -704,7 +709,8 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 - 启动时若今天尚未执行且已过 `daily_time`，立即补跑一次；
 - 每轮循环重新加载配置，修改配置或执行时间无需重启；
 - 单次执行失败不退出进程，记录日志后等待下一天；
-- 同一天不重复执行：`last_run_date` 同时写入数据库与 `daemon_state.json`；
+- 同一天不重复执行：`last_run_date` 同时写入数据库与 `daemon_state.json`
+  （`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
 - Ctrl+C（SIGINT）立即中断当前执行并退出；SIGTERM 优雅收尾后退出；
 - 前台运行时 INFO 日志同时输出到控制台。
 
@@ -743,7 +749,7 @@ python curator_views/cli.py check --config config.yaml
 
 ```bash
 python curator_views/cli.py forecast --config config.yaml \
-  [--days N] [--fetch] [--natural trend|target] \
+  [--days N] [--fetch] [--today] [--natural trend|target] \
   [--set KEY=VALUE ...] [--json]
 ```
 
@@ -753,6 +759,11 @@ python curator_views/cli.py forecast --config config.yaml \
 - `--days N`：预测天数，默认 7，必须 ≥ 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，仅在内存使用，绝不写库；要求
   `clan_id` 非空；
+- `--today`：今日视角，从今天 00:00 起算；首日自然流量取
+  `最新实际 − 最新刷量`（与 `run` 的“昨日自然流量”口径一致），未来日假设自然
+  流量不变，因此每天都会重新计算缺口，适合回答“今天该刷多少”。会忽略
+  `--natural`；默认只读本地库，库不是最新时会给出 `stale_history` 提示，
+  可配合 `--fetch` 使用；
 - `--natural trend|target`：
   - `trend`（默认）：假设自然流量按当前趋势延续；
   - `target`：假设自然流量最终收敛到目标（首日用初始预测，之后用上一天目标）；
@@ -767,9 +778,11 @@ python curator_views/cli.py forecast --config config.yaml \
 - growth 起点只从 `kv_store` 读取，速率一致才沿用，否则按预测首日重新起算，
   不写回。
 
-预测首日为**明天 00:00**（Asia/Shanghai），因为 Steam 当天统计通常次日才完整。
+预测首日默认为**明天 00:00**（Asia/Shanghai），因为 Steam 当天统计通常次日才完整；
+加 `--today` 时改为今天 00:00，并用昨日实际减去昨日刷量作为自然流量。
 这是**估算不是精确预测**：首日基准需要假设上一日实际，未来自然流量只是外推；
 异常标记未持久化，因此 `in_cooldown` 恒为 `false`，未来日也不做溢出扣减。
+`--today` 同样不含恢复期、波动率与刷量列表，只复用 `run` 的缺口公式。
 
 forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照是
 `base × max(1, multiplier)`。当 `growth_factor < 1` 时两者不同，不要把托底
@@ -799,6 +812,7 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 | `need_all_zero` | 整个预测区间缺口都为 0，系统不会刷量 |
 | `multiplier_zero` | 目标倍率在某个日期归零（通常 `growth_rate` 过负） |
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
+| `stale_history` | `--today` 时本地库最新日期早于昨天，缺口可能基于旧数据 |
 
 ### 8.6 boost
 
@@ -957,12 +971,17 @@ CLI 不会因 Cookie 缺失退出；但统计抓取通常需要登录，`run` / 
 ### 9.7 正式执行前先估算
 
 ```bash
+# 今天该刷多少（--fetch 会在线补齐昨天/今天的统计，仅内存使用）
+python curator_views/cli.py forecast --config config.yaml --today --fetch
+
+# 未来两周的空转/超载检查
 python curator_views/cli.py forecast --config config.yaml --days 14
 python curator_views/cli.py forecast --config config.yaml \
   --set growth_factor=1.2 --set baseline_views=1500
 ```
 
-用 `--set` 做 what-if，确认缺口和容量后再改正式配置。
+用 `--today` 对齐 `run` 的缺口口径；用 `--set` 做 what-if，确认缺口和容量后再改
+正式配置。
 
 ---
 
