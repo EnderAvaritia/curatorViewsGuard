@@ -598,3 +598,101 @@ class TestForecastCli:
         out = capsys.readouterr().out
         assert "单日吞吐上限" in out
         assert "吞吐不足" in out
+
+class TestTargetBounds:
+    """forecast 的目标上下界必须与 run_daily 一致。"""
+
+    def test_upper_bound_caps_target_and_need(self):
+        result = forecast_days(
+            make_history(views=1000),
+            make_config(
+                baseline_views=1000.0,
+                boost_mode="growth",
+                growth_factor=2.0,
+                target_max=1500,
+            ),
+            START_TS,
+            days=3,
+            first_natural=1000,
+        )
+        rows = result["rows"]
+        assert all(row["raw_target"] == 2000.0 for row in rows)
+        assert all(row["target"] == 1500.0 for row in rows)
+        assert all(row["target_bound"] == "max" for row in rows)
+        assert [row["need"] for row in rows] == [500, 500, 500]
+        assert result["summary"]["target_first"] == 1500.0
+
+    def test_lower_bound_floors_declining_target(self):
+        result = forecast_days(
+            make_history(views=1000),
+            make_config(
+                baseline_views=1000.0,
+                boost_mode="growth",
+                growth_factor=0.5,
+                target_min=800,
+            ),
+            START_TS,
+            days=2,
+            first_natural=400,
+        )
+        rows = result["rows"]
+        assert all(row["raw_target"] == 500.0 for row in rows)
+        assert all(row["target"] == 800.0 for row in rows)
+        assert all(row["target_bound"] == "min" for row in rows)
+        assert [row["need"] for row in rows] == [400, 400]
+
+    def test_zero_bounds_disable_clamp(self):
+        result = forecast_days(
+            make_history(views=1000),
+            make_config(
+                baseline_views=1000.0,
+                boost_mode="growth",
+                growth_factor=2.0,
+                target_min=0,
+                target_max=0,
+            ),
+            START_TS,
+            days=2,
+            first_natural=1000,
+        )
+        rows = result["rows"]
+        assert all(row["target"] == 2000.0 for row in rows)
+        assert all(row["target_bound"] == "" for row in rows)
+        assert [row["need"] for row in rows] == [1000, 1000]
+
+    def test_upper_bound_holds_over_long_growth_horizon(self):
+        # 正速率持续 101 天：原始目标无限上涨，但上限必须始终生效
+        result = forecast_days(
+            make_history(views=1000),
+            make_config(
+                baseline_views=1000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+                growth_rate=0.05,
+                target_max=1500,
+            ),
+            START_TS,
+            days=101,
+            first_natural=1000,
+        )
+        assert all(row["target"] == 1500.0 for row in result["rows"])
+        assert result["rows"][-1]["target_bound"] == "max"
+        assert all(row["need"] == 500 for row in result["rows"])
+
+    def test_lower_bound_suppresses_multiplier_zero_warning(self):
+        # 系数归零但被 target_min 托底时，目标不会归零，不应再提示
+        result = forecast_days(
+            make_history(views=1000),
+            make_config(
+                boost_mode="growth",
+                growth_factor=1.0,
+                growth_rate=-0.01,
+                target_min=1000,
+            ),
+            START_TS,
+            days=101,
+            first_natural=1000,
+        )
+        assert result["rows"][100]["multiplier"] == 0.0
+        assert result["rows"][100]["target"] == 1000.0
+        assert "multiplier_zero" not in warning_codes(result)

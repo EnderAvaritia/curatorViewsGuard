@@ -755,3 +755,150 @@ class TestThroughputCapacity:
         assert summary["need"] == 5900
         assert summary["throughput_capacity"] == 10800
         assert summary["capacity_warning"] == ""
+
+
+class TestTargetBounds:
+    """今日目标上下界：上限封顶防增长不收敛，下限托底防跌破，0 表示不设界。"""
+
+    def test_upper_bound_caps_growth_target(self):
+        # 基线 1000 × 2.0 = 2000 → target_max 1500 → 缺口 1500 − 100
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=2.0,
+            target_max=1500,
+        )
+        assert summary["today_expected_raw"] == 2000
+        assert summary["today_expected"] == 1500
+        assert summary["target_bound"] == "max"
+        assert summary["need"] == 1400
+
+    def test_lower_bound_floors_declining_target(self):
+        # 基线 1000 × 0.5 = 500 → target_min 800 → 缺口 800 − 100
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=0.5,
+            target_min=800,
+        )
+        assert summary["today_expected_raw"] == 500
+        assert summary["today_expected"] == 800
+        assert summary["target_bound"] == "min"
+        assert summary["need"] == 700
+
+    def test_zero_bounds_disable_clamp(self):
+        # 两个都是 0 → 不设界，目标保持原始值
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=2.0,
+            target_min=0,
+            target_max=0,
+        )
+        assert summary["today_expected_raw"] == 2000
+        assert summary["today_expected"] == 2000
+        assert summary["target_bound"] == ""
+        assert summary["need"] == 1900
+
+    def test_swapped_bounds_are_normalized(self):
+        # min 900 > max 600（笔误）→ 交换为 [600, 900]，目标 1000 压到 900
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=1000,
+            target_min=900,
+            target_max=600,
+        )
+        assert summary["today_expected"] == 900
+        assert summary["target_bound"] == "max"
+
+    def test_lower_bound_raises_long_baseline(self):
+        # 历史低位 100、最近 5 天已被托底到 1000；长期基线若仍取 100，
+        # 连续托底会被 long_baseline 检测误判为恶意刷量。下限应同步抬高
+        # 长期基线，低于下限×1.3 的托底不算异常。
+        stats = make_stats([100] * 25 + [1000] * 5)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=100,
+            target_min=1000,
+            consecutive_days=2,
+        )
+        assert summary["overflow_flag_count"] == 0
+        assert summary["in_cooldown"] is False
+
+    def test_volatility_cannot_exceed_upper_bound(self):
+        # 缺口 1400 经 +30% 抖动变成 1820，但实际执行仍不得超过上限 1500
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        with patch(
+            "curator_views.core.scheduler.random.uniform", return_value=0.30
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                booster,
+                baseline_views=1000,
+                boost_mode="growth",
+                growth_factor=2.0,
+                target_max=1500,
+                volatility=0.30,
+            )
+        assert summary["today_expected"] == 1500
+        assert summary["need"] == 1500
+        assert booster.last_target == 1500
+
+    def test_upper_bound_caps_growth_after_long_run(self):
+        # 速率已生效 30 天：原始目标 1000×1.5×(1+0.05×30)=3750，
+        # 上限 1500 必须把它压住，避免持续运行后刷出恐怖数值
+        stats = make_stats([1000] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            saved_state=TestGrowthRate._seed_rate(0.05, 30),
+            baseline_views=1000,
+            boost_mode="growth",
+            growth_factor=1.5,
+            growth_rate=0.05,
+            target_max=1500,
+        )
+        assert summary["today_expected_raw"] == 3750
+        assert summary["today_expected"] == 1500
+        assert summary["target_bound"] == "max"
+        assert summary["need"] == 500
+
+    def test_lower_bound_does_not_flag_own_boost(self):
+        # 曲线被托底在 600：检测参照同步抬到下限，连续多天不会被误判为
+        # 恶意刷量（控制组不设下限时会被连续标记并进入恢复期）。
+        stats = make_stats([600] * 30)
+        with_floor = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=300,
+            target_min=600,
+            consecutive_days=2,
+        )
+        without_floor = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=300,
+            consecutive_days=2,
+        )
+        assert with_floor["target_bound"] == "min"
+        assert with_floor["overflow_flag_count"] == 0
+        assert with_floor["in_cooldown"] is False
+        assert without_floor["overflow_flag_count"] > 0

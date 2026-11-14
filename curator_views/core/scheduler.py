@@ -111,6 +111,43 @@ def _target_multiplier(
     return max(0.0, factor * (1.0 + growth_rate * days))
 
 
+def _normalize_target_bounds(
+    target_min: float = 0.0, target_max: float = 0.0
+) -> tuple[float, float]:
+    """归一化目标上下界：负数按 0（不设界）处理，min > max 时交换并告警。"""
+    low = max(0.0, float(target_min or 0))
+    high = max(0.0, float(target_max or 0))
+    if low > 0 and high > 0 and low > high:
+        logger.warning(
+            "target_min (%g) 大于 target_max (%g)，已按交换后的 [%g, %g] 夹取。",
+            low, high, high, low,
+        )
+        low, high = high, low
+    return low, high
+
+
+def _clamp_target(
+    target: float, target_min: float = 0.0, target_max: float = 0.0
+) -> tuple[float, str]:
+    """把今日目标夹到 ``[target_min, target_max]``；0 表示该方向不设界。
+
+    - ``target_min`` > 0 且目标低于下限时抬到下限（托底，防目标一路下滑）；
+    - ``target_max`` > 0 且目标高于上限时压到上限（封顶，防 growth 无限上涨）；
+    - 两者都为 0 时不设界，原样返回；
+    - 两者都 > 0 且 ``target_min > target_max`` 时视为配置笔误，记录警告并
+      交换后再夹取，避免目标被夹成矛盾值。
+
+    Returns:
+        ``(夹取后的目标, 命中的边界)``，边界为 ``"min"`` / ``"max"`` / ``""``。
+    """
+    low, high = _normalize_target_bounds(target_min, target_max)
+    if low > 0 and target < low:
+        return low, "min"
+    if high > 0 and target > high:
+        return high, "max"
+    return target, ""
+
+
 def _effective_threads(
     threads: int,
     app_count: Optional[int] = None,
@@ -159,6 +196,16 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
     mode = "（演练模式，未实际提升）" if dry_run else ""
     lines = [
         f"日期: {summary['date']}",
+    ]
+    if summary.get("target_bound"):
+        bound_label = "下限" if summary["target_bound"] == "min" else "上限"
+        raw = summary.get("today_expected_raw", summary["today_expected"])
+        lines.append(
+            f"目标{bound_label}夹取: {summary['today_expected']:.0f}"
+            f"（原始 {raw:.0f}，下限={summary.get('target_min', 0):g}，"
+            f"上限={summary.get('target_max', 0):g}）"
+        )
+    lines.extend([
         f"今日预期浏览量: {summary['today_expected']:.0f}",
         f"昨日实际浏览量: {summary['yesterday_actual']}",
         f"昨日刷量: {summary.get('yesterday_boosted', 0)}",
@@ -169,7 +216,7 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
         f"统计数据天数: {summary['stats_days']}",
         f"程序启动日: {summary['program_start']}",
         f"启动期加权: {'是' if summary['startup_applied'] else '否'}",
-    ]
+    ])
     list_status = summary.get("boost_list_status", "disabled")
     if list_status != "disabled":
         labels = {
@@ -299,6 +346,7 @@ def run_daily(
         boost_n, single_cap, batch_size, target_ratio, boost_distribution,
         threads, wait_min, wait_max,
         baseline_views, boost_mode, growth_factor,
+        target_min, target_max,
         volatility, cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool),
@@ -337,6 +385,16 @@ boost_mode / growth_factor / growth_rate：
         刷量波动率（0~0.3，建议 ≤0.15）。>0 时每日实际提升目标在
         「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕目标自然波动，
         避免收敛成一条直线。
+
+    target_min / target_max：
+        今日目标浏览量的上下界（0 表示该方向不设界）。目标先按
+        ``基准 × 目标系数`` 算出，再夹到 ``[target_min, target_max]`` 后参与
+        缺口计算：
+        - ``target_max`` 防止 growth 模式目标随天数无限上涨（增长不收敛）；
+        - ``target_min`` 托底，防止目标/浏览量持续下滑跌破下限。
+        检测参照取 ``max(自然预期, 夹取后目标)``：托底时同步抬到下限，避免把
+        自己托底刷出来的量误判为恶意刷量；封顶后参照不虚高，超出上限的外部
+        异常仍能及时发现。刷量列表模式直接覆盖缺口，不受上下界约束。
 
     dry_run：
         为 True 时只计算、不产生任何持久化副作用：不写 daily_stats、
@@ -384,6 +442,11 @@ boost_mode / growth_factor / growth_rate：
     boost_mode = str(config.get("boost_mode", "stable")).lower()
     growth_factor = float(config.get("growth_factor", 1.0) or 1.0)
     growth_rate = float(config.get("growth_rate", 0) or 0)
+    target_min = float(config.get("target_min", 0) or 0)
+    target_max = float(config.get("target_max", 0) or 0)
+    target_floor, target_ceiling = _normalize_target_bounds(
+        target_min, target_max
+    )
     volatility = float(config.get("volatility", 0) or 0)
     cooldown_days = int(config.get("cooldown_days", 7))
     exclude_flagged = bool(config.get("exclude_flagged", True))
@@ -468,11 +531,17 @@ boost_mode / growth_factor / growth_rate：
         history_clean = [
             d for d in history_sorted if d["date_ts"] not in confirmed_flagged
         ]
-        # 长期基线（更长窗口的中位数）：即使短期预期被污染，仍是独立参照
+        # 长期基线（更长窗口的中位数）：即使短期预期被污染，仍是独立参照。
+        # 配置了目标下限时，长期基线不能低于下限：我们是主动把曲线托到
+        # target_min，若仍拿历史低位当基线，连续托底会被误判成恶意刷量。
+        # 抬到下限后，低于下限的正常托底不算异常，高于下限 ×(1+k) 的外部
+        # 尖峰仍会被抓到（漂移检测的高位日阈值也同步抬高）。
         long_baseline: float | None = None
         if baseline_days > 0 and history_clean:
             base_window = history_clean[-min(len(history_clean), baseline_days):]
             long_baseline = median(d["num_views"] for d in base_window)
+            if target_floor > 0:
+                long_baseline = max(long_baseline, target_floor)
         # 持续上升斜率检测：慢性爬升型刷量（需要长期基线参照，防止
         # 把真实增长误判为异常）
         drift_days = detect_drift(
@@ -498,7 +567,15 @@ boost_mode / growth_factor / growth_rate：
             day_multiplier = _target_multiplier(
                 multiplier, growth_rate, drift_start_ts, day["date_ts"]
             )
-            predictions[day["date_ts"]] = base * max(1.0, day_multiplier)
+            # 检测参照：取自然预期 base 与夹取后目标的较大值。
+            # - 增长时用抬高后的目标，避免把自己刷的量误判为异常；
+            # - 下滑时不把"实际高于下滑目标"误判为异常（参照仍为 base）；
+            # - 托底时参照同步抬到下限，避免托底刷量被误判；
+            # - 封顶后参照不再虚高，超出上限的外部异常仍能及时发现。
+            day_target, _ = _clamp_target(
+                base * day_multiplier, target_floor, target_ceiling
+            )
+            predictions[day["date_ts"]] = max(base, day_target)
         overflow = detect_overflow(
             history_clean, predictions, outlier_k, consecutive_days,
             long_baseline=long_baseline,
@@ -550,7 +627,20 @@ boost_mode / growth_factor / growth_rate：
     today_multiplier = _target_multiplier(
         multiplier, growth_rate, drift_start_ts, today_ts
     )
-    today_expected = base_expected * today_multiplier
+    today_expected_raw = base_expected * today_multiplier
+    # 目标上下界：0 表示该方向不设界。上限防 growth 目标无限上涨，
+    # 下限托底防目标持续下滑；夹取后的目标再参与缺口计算。
+    today_expected, target_bound = _clamp_target(
+        today_expected_raw, target_floor, target_ceiling
+    )
+    if target_bound:
+        bound_label = "下限" if target_bound == "min" else "上限"
+        logger.info(
+            "今日目标 %.1f 命中%s，按 %.1f 计算缺口"
+            "（target_min=%g，target_max=%g）。",
+            today_expected_raw, bound_label, today_expected,
+            target_floor, target_ceiling,
+        )
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
     #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
@@ -587,6 +677,18 @@ boost_mode / growth_factor / growth_rate：
             "波动率 %.2f: 缺口 %d → 提升目标 %d",
             volatility, base_need, need,
         )
+
+    # 6.4 上限同时作为实际刷量的硬上限：波动率可能把缺口从目标值再抬高
+    #     （自然流量越接近 0 越明显），这里再夹一次，保证 run / daemon
+    #     实际下发的刷量不会突破 target_max。下限只作用于目标浏览量，
+    #     不在缺口上强制最小值（自然流量已达标时不制造额外刷量）。
+    if need > 0 and target_ceiling > 0 and need > target_ceiling:
+        clamped_need = int(round(target_ceiling))
+        logger.info(
+            "波动后刷量目标 %d 超过上限 %g，按上限 %d 执行。",
+            need, target_ceiling, clamped_need,
+        )
+        need = clamped_need
 
     # 6.5 每日刷量列表模式：以列表首行数量覆盖上面算出的缺口。
     #     - 列表为空/文件缺失 → 今日不刷（不回退到自动预测，避免绕过列表）；
@@ -655,6 +757,10 @@ boost_mode / growth_factor / growth_rate：
         "date": today_iso,
         "dry_run": dry_run,
         "today_expected": today_expected,
+        "today_expected_raw": round(today_expected_raw, 1),
+        "target_min": target_floor,
+        "target_max": target_ceiling,
+        "target_bound": target_bound,
         "yesterday_actual": yesterday_actual,
         "yesterday_boosted": yesterday_boosted,
         "yesterday_natural": yesterday_natural,

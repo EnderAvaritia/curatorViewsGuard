@@ -15,6 +15,11 @@
 - 模式切换：`boost_mode: stable` 维持稳定 / `growth` 用 `growth_factor` 调台阶
   （>1 刷高、<1 压低），`growth_rate` 按天线性推进（正数上涨、负数下滑）；
   两者相乘，检测参照不会把自己刷的量误判为恶意刷量；
+- 目标上下界：`target_min` / `target_max` 夹取今日目标（0 表示该方向不设界），
+  上限防止 growth 目标无限上涨，下限托底防止目标持续下滑；`run` / `daemon`
+  按夹取后的目标实际刷量，`forecast` 只是预览；下限同时抬高短期/长期检测
+  参照，托底刷量不会被误判；上限也是波动后的最终刷量硬上限，只限制补量、
+  不会压低自然流量；刷量列表模式不受影响；
 - 受控提升：分批、限速、单 App 上限、按目标比例提前停止，尽量模拟自然流量；
   配置 `volatility` 波动率后，每日提升量在缺口附近随机，曲线围绕基线自然波动；
 - 每日刷量列表：配置 `boost_list_file` 后按列表逐行刷量，一行一个数量，
@@ -230,6 +235,9 @@ python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--
 - `--apps M`：使用的最近推荐数量（默认取配置中的 `boost_n`）；
 - `--dry-run`：仅记录提升计划，不发送任何请求。
 
+手动 `boost` 是显式覆盖，与刷量列表一样不受 `target_min` / `target_max`
+约束。
+
 ### login
 
 Steam 登录页有验证码、新设备/异地还要 Steam Guard 手机确认，无法可靠全自动。
@@ -323,6 +331,8 @@ python curator_views/cli.py version
 | `boost_mode` | `stable` | 模式切换：`stable` 维持稳定 / `growth` 刷量（目标=基准×目标系数） |
 | `growth_factor` | `1.5` | growth 模式目标系数的起始值（如 1.5 = 比基准高 50%；小于 1 表示压低台阶，如 0.85） |
 | `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
+| `target_min` | `0` | 今日目标下限（次）；> 0 时目标跌破下限按下限补量，`0` 不设界 |
+| `target_max` | `0` | 今日目标上限（次）；> 0 时目标超出上限按上限补量，`0` 不设界 |
 | `volatility` | `0.10` | 刷量波动率：每日提升量在「缺口 ×(1±波动率)」内随机；建议 ≤ 0.15 |
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |

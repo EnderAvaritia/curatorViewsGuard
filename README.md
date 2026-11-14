@@ -39,6 +39,9 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
   数据。系统能识别异常溢出，主动少刷或暂停，并让曲线自然回落。
 - **刷量可控、可审计**：只刷最近发布的少量推荐，单条有上限、请求有间隔、每批都有
   台账记录，不再盲目全量刷。
+- **目标有安全边界**：`target_min` / `target_max` 给每日目标浏览量设上下界，
+  防止 growth 模式长期运行后目标无限膨胀，或一路下滑跌破底线；`0` 表示该方向
+  不设界，run / daemon 实际执行与 forecast 预览都使用同一口径。
 - **配置可预测**：正式执行前可用 `forecast` 只读推算今天/明天起 N 天的目标与缺口，
   判断配置会不会空转或超载。
 
@@ -131,9 +134,10 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
               趋势修正受 |斜率| ≤ 中位数 × trend_cap 封顶
               （baseline_views > 0 时直接用该固定值，跳过自动预测）
 
-今日目标     = 基准预期 × 目标系数
+今日目标     = clamp(基准预期 × 目标系数, target_min, target_max)
               stable 模式：目标系数 = 1
               growth 模式：目标系数 = growth_factor × (1 + growth_rate × 距生效日天数)
+              target_min / target_max 为 0 时表示该方向不设界
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
@@ -182,6 +186,12 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
   判断参照，避免把自己刷出来的量误判为恶意刷量；长期基线仍是原始中位数。
 - `forecast` 输出的“目标”是托底目标 `base × 目标系数（multiplier）`，当
   `growth_factor < 1` 时与检测参照不同，不能混用。
+- `target_min` / `target_max` 在目标系数算完后夹取今日目标（0 表示该方向
+  不设界）：上限防止 growth 目标随天无限上涨，下限托底防止目标持续下滑。
+  `run` / `daemon` 实际执行时就是按夹取后的目标下发刷量，`forecast` 只是用
+  同一口径预览；下限同时抬高短期与长期反作弊参照，避免把自己托底刷出来的
+  量误判为恶意刷量；上限同时是波动后的最终刷量硬上限；上限只限制补量，
+  不会压低自然流量；刷量列表模式的显式数值不受上下界影响。
 
 ### 3.5 缺口与昨日自然流量
 
@@ -407,6 +417,8 @@ python curator_views/cli.py init-config
 #    boost_cookie_file  —— 刷量专用 Cookie 文件，可选；留空则游客刷量
 #    proxy              —— 代理地址，可选
 #    ntfy_url / ntfy_topic —— ntfy 推送，可选
+#    target_min / target_max —— 目标浏览量上下界，0=不设界，可选
+#    boost_mode / growth_factor / growth_rate —— 目标计算方式，可选
 
 # 3. 半自动登录，生成统计用 Cookie
 python curator_views/cli.py login --config config.yaml \
@@ -541,6 +553,8 @@ python curator_views/cli.py daemon --config config.yaml
 | `boost_mode` | `stable` | `stable` 维持稳定 / `growth` 主动升降 |
 | `growth_factor` | `1.5` | growth 模式目标系数的起始值；stable 模式不生效 |
 | `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%） |
+| `target_min` | `0` | 今日目标下限（次）；> 0 时目标跌破下限按下限补量，`0` 不设界 |
+| `target_max` | `0` | 今日目标上限（次）；> 0 时目标超出上限按上限补量，`0` 不设界 |
 | `volatility` | `0.10` | 缺口随机抖动幅度；建议 ≤ 0.15 |
 
 **说明：**
@@ -551,6 +565,13 @@ python curator_views/cli.py daemon --config config.yaml
 - `growth_factor < 1` 表示允许曲线先跌到基准的某个比例，跌破才托住；
   `> 1` 表示主动抬高台阶。
 - `growth_rate` 与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算。
+- `target_min` / `target_max` 只夹取「今日目标」，缺口仍按
+  `目标 − 昨日自然流量 − 溢出扣减` 计算；两者都为 `0` 时不设界。`run` /
+  `daemon` 按夹取后的目标实际刷量，`forecast` 只是预览同一口径。上限也是
+  波动率作用后的最终刷量硬上限，只限制补量、不会压低自然流量；下限是目标
+  托底，自然流量已高于下限时不会额外刷量，也不会强制每天刷量。下限会同步
+  抬高短期与长期检测参照，托底刷量不会被判成恶意刷量；刷量列表模式直接
+  覆盖缺口，不受上下界约束。
 - `volatility` 作用于缺口而非目标，详见 [3.6](#36-波动率让曲线不那么机械)。
 
 ### 7.7 刷量列表
@@ -623,6 +644,9 @@ baseline_views: 0
 boost_mode: stable
 growth_factor: 1.5
 growth_rate: 0.0
+# 目标浏览量上下界（0=不设界）
+target_min: 0
+target_max: 0
 volatility: 0.10
 
 boost_list_file: ""
@@ -841,13 +865,17 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 `boost_n × single_cap`，单日吞吐上限 = `min(threads, 2, boost_n, batch_size) ×
 86400 / max(wait_min, wait_max)`（未计请求耗时），都会在表格上方单独列出。
 
+配置 `target_min` / `target_max` 时，表格上方会多一行「目标上下界」，表格里的
+「目标」是夹取后的值；JSON `rows` 中 `raw_target` 保留夹取前的原始目标，
+`target_bound` 标记命中的边界（`min` / `max` / 空字符串），与 `run` 的口径一致。
+
 常见 warning：
 
 | code | 含义 |
 | --- | --- |
 | `no_history` | 本地没有可用历史数据，所有基准为 0 |
 | `need_all_zero` | 整个预测区间缺口都为 0，系统不会刷量 |
-| `multiplier_zero` | 目标系数在某个日期归零（通常 `growth_rate` 过负） |
+| `multiplier_zero` | 目标系数在某个日期归零（通常 `growth_rate` 过负）；已配置 `target_min` 托底时不提示 |
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
 | `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
@@ -864,7 +892,8 @@ python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--
 - `--apps M`：使用的最近推荐数量，默认取配置 `boost_n`；
 - `--dry-run`：仅记录提升计划，不发送任何请求。
 
-使用 `boost_cookie_file` 对应的 Cookie；留空则游客模式。
+使用 `boost_cookie_file` 对应的 Cookie；留空则游客模式。手动 `boost` 是
+显式覆盖，与刷量列表一样不受 `target_min` / `target_max` 约束。
 
 ### 8.7 login
 
@@ -1020,6 +1049,21 @@ python curator_views/cli.py forecast --config config.yaml \
 
 默认口径已对齐 `run` 的缺口公式；用 `--tomorrow` 看明天起，用 `--set` 做 what-if，
 确认缺口和容量后再改正式配置。
+
+### 9.8 给增长目标封顶 / 托底
+
+```yaml
+boost_mode: growth
+growth_factor: 1.2
+growth_rate: 0.01
+target_max: 5000   # 目标不超过 5000，防止增长不收敛
+target_min: 1000   # 目标不低于 1000，跌破时按下限补量
+```
+
+两个键都是 `0` 表示该方向不设界。上下界只夹取「今日目标」，缺口仍按
+`目标 − 昨日自然流量` 计算；`run` / `daemon` 实际执行按夹取后的目标刷量，
+`forecast` 只是预览。上限同时是波动后的最终刷量硬上限；刷量列表模式的
+显式数值不受影响。
 
 ---
 
@@ -1372,11 +1416,12 @@ boost_list_file: "boost_plan.txt"
 python -m pytest tests/ -v
 ```
 
-当前测试共 **204** 个，覆盖：
+当前测试共 **217** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
-- 手动基线、growth 模式、growth_rate 锚点、波动率、恢复期、标记日剔除；
+- 手动基线、growth 模式、growth_rate 锚点、目标上下界（封顶 / 托底 /
+  不设界 / 波动不越界 / 长期基线同步）、波动率、恢复期、标记日剔除；
 - 调度器子进程执行器、时区工具；
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；

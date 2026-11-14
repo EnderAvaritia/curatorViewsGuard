@@ -20,8 +20,10 @@ from typing import Any, Dict, List, Optional
 from .predictor import predict_expected
 from .scheduler import (
     _TZ,
+    _clamp_target,
     _daily_throughput_capacity,
     _effective_threads,
+    _normalize_target_bounds,
     _target_multiplier,
 )
 
@@ -62,7 +64,8 @@ def forecast_days(
           ``predict_expected(local_history)["expected"]``；
         - ``multiplier``：目标系数（表格列名「目标系数」），复用
           ``scheduler._target_multiplier``；stable 模式恒为 1.0；
-        - ``target = base * multiplier``；
+        - ``target``：``base * multiplier`` 再按 ``target_min`` / ``target_max``
+          夹取（0 表示该方向不设界），与 ``run_daily`` 的目标上下界一致；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
         - ``need = max(0, round(target - assumed_natural))``，未来日不做溢出扣减；
@@ -85,6 +88,11 @@ def forecast_days(
     boost_mode = str(config.get("boost_mode", "stable")).lower()
     growth_factor = float(config.get("growth_factor", 1.0) or 1.0)
     growth_rate = float(config.get("growth_rate", 0) or 0)
+    target_min = float(config.get("target_min", 0) or 0)
+    target_max = float(config.get("target_max", 0) or 0)
+    target_floor, target_ceiling = _normalize_target_bounds(
+        target_min, target_max
+    )
     boost_n = int(config.get("boost_n", 5))
     single_cap = int(config.get("single_cap", 300))
     batch_size = int(config.get("batch_size", 50))
@@ -124,7 +132,10 @@ def forecast_days(
         date_ts = int(start_ts) + 86400 * index
         base = baseline_views if baseline_views > 0 else prediction
         multiplier = _target_multiplier(factor, growth_rate, drift_start, date_ts)
-        target = base * multiplier
+        raw_target = base * multiplier
+        target, target_bound = _clamp_target(
+            raw_target, target_floor, target_ceiling
+        )
 
         if first_natural is not None:
             # 今日视角：自然流量不含刷量，刷完当天也不会抬高次日的自然基准
@@ -144,7 +155,9 @@ def forecast_days(
                 "date_ts": date_ts,
                 "base": round(float(base), 1),
                 "multiplier": round(float(multiplier), 4),
+                "raw_target": round(float(raw_target), 1),
                 "target": round(float(target), 1),
+                "target_bound": target_bound,
                 "assumed_natural": assumed_natural,
                 "need": need,
                 "cumulative_boost": cumulative_boost,
@@ -216,13 +229,17 @@ def _build_warnings(
              "message": f"预测区间 {rows[0]['date']} ~ {rows[-1]['date']} 内"
                         "目标始终低于假设自然流量，系统不会产生刷量。"}
         )
-    zero_rows = [row for row in rows if row["multiplier"] == 0.0]
+    zero_rows = [
+        row for row in rows
+        if row["multiplier"] == 0.0 and row["target"] == 0.0
+    ]
     if zero_rows:
         warnings.append(
             {"code": "multiplier_zero",
              "message": f"目标系数在 {zero_rows[0]['date']} 归零"
                         f"（growth_rate={growth_rate:g}），目标将归零并永久为 0，"
-                        "请检查 growth_rate 配置。"}
+                        "请检查 growth_rate 配置"
+                        "（或配置 target_min 托底）。"}
         )
 
     capacity = max(0, boost_n) * max(0, single_cap)

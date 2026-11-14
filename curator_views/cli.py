@@ -227,6 +227,19 @@ growth_factor: 1.5
 # 想每天固定降多少最好配合 baseline_views（固定基准）使用。
 growth_rate: 0.0
 
+# 今日目标浏览量的上下界（单位：次；0 表示该方向不设界）。
+# 只夹取“今日目标”（基准 × 目标系数），刷量缺口仍 = 目标 − 昨日自然流量：
+# - target_max > 0：目标超过上限时按上限补量，防止 growth 模式目标随天
+#   无限上涨（增长不收敛）；
+# - target_min > 0：目标跌破下限时按下限补量，避免浏览量一路下滑（托底）。
+# 两者都为 0 时不设界（默认）。刷量列表与手动 boost 的显式数值不受限。
+# run / daemon 实际执行时按夹取后的目标下发刷量，forecast 只是用同一口径
+# 预览；target_max 同时是最终刷量的硬上限，波动率也不会突破它。
+# 白话：想给每天刷到的浏览量封顶就填 target_max；怕一路跌就填 target_min
+# 托底；填 0 表示不管。
+target_min: 0
+target_max: 0
+
 # 刷量波动率（0~0.3，建议 ≤ 0.15）：每天实际提升量在
 # 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在目标附近自然上下波动，
 # 避免收敛成一条笔直的线而显得不自然。过大易触发反作弊误判。
@@ -446,6 +459,8 @@ def _scheduler_config(
         "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
         "growth_factor": float(cfg.get("growth_factor", 1.0) or 1.0),
         "growth_rate": float(cfg.get("growth_rate", 0) or 0),
+        "target_min": float(cfg.get("target_min", 0) or 0),
+        "target_max": float(cfg.get("target_max", 0) or 0),
         "volatility": float(cfg.get("volatility", 0) or 0),
         "boost_n": int(cfg.get("boost_n", 5)),
         "single_cap": int(cfg.get("single_cap", 300)),
@@ -729,9 +744,18 @@ def _print_info_report(report: Dict[str, Any]) -> None:
     boost_text = (
         "提升已开启" if config["boost_enabled"] else "提升已关闭（采集模式）"
     )
+    bounds_text = ""
+    if config.get("target_min") or config.get("target_max"):
+        floor_text = (
+            f"{config['target_min']:g}" if config.get("target_min") else "不设"
+        )
+        ceiling_text = (
+            f"{config['target_max']:g}" if config.get("target_max") else "不设"
+        )
+        bounds_text = f"；目标上下界=[{floor_text}, {ceiling_text}]"
     print(
         f"配置: 每日执行 {config['daily_time']}；{boost_text}；"
-        f"boost_mode={config['boost_mode']}"
+        f"boost_mode={config['boost_mode']}{bounds_text}"
     )
 
     if config.get("boost_list_file"):
@@ -795,6 +819,8 @@ def cmd_info(args: argparse.Namespace) -> int:
             "daily_time": str(cfg.get("daily_time", "10:00")),
             "boost_enabled": bool(cfg.get("boost_enabled", True)),
             "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
+            "target_min": float(cfg.get("target_min", 0) or 0),
+            "target_max": float(cfg.get("target_max", 0) or 0),
             "db_path": db_path,
             "boost_list_file": list_path,
             "boost_list_remaining": list_remaining,
@@ -1138,6 +1164,15 @@ def _print_forecast_report(
     single_cap = max(0, int(config.get("single_cap", 300)))
     batch_size = int(config.get("batch_size", 50))
     capacity = boost_n * single_cap
+    target_min = float(config.get("target_min", 0) or 0)
+    target_max = float(config.get("target_max", 0) or 0)
+    if target_min > 0 or target_max > 0:
+        floor_text = f"{target_min:g}" if target_min > 0 else "不设"
+        ceiling_text = f"{target_max:g}" if target_max > 0 else "不设"
+        print(
+            f"目标上下界: 下限={floor_text} 上限={ceiling_text}"
+            "（0=不设界；超出时按边界刷）"
+        )
     print(
         f"单日容量: {capacity:,} 次"
         f"（boost_n={boost_n} × single_cap={single_cap}）"
