@@ -211,8 +211,8 @@ baseline_views: 0
 # 白话：stable = 维持现状；growth = 往上刷（配合 growth_factor）。
 boost_mode: stable
 
-# growth 模式下的目标倍率：1.5 表示目标 = 基准 × 1.5。
-# stable 模式下该值不生效。倍率不宜过大，否则曲线形态异常仍可能被
+# growth 模式下的目标系数起始值：1.5 表示目标 = 基准 × 1.5。
+# stable 模式下该值不生效。目标系数不宜过大，否则曲线形态异常仍可能被
 # Steam 风控察觉。
 # 白话：growth 模式刷到基准的 1.5 倍；stable 模式下用不上。
 growth_factor: 1.5
@@ -1159,7 +1159,7 @@ def _print_forecast_report(
         )
     print()
 
-    header = ["日期", "基准", "倍率", "目标", "假设自然", "缺口", "备注"]
+    header = ["日期", "基准", "目标系数", "目标", "假设自然", "缺口", "备注"]
     aligns = ["left", "right", "right", "right", "right", "right", "left"]
     body: list[list[str]] = []
     for row in rows:

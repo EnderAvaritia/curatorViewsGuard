@@ -60,7 +60,8 @@ def forecast_days(
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
           ``predict_expected(local_history)["expected"]``；
-        - ``multiplier``：复用 ``scheduler._target_multiplier``；stable 模式倍率恒为 1.0；
+        - ``multiplier``：目标系数（表格列名「目标系数」），复用
+          ``scheduler._target_multiplier``；stable 模式恒为 1.0；
         - ``target = base * multiplier``；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
@@ -219,7 +220,7 @@ def _build_warnings(
     if zero_rows:
         warnings.append(
             {"code": "multiplier_zero",
-             "message": f"目标倍率在 {zero_rows[0]['date']} 归零"
+             "message": f"目标系数在 {zero_rows[0]['date']} 归零"
                         f"（growth_rate={growth_rate:g}），目标将归零并永久为 0，"
                         "请检查 growth_rate 配置。"}
         )

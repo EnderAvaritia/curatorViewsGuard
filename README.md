@@ -65,7 +65,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 | 每日浏览量 | Steam 鉴赏家后台按天统计的 `num_views`，通过 `g_StatsAppViews` 获取 |
 | 统计滞后 | Steam 当天统计通常在次日才完整，因此系统按“昨日数据”推算今日 |
 | 基准（base） | 今日浏览量的参考水平：自动预测值，或 `baseline_views` 手动固定值 |
-| 今日目标（target） | `基准 × 倍率 × 速率因子`，系统希望今天达到的浏览量水平 |
+| 今日目标（target） | `基准 × 目标系数`，系统希望今天达到的浏览量水平 |
+| 目标系数（multiplier） | 目标相对基准的比例；`stable` 恒为 `1.0`，`growth` 为 `growth_factor × (1 + growth_rate × 距生效日天数)` |
 | 昨日实际 | 最近一天入库的浏览量，其中可能包含昨天自己刷的量 |
 | 昨日刷量 | `boost_log` 台账中记录的昨天提升总量 |
 | 昨日自然流量 | `昨日实际 − 昨日刷量`，夹到不小于 0；是计算今日缺口的基准 |
@@ -130,10 +131,9 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
               趋势修正受 |斜率| ≤ 中位数 × trend_cap 封顶
               （baseline_views > 0 时直接用该固定值，跳过自动预测）
 
-今日目标     = 基准预期 × 倍率 × 速率因子
-              stable 模式：倍率 = 1，速率因子 = 1
-              growth 模式：倍率 = growth_factor
-              速率因子 = 1 + growth_rate × 距生效日天数
+今日目标     = 基准预期 × 目标系数
+              stable 模式：目标系数 = 1
+              growth 模式：目标系数 = growth_factor × (1 + growth_rate × 距生效日天数)
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
@@ -167,17 +167,21 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 | 模式 | 公式 | 用途 |
 | --- | --- | --- |
 | `stable` | `target = base` | 维持稳定，补缺口到基准水平 |
-| `growth` | `target = base × growth_factor × (1 + growth_rate × 天数)` | 主动抬高或压低台阶，并可按天匀速变化 |
+| `growth` | `target = base × 目标系数`，目标系数 = `growth_factor × (1 + growth_rate × 天数)` | 主动抬高或压低台阶，并可按天匀速变化 |
+
+`目标系数`就是 `forecast` 表格里的「目标系数」列，表示目标相对基准的比例，
+不是相对自然流量的倍数。例如 `0.842` 表示目标 = 基准 × 0.842。
 
 - `growth_factor` 管“台阶高低”：`1.5` 表示目标是基准的 1.5 倍；`0.85` 表示先允许
   跌到基准的 85%，跌破才托住。
-- `growth_rate` 管“斜率”：`0.01` 表示每天在基准上多加 1%，`-0.01` 表示每天降 1%。
+- `growth_rate` 管“斜率”：`0.01` 表示目标系数每天增加 `growth_factor × 1%`
+  （例如 `growth_factor=0.85` 时约 +0.0085），`-0.01` 则每天下降。
 - 速率锚点持久化在 `kv_store`：同一速率跨重启沿用原起点；修改速率后从当天重新
   起算，避免历史天数突然生效造成目标跳变。
 - 检测参照与补缺口目标同步：预测阶段使用 `base × max(1, multiplier)` 作为异常
   判断参照，避免把自己刷出来的量误判为恶意刷量；长期基线仍是原始中位数。
-- `forecast` 输出的“目标”是托底目标 `base × multiplier`，当 `growth_factor < 1`
-  时与检测参照不同，不能混用。
+- `forecast` 输出的“目标”是托底目标 `base × 目标系数（multiplier）`，当
+  `growth_factor < 1` 时与检测参照不同，不能混用。
 
 ### 3.5 缺口与昨日自然流量
 
@@ -535,8 +539,8 @@ python curator_views/cli.py daemon --config config.yaml
 | --- | --- | --- |
 | `baseline_views` | `0` | 手动目标浏览量；> 0 时替代自动预测 |
 | `boost_mode` | `stable` | `stable` 维持稳定 / `growth` 主动升降 |
-| `growth_factor` | `1.5` | growth 模式倍率；stable 模式不生效 |
-| `growth_rate` | `0` | growth 模式每天相对基准的线性变化率 |
+| `growth_factor` | `1.5` | growth 模式目标系数的起始值；stable 模式不生效 |
+| `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%） |
 | `volatility` | `0.10` | 缺口随机抖动幅度；建议 ≤ 0.15 |
 
 **说明：**
@@ -794,7 +798,7 @@ python curator_views/cli.py forecast --config config.yaml \
 `in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期、
 波动率与刷量列表，只复用 `run` 的缺口公式。
 
-forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照是
+forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run` 的检测参照是
 `base × max(1, multiplier)`。当 `growth_factor < 1` 时两者不同，不要把托底
 目标当成检测参照。
 
@@ -808,10 +812,10 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
       基线=auto 自然模型=natural 波动率=0.10
 单日容量: 1,500 次（boost_n=5 × single_cap=300）
 
-日期           基准   倍率     目标  假设自然   缺口  备注
---------------------------------------------------------------
-2026-11-14  8,430.4  0.842  7,094.2     5,449  1,645  容量不足
-2026-11-15  8,352.3  0.833  6,957.5     5,449  1,508  容量不足
+日期           基准  目标系数     目标  假设自然   缺口  备注
+-----------------------------------------------------------------
+2026-11-14  8,430.4     0.842  7,094.2     5,449  1,645  容量不足
+2026-11-15  8,352.3     0.833  6,957.5     5,449  1,508  容量不足
 ...
 
 汇总: 7 天预计刷量 8,216（日均 1,174）；目标 7,094.2 → 5,893.0
@@ -820,6 +824,17 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
       2026-11-14 需要 1,645 次
       2026-11-15 需要 1,508 次
 ```
+
+「目标系数」= 目标 ÷ 基准，只作用于基准，不是“自然流量的倍数”：
+
+- `stable` 模式恒为 `1.000`；
+- `growth` 模式为 `growth_factor × (1 + growth_rate × 距生效日天数)`，线性变化，
+  不是复利。
+
+例如 `growth_factor=0.85`、`growth_rate=-0.01` 时，11-14 是第 1 天：
+`0.85 × (1 - 0.01 × 1) = 0.8415`，显示为 `0.842`；当天目标 =
+`8,430.4 × 0.842 ≈ 7,094.2`。`0.842` 表示目标是基准的 84.2%，不是自然流量的
+0.842 倍。JSON 字段仍叫 `multiplier`。
 
 表格里的「备注」列会在缺口超过单日容量时显示 `容量不足`（容量为 0 时显示
 `无容量`），在受线程/等待间隔限制时显示 `吞吐不足`；单日容量 =
@@ -832,7 +847,7 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 | --- | --- |
 | `no_history` | 本地没有可用历史数据，所有基准为 0 |
 | `need_all_zero` | 整个预测区间缺口都为 0，系统不会刷量 |
-| `multiplier_zero` | 目标倍率在某个日期归零（通常 `growth_rate` 过负） |
+| `multiplier_zero` | 目标系数在某个日期归零（通常 `growth_rate` 过负） |
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
 | `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |

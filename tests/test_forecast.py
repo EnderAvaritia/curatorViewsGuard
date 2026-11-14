@@ -569,6 +569,8 @@ class TestForecastCli:
         assert len(table_lines) == 4  # 表头 + 3 天
         assert len({cli._display_width(line) for line in table_lines}) == 1
         assert "单日容量" in out
+        assert "目标系数" in out
+        assert "倍率" not in out
         assert "容量不足" in out
 
     def test_cli_table_marks_throughput_shortage(self, tmp_path, capsys):

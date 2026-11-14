@@ -202,6 +202,11 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
 max(wait_min, wait_max)`（未计请求耗时），都会单独列在表格上方。缺口超过吞吐上限时
 给出 `throughput_capacity` 警告。
 
+「目标系数」= 目标 ÷ 基准；`stable` 恒为 `1.0`，`growth` 为
+`growth_factor × (1 + growth_rate × 距生效日天数)`（线性，不是复利）。
+例如 `0.842` 表示目标 = 基准 × 0.842，不是自然流量的 0.842 倍；JSON 字段仍为
+`multiplier`。
+
 forecast 只以只读 URI 打开数据库，只执行 `SELECT`，不会写 `last_run_date`、不会写
 growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只
 读取 `kv_store`，速率一致才沿用，否则按预测首日重新起算（不写回）。
@@ -209,7 +214,7 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 需要注意：Steam 统计滞后一天，默认从今天 00:00 起算（`--tomorrow` 改为明天），
 自然口径取今天之前最近一个完整日；本地库不是最新时给出 `stale_history` 提示。
 未来自然流量只是外推，所以结果是**估算不是精确预测**。forecast 输出的是托底目标
-`base × multiplier`；`run_daily` 的检测参照是 `base × max(1, multiplier)`，
+`base × 目标系数（multiplier）`；`run_daily` 的检测参照是 `base × max(1, multiplier)`，
 `growth_factor < 1` 时二者不同。异常标记未持久化，`in_cooldown` 恒为 false；
 自然口径也不含恢复期、波动率与刷量列表。
 
@@ -315,9 +320,9 @@ python curator_views/cli.py version
 | `slope_days` | `14` | 持续上升斜率检测窗口 |
 | `slope_threshold` | `0.02` | 斜率阈值（相对中位数/天），超阈值视为慢性爬升候选 |
 | `baseline_views` | `0` | 手动目标浏览量；大于 0 时替代自动预测，系统围绕该值刷量 |
-| `boost_mode` | `stable` | 模式切换：`stable` 维持稳定 / `growth` 刷量（目标=基准×倍率） |
-| `growth_factor` | `1.5` | growth 模式的目标倍率（如 1.5 = 比基准高 50%；小于 1 表示压低台阶，如 0.85） |
-| `growth_rate` | `0` | growth 模式下每天相对基准的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1% 匀速下滑）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
+| `boost_mode` | `stable` | 模式切换：`stable` 维持稳定 / `growth` 刷量（目标=基准×目标系数） |
+| `growth_factor` | `1.5` | growth 模式目标系数的起始值（如 1.5 = 比基准高 50%；小于 1 表示压低台阶，如 0.85） |
+| `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
 | `volatility` | `0.10` | 刷量波动率：每日提升量在「缺口 ×(1±波动率)」内随机；建议 ≤ 0.15 |
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |
