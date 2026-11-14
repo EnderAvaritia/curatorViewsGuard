@@ -50,6 +50,20 @@ def warning_codes(result):
     return {item["code"] for item in result["warnings"]}
 
 
+class TestDisplayWidth:
+    def test_cjk_counts_as_two_columns(self):
+        assert cli._display_width("日期") == 4
+        assert cli._display_width("假设自然") == 8
+        assert cli._display_width("2026-11-14") == 10
+
+    def test_pad_display_aligns_by_display_width(self):
+        assert cli._pad_display("假设自然", 10, "right") == "  假设自然"
+        assert cli._pad_display("8,430.4", 10, "left") == "8,430.4   "
+        assert (
+            cli._display_width(cli._pad_display("假设自然", 10, "right")) == 10
+        )
+
+
 class TestForecastDays:
     def test_declining_factor_all_zero_and_warns(self):
         # 默认用户配置：0.85 托底 + 每天 -1%，目标始终低于自然流量
@@ -444,3 +458,36 @@ class TestForecastCli:
         payload = json.loads(capsys.readouterr().out)
         assert payload["source"]["natural_basis"] == "trend"
         assert payload["source"]["yesterday_natural"] is None
+
+    def test_cli_table_columns_align_and_mark_over_capacity(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=4000",
+                "--days",
+                "3",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        table_lines = [
+            line
+            for line in out.splitlines()
+            if line.startswith("日期") or line.startswith("20")
+        ]
+        assert len(table_lines) == 4  # 表头 + 3 天
+        assert len({cli._display_width(line) for line in table_lines}) == 1
+        assert "单日容量" in out
+        assert "容量不足" in out

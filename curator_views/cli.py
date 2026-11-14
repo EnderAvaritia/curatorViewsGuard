@@ -40,6 +40,7 @@ import json
 import logging
 import sqlite3
 import sys
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -1067,6 +1068,26 @@ def _forecast_start_epoch() -> int:
     )
 
 
+def _display_width(text: str) -> int:
+    """按终端显示宽度计算字符串宽度（CJK 全角字符占 2 列）。"""
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        for ch in str(text)
+    )
+
+
+def _pad_display(text: str, width: int, align: str = "left") -> str:
+    """按显示宽度补空格，保证中英文混排表格对齐。"""
+    text = str(text)
+    padding = max(0, width - _display_width(text))
+    if align == "right":
+        return " " * padding + text
+    if align == "center":
+        left = padding // 2
+        return " " * left + text + " " * (padding - left)
+    return text + " " * padding
+
+
 def _print_forecast_report(
     result: Dict[str, Any],
     config: Dict[str, Any],
@@ -1087,38 +1108,82 @@ def _print_forecast_report(
     source_text = "Steam 在线抓取" if fetched else f"本地数据库 {db_path}"
     print(
         f"数据来源: {source_text}（{source['history_days']} 天，"
-        f"最新 {source['latest_date']} = {source['latest_views']} 次）"
+        f"最新 {source['latest_date']} = {source['latest_views']:,} 次）"
     )
     if natural_basis == "natural":
         print(
             f"自然口径: 基准日 {source['baseline_date']} 实际 "
-            f"{source['yesterday_actual']} - 刷量 {source['yesterday_boosted']} "
-            f"= 自然 {source['yesterday_natural']}；未来日假设自然不变"
+            f"{source['yesterday_actual']:,} - 刷量 "
+            f"{source['yesterday_boosted']:,} "
+            f"= 自然 {source['yesterday_natural']:,}；未来日假设自然不变"
         )
     baseline = float(config.get("baseline_views", 0) or 0)
     baseline_text = "auto" if baseline <= 0 else f"{baseline:g}"
     print(
         f"参数: boost_mode={config.get('boost_mode', 'stable')} "
         f"factor={float(config.get('growth_factor', 1.0)):g} "
-        f"rate={float(config.get('growth_rate', 0)):g} "
-        f"基线={baseline_text} "
+        f"rate={float(config.get('growth_rate', 0)):g}"
+    )
+    print(
+        f"      基线={baseline_text} "
         f"自然模型={source.get('natural_mode', 'natural')} "
         f"波动率={float(config.get('volatility', 0)):.2f}"
     )
-    print()
+    boost_n = max(0, int(config.get("boost_n", 5)))
+    single_cap = max(0, int(config.get("single_cap", 300)))
+    capacity = boost_n * single_cap
     print(
-        f"{'日期':<12}{'基准':>8}{'倍率':>8}{'目标':>9}"
-        f"{'假设自然':>9}{'缺口':>8}"
+        f"单日容量: {capacity:,} 次"
+        f"（boost_n={boost_n} × single_cap={single_cap}）"
     )
-    for row in rows:
-        print(
-            f"{row['date']:<12}{row['base']:>8.1f}{row['multiplier']:>8.3f}"
-            f"{row['target']:>9.1f}{row['assumed_natural']:>9}{row['need']:>8}"
-        )
     print()
+
+    header = ["日期", "基准", "倍率", "目标", "假设自然", "缺口", "备注"]
+    aligns = ["left", "right", "right", "right", "right", "right", "left"]
+    body: list[list[str]] = []
+    for row in rows:
+        if row["need"] <= 0:
+            note = ""
+        elif capacity <= 0:
+            note = "无容量"
+        elif row["need"] > capacity:
+            note = "容量不足"
+        else:
+            note = ""
+        body.append(
+            [
+                row["date"],
+                f"{row['base']:,.1f}",
+                f"{row['multiplier']:.3f}",
+                f"{row['target']:,.1f}",
+                f"{row['assumed_natural']:,}",
+                f"{row['need']:,}",
+                note,
+            ]
+        )
+
+    widths = [_display_width(item) for item in header]
+    for cells in body:
+        for index, cell in enumerate(cells):
+            widths[index] = max(widths[index], _display_width(cell))
+
+    def render(cells: list[str]) -> str:
+        return "  ".join(
+            _pad_display(cell, width, align)
+            for cell, width, align in zip(cells, widths, aligns)
+        )
+
+    print(render(header))
+    print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for cells in body:
+        print(render(cells))
+    print()
+    total_need = int(summary["total_need"])
+    days = max(1, int(summary["days"]))
     print(
-        f"汇总: {summary['days']} 天预计刷量 {summary['total_need']}；"
-        f"目标 {summary['target_first']:.1f} → {summary['target_last']:.1f}"
+        f"汇总: {days} 天预计刷量 {total_need:,}"
+        f"（日均 {total_need / days:,.0f}）；"
+        f"目标 {summary['target_first']:,.1f} → {summary['target_last']:,.1f}"
     )
     if natural_basis == "natural":
         print(

@@ -207,11 +207,17 @@ def _build_warnings(
     for row in rows:
         if row["need"] > capacity:
             over_capacity.append(
-                f"{row['date']} 需要刷量 {row['need']} 次，超过单日容量上限 "
-                f"{capacity} 次（boost_n={boost_n} × single_cap={single_cap}），"
-                "当天无法刷满。"
+                f"      {row['date']} 需要 {row['need']:,} 次"
             )
     if over_capacity:
-        warnings.append({"code": "over_capacity",
-                         "message": " ".join(over_capacity)})
+        warnings.append(
+            {
+                "code": "over_capacity",
+                "message": (
+                    f"以下日期超过单日容量 {capacity:,} 次"
+                    f"（boost_n={boost_n} × single_cap={single_cap}）：\n"
+                    + "\n".join(over_capacity)
+                ),
+            }
+        )
     return warnings
