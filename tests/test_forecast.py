@@ -205,15 +205,16 @@ def make_readonly_db(tmp_path):
         "CREATE TABLE daily_stats (date_ts INTEGER PRIMARY KEY, num_views INTEGER)"
     )
     conn.execute("CREATE TABLE kv_store (key TEXT PRIMARY KEY, value TEXT)")
-    # 用固定 UTC+8 日期生成 10 天恒定历史
-    end_ts = _date_to_epoch("2026-11-12")
+    # 相对“今天”生成 10 天恒定历史（最后一条是昨天），避免依赖机器时钟
+    end_ts = _today_epoch() - DAY
     for i in range(10):
         conn.execute(
             "INSERT INTO daily_stats (date_ts, num_views) VALUES (?, ?)",
             (end_ts - DAY * (9 - i), 1000),
         )
     conn.execute(
-        "INSERT INTO kv_store (key, value) VALUES ('program_start', '2026-11-03')"
+        "INSERT INTO kv_store (key, value) VALUES ('program_start', ?)",
+        (_iso(end_ts - DAY * 9),),
     )
     conn.commit()
     conn.close()
@@ -283,7 +284,7 @@ class TestForecastCli:
         assert code == 0
         assert before == after
         out = capsys.readouterr().out
-        assert "（3 天）" in out
+        assert "3 天" in out
         assert len(set(re.findall(r"\d{4}-\d{2}-\d{2}", out))) >= 3
         assert not (tmp_path / "views.db-wal").exists()
 
@@ -311,6 +312,7 @@ class TestForecastCli:
         assert db_path.read_bytes() == before
         payload = json.loads(capsys.readouterr().out)
         assert payload["source"]["perspective"] == "today"
+        assert payload["source"]["natural_basis"] == "natural"
         assert payload["source"]["yesterday_actual"] == 1000
         assert payload["source"]["yesterday_boosted"] == 100
         assert payload["source"]["yesterday_natural"] == 900
@@ -337,8 +339,8 @@ class TestForecastCli:
 
         assert code == 0
         out = capsys.readouterr().out
-        assert "今日视角" in out
-        assert "今日口径" in out
+        assert "含今天" in out
+        assert "自然口径" in out
         assert "缺口公式" in out
 
     def test_cli_today_warns_when_history_is_stale(self, tmp_path, capsys):
@@ -361,3 +363,84 @@ class TestForecastCli:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert "stale_history" in {item["code"] for item in payload["warnings"]}
+
+    def test_cli_default_includes_today_with_natural_gap(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=2000",
+                "--days",
+                "2",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["perspective"] == "today"
+        assert payload["source"]["natural_basis"] == "natural"
+        assert payload["rows"][0]["date"] == _iso(_today_epoch())
+        assert payload["rows"][0]["assumed_natural"] == 1000
+        assert payload["rows"][0]["need"] == 1000
+
+    def test_cli_tomorrow_starts_next_day(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=2000",
+                "--tomorrow",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["perspective"] == "tomorrow"
+        assert payload["rows"][0]["date"] == _iso(_today_epoch() + DAY)
+        assert payload["rows"][0]["assumed_natural"] == 1000
+        assert payload["rows"][0]["need"] == 1000
+
+    def test_cli_explicit_natural_trend_keeps_old_model(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--natural",
+                "trend",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["natural_basis"] == "trend"
+        assert payload["source"]["yesterday_natural"] is None

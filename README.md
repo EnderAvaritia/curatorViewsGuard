@@ -418,8 +418,8 @@ python curator_views/cli.py check --config config.yaml
 # 6. 只读估算未来 7 天的目标与缺口
 python curator_views/cli.py forecast --config config.yaml --days 7
 
-# 6b. 只看今天该刷多少（首日自然流量 = 昨日实际 − 昨日刷量）
-python curator_views/cli.py forecast --config config.yaml --today --fetch
+# 6b. 只看今天该刷多少（默认含今天，首日自然 = 昨日实际 − 昨日刷量）
+python curator_views/cli.py forecast --config config.yaml --fetch
 
 # 7. 演练模式：完整计算但不真正刷量
 python curator_views/cli.py run --config config.yaml --dry-run
@@ -749,23 +749,22 @@ python curator_views/cli.py check --config config.yaml
 
 ```bash
 python curator_views/cli.py forecast --config config.yaml \
-  [--days N] [--fetch] [--today] [--natural trend|target] \
+  [--days N] [--fetch] [--today | --tomorrow] [--natural trend|target] \
   [--set KEY=VALUE ...] [--json]
 ```
 
-只读推算未来 N 天的目标浏览量、假设自然流量与刷量缺口，用于判断配置是否会
-空转（缺口恒为 0）或超载（缺口超过单日容量）。
+只读推算**今天（默认）或明天起** N 天的目标浏览量、假设自然流量与刷量缺口，
+用于判断配置是否会空转（缺口恒为 0）或超载（缺口超过单日容量）。
 
 - `--days N`：预测天数，默认 7，必须 ≥ 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，仅在内存使用，绝不写库；要求
   `clan_id` 非空；
-- `--today`：今日视角，从今天 00:00 起算；首日自然流量取
-  `最新实际 − 最新刷量`（与 `run` 的“昨日自然流量”口径一致），未来日假设自然
-  流量不变，因此每天都会重新计算缺口，适合回答“今天该刷多少”。会忽略
-  `--natural`；默认只读本地库，库不是最新时会给出 `stale_history` 提示，
-  可配合 `--fetch` 使用；
-- `--natural trend|target`：
-  - `trend`（默认）：假设自然流量按当前趋势延续；
+- `--today` / `--tomorrow`：从今天 00:00（默认）或明天 00:00 起算。今天的
+  统计要明天才完整，所以预测今天本身仍然是预测；
+- `--natural trend|target`：默认 `natural`，即首日自然流量取“今天之前最近一个
+  完整日的实际 − 当日刷量”（与 `run` 的缺口公式一致），未来日假设自然流量不变，
+  因此每天都会重新计算缺口；显式指定时改用旧模型：
+  - `trend`：假设自然流量按实际趋势延续；
   - `target`：假设自然流量最终收敛到目标（首日用初始预测，之后用上一天目标）；
 - `--set KEY=VALUE`：覆盖配置做 what-if，可重复，也能覆盖 `db_path`；
 - `--json`：输出 `rows` / `warnings` / `summary` / `source` 完整结构。
@@ -778,11 +777,12 @@ python curator_views/cli.py forecast --config config.yaml \
 - growth 起点只从 `kv_store` 读取，速率一致才沿用，否则按预测首日重新起算，
   不写回。
 
-预测首日默认为**明天 00:00**（Asia/Shanghai），因为 Steam 当天统计通常次日才完整；
-加 `--today` 时改为今天 00:00，并用昨日实际减去昨日刷量作为自然流量。
-这是**估算不是精确预测**：首日基准需要假设上一日实际，未来自然流量只是外推；
-异常标记未持久化，因此 `in_cooldown` 恒为 `false`，未来日也不做溢出扣减。
-`--today` 同样不含恢复期、波动率与刷量列表，只复用 `run` 的缺口公式。
+默认从**今天 00:00**（Asia/Shanghai）起算，`--tomorrow` 可改为明天。自然口径下
+首日基准取今天之前最近一个完整日；若本地库最新日期早于昨天，会给出
+`stale_history` 提示，建议加 `--fetch`。
+这是**估算不是精确预测**：未来自然流量只是外推；异常标记未持久化，因此
+`in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期、
+波动率与刷量列表，只复用 `run` 的缺口公式。
 
 forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照是
 `base × max(1, multiplier)`。当 `growth_factor < 1` 时两者不同，不要把托底
@@ -791,17 +791,19 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 输出示例：
 
 ```
-预测区间: 2026-11-14 ~ 2026-11-20（7 天）
-数据来源: 本地数据库 E:\...\views.db（34 天，最新 2026-11-13 = 1234 次）
-参数: boost_mode=growth factor=0.85 rate=-0.01 基线=auto 波动率=0.10
+预测区间: 2026-11-14 ~ 2026-11-20（7 天，含今天）
+数据来源: 本地数据库 E:\...\views.db（18 天，最新 2026-11-13 = 5449 次）
+自然口径: 基准日 2026-11-13 实际 5449 - 刷量 0 = 自然 5449；未来日假设自然不变
+参数: boost_mode=growth factor=0.85 rate=-0.01 基线=auto 自然模型=natural 波动率=0.10
 
 日期            基准    倍率     目标  假设自然    缺口
-2026-11-14    1234.0  0.842   1038.4     1234       0
+2026-11-14    8415.2  0.842   7081.4     5449    1632
+2026-11-15    8400.9  0.833   6997.9     5449    1549
 ...
 
-汇总: 7 天预计刷量 0；目标 1038.4 → 975.5
+汇总: 7 天预计刷量 9227；目标 7081.4 → 6063.8
 提示:
-  - [need_all_zero] 预测区间 2026-11-14 ~ 2026-11-20 内目标始终低于假设自然流量，系统不会产生刷量。
+  - [over_capacity] 2026-11-14 需要刷量 1632 次，超过单日容量上限 1500 次（boost_n=5 × single_cap=300），当天无法刷满。
 ```
 
 常见 warning：
@@ -812,7 +814,7 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 | `need_all_zero` | 整个预测区间缺口都为 0，系统不会刷量 |
 | `multiplier_zero` | 目标倍率在某个日期归零（通常 `growth_rate` 过负） |
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
-| `stale_history` | `--today` 时本地库最新日期早于昨天，缺口可能基于旧数据 |
+| `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
 
 ### 8.6 boost
 
@@ -971,8 +973,8 @@ CLI 不会因 Cookie 缺失退出；但统计抓取通常需要登录，`run` / 
 ### 9.7 正式执行前先估算
 
 ```bash
-# 今天该刷多少（--fetch 会在线补齐昨天/今天的统计，仅内存使用）
-python curator_views/cli.py forecast --config config.yaml --today --fetch
+# 今天该刷多少（默认含今天；--fetch 会在线补齐统计，仅内存使用）
+python curator_views/cli.py forecast --config config.yaml --fetch
 
 # 未来两周的空转/超载检查
 python curator_views/cli.py forecast --config config.yaml --days 14
@@ -980,8 +982,8 @@ python curator_views/cli.py forecast --config config.yaml \
   --set growth_factor=1.2 --set baseline_views=1500
 ```
 
-用 `--today` 对齐 `run` 的缺口口径；用 `--set` 做 what-if，确认缺口和容量后再改
-正式配置。
+默认口径已对齐 `run` 的缺口公式；用 `--tomorrow` 看明天起，用 `--set` 做 what-if，
+确认缺口和容量后再改正式配置。
 
 ---
 
