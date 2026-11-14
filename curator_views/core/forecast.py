@@ -18,7 +18,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .predictor import predict_expected
-from .scheduler import _TZ, _target_multiplier
+from .scheduler import (
+    _TZ,
+    _daily_throughput_capacity,
+    _effective_threads,
+    _target_multiplier,
+)
 
 
 def _iso_date(date_ts: int) -> str:
@@ -81,6 +86,10 @@ def forecast_days(
     growth_rate = float(config.get("growth_rate", 0) or 0)
     boost_n = int(config.get("boost_n", 5))
     single_cap = int(config.get("single_cap", 300))
+    batch_size = int(config.get("batch_size", 50))
+    threads = int(config.get("threads", 1))
+    wait_min = float(config.get("wait_min", 8.0))
+    wait_max = float(config.get("wait_max", 16.0))
 
     # 与 run_daily 一样：只有 growth 且速率非 0 时才启用速率锚点；stable 恒为 1.0
     factor = growth_factor if boost_mode == "growth" else 1.0
@@ -148,10 +157,19 @@ def forecast_days(
         previous_target = target
         prediction = predict()
 
-    warnings = _build_warnings(
-        history, rows, growth_rate, boost_n, single_cap
+    throughput_capacity = _daily_throughput_capacity(
+        threads, wait_min, wait_max, boost_n, batch_size
     )
-    return {"rows": rows, "warnings": warnings, "summary": _build_summary(rows)}
+    warnings = _build_warnings(
+        history, rows, growth_rate, boost_n, single_cap,
+        threads, wait_min, wait_max, batch_size,
+    )
+    summary = _build_summary(rows)
+    summary["throughput_capacity"] = throughput_capacity
+    summary["effective_threads"] = _effective_threads(
+        threads, boost_n, batch_size
+    )
+    return {"rows": rows, "warnings": warnings, "summary": summary}
 
 
 def _build_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -178,6 +196,10 @@ def _build_warnings(
     growth_rate: float,
     boost_n: int,
     single_cap: int,
+    threads: int = 1,
+    wait_min: float = 8.0,
+    wait_max: float = 16.0,
+    batch_size: int = 50,
 ) -> List[Dict[str, str]]:
     """根据预测结果生成中文提示（code + 具体到日期/数字的 message）。"""
     warnings: List[Dict[str, str]] = []
@@ -220,4 +242,29 @@ def _build_warnings(
                 ),
             }
         )
+
+    throughput = _daily_throughput_capacity(
+        threads, wait_min, wait_max, boost_n, batch_size
+    )
+    if throughput is not None:
+        over_throughput = [
+            f"      {row['date']} 需要 {row['need']:,} 次"
+            for row in rows
+            if row["need"] > throughput
+        ]
+        if over_throughput:
+            warnings.append(
+                {
+                    "code": "throughput_capacity",
+                    "message": (
+                        f"以下日期超过按 threads={threads}、"
+                        f"wait_min={wait_min:g}、wait_max={wait_max:g} "
+                        f"估算的单日吞吐上限 {throughput:,} 次"
+                        f"（实际并发 "
+                        f"{_effective_threads(threads, boost_n, batch_size)}，"
+                        "未计请求耗时）：\n"
+                        + "\n".join(over_throughput)
+                    ),
+                }
+            )
     return warnings

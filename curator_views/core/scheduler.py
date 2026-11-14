@@ -111,6 +111,49 @@ def _target_multiplier(
     return max(0.0, factor * (1.0 + growth_rate * days))
 
 
+def _effective_threads(
+    threads: int,
+    app_count: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> int:
+    """返回 Booster 实际可同时访问的 App 数。
+
+    受实现上限（2）、推荐数（boost_n）与批次大小（batch_size）共同限制；
+    并行批次里只有 ``len(active)`` 个任务，线程再多也不会超过这个数。
+    """
+    limit = max(1, min(int(threads), 2))
+    if app_count is not None:
+        limit = min(limit, max(1, int(app_count)))
+    if batch_size is not None:
+        limit = min(limit, max(1, int(batch_size)))
+    return max(1, limit)
+
+
+def _daily_throughput_capacity(
+    threads: int,
+    wait_min: float,
+    wait_max: float,
+    app_count: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> Optional[int]:
+    """估算单日最多能发多少次请求（乐观上限，未计请求耗时）。
+
+    Booster 每次访问后随机等待 ``wait_min`` ~ ``wait_max`` 秒，并发线程各自
+    独立等待；因此单日请求上限约为::
+
+        实际并发 × 86400 / max(wait_min, wait_max)
+
+    ``wait_min`` 大于 ``wait_max`` 时，``random.uniform`` 的实际最大值仍是
+    较大者。等待上限 <= 0 表示不等待，返回 ``None``（不构成吞吐瓶颈）。
+    """
+    interval = max(0.0, float(wait_min), float(wait_max))
+    if interval <= 0:
+        return None
+    return int(
+        _effective_threads(threads, app_count, batch_size) * 86400 / interval
+    )
+
+
 def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
     """把汇总字典格式化为每日简报正文。"""
     mode = "（演练模式，未实际提升）" if dry_run else ""
@@ -142,6 +185,17 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
             f"（今日 {summary.get('boost_list_amount') or 0}，"
             f"剩余 {summary.get('boost_list_remaining', 0)} 行）"
         )
+    throughput = summary.get("throughput_capacity")
+    if throughput is not None:
+        wait_min = summary.get("wait_min", 8.0)
+        wait_max = summary.get("wait_max", 16.0)
+        lines.append(
+            f"单日吞吐上限: {throughput:,} 次"
+            f"（threads={summary.get('threads', 1)}，"
+            f"最大间隔={max(wait_min, wait_max):g}s）"
+        )
+    if summary.get("capacity_warning"):
+        lines.append(f"注意: {summary['capacity_warning']}")
     lines.append(f"实际提升: {summary['boosted']} {mode}")
     return "\n".join(lines)
 
@@ -243,6 +297,7 @@ def run_daily(
         window_days, trend_cap, startup_factor, trend_min_points,
         outlier_k, consecutive_days, absorb_days,
         boost_n, single_cap, batch_size, target_ratio, boost_distribution,
+        threads, wait_min, wait_max,
         baseline_views, boost_mode, growth_factor,
         volatility, cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
@@ -338,9 +393,13 @@ boost_mode / growth_factor / growth_rate：
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
     boost_list_file = str(config.get("boost_list_file", "") or "").strip()
+    threads = int(config.get("threads", getattr(booster, "threads", 1)))
+    wait_min = float(config.get("wait_min", getattr(booster, "wait_min", 8.0)))
+    wait_max = float(config.get("wait_max", getattr(booster, "wait_max", 16.0)))
 
     # Booster 的执行参数以 config 为准（调用方构建实例时可先给默认值）
-    booster.batch_size = int(config.get("batch_size", booster.batch_size))
+    batch_size = int(config.get("batch_size", booster.batch_size))
+    booster.batch_size = batch_size
     booster.single_cap = int(config.get("single_cap", booster.single_cap))
     booster.target_ratio = float(config.get("target_ratio", booster.target_ratio))
     booster.distribution = str(
@@ -569,6 +628,28 @@ boost_mode / growth_factor / growth_rate：
                 )
                 need = list_amount
 
+    # 6.6 吞吐能力检查：threads 与等待间隔共同决定一天最多能发多少请求。
+    #     这是乐观上限（未计请求耗时）；缺口超过它时一天肯定跑不满。
+    throughput_capacity = _daily_throughput_capacity(
+        threads, wait_min, wait_max, boost_n, batch_size
+    )
+    capacity_warning = ""
+    if (
+        boost_enabled
+        and throughput_capacity is not None
+        and need > throughput_capacity
+    ):
+        capacity_warning = (
+            f"今日缺口 {need:,} 超过单日吞吐上限 {throughput_capacity:,} 次"
+            f"（threads={threads}，实际并发≤"
+            f"{_effective_threads(threads, boost_n, batch_size)}，"
+            f"最大间隔={max(wait_min, wait_max):g}s，未计请求耗时）"
+        )
+        logger.warning(
+            "%s；建议提高 threads（实现上限 2）或降低 wait_min/wait_max，"
+            "否则一天跑不满。", capacity_warning,
+        )
+
     # 7. 汇总字典
     summary: Dict[str, Any] = {
         "date": today_iso,
@@ -595,6 +676,11 @@ boost_mode / growth_factor / growth_rate：
         "boost_list_status": list_status,
         "boost_list_amount": list_amount,
         "boost_list_remaining": list_remaining,
+        "threads": threads,
+        "wait_min": wait_min,
+        "wait_max": wait_max,
+        "throughput_capacity": throughput_capacity,
+        "capacity_warning": capacity_warning,
     }
 
     # 8. 执行受控提升（调度器 / 执行器分离：优先子进程，回退直调）

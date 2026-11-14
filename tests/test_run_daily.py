@@ -718,3 +718,40 @@ class TestBoostList:
         assert summary["need"] == 0
         assert booster.last_target is None
         assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"
+
+
+class TestThroughputCapacity:
+    def test_warns_when_need_exceeds_thread_wait_capacity(self):
+        stats = make_stats([100] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=6000,
+            boost_n=10,
+            single_cap=1000,
+            threads=1,
+            wait_min=8.0,
+            wait_max=16.0,
+        )
+        assert summary["need"] == 5900
+        assert summary["throughput_capacity"] == 5400
+        assert "5,900" in summary["capacity_warning"]
+        assert "5,400" in summary["capacity_warning"]
+
+    def test_no_warning_when_two_threads_cover_need(self):
+        stats = make_stats([100] * 30)
+        summary = run_with(
+            stats,
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=6000,
+            boost_n=10,
+            single_cap=1000,
+            threads=2,
+            wait_min=8.0,
+            wait_max=16.0,
+        )
+        assert summary["need"] == 5900
+        assert summary["throughput_capacity"] == 10800
+        assert summary["capacity_warning"] == ""

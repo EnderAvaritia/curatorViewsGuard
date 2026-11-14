@@ -74,7 +74,9 @@ from curator_views.core.notifier import Notifier  # noqa: E402
 from curator_views.core.predictor import predict_expected  # noqa: E402
 from curator_views.core.scheduler import (  # noqa: E402
     _TZ,
+    _daily_throughput_capacity,
     _date_to_epoch,
+    _effective_threads,
     _today_epoch,
     run_daily,
 )
@@ -452,6 +454,9 @@ def _scheduler_config(
         "boost_distribution": str(
             cfg.get("boost_distribution", "ratio")
         ).lower(),
+        "threads": int(cfg.get("threads", 1)),
+        "wait_min": float(cfg.get("wait_min", 8.0)),
+        "wait_max": float(cfg.get("wait_max", 16.0)),
         "boost_enabled": bool(boost_enabled),
         "dry_run": bool(dry_run),
         "boost_list_file": _resolve_path(cfg_dir, list_file) if list_file else "",
@@ -1131,11 +1136,27 @@ def _print_forecast_report(
     )
     boost_n = max(0, int(config.get("boost_n", 5)))
     single_cap = max(0, int(config.get("single_cap", 300)))
+    batch_size = int(config.get("batch_size", 50))
     capacity = boost_n * single_cap
     print(
         f"单日容量: {capacity:,} 次"
         f"（boost_n={boost_n} × single_cap={single_cap}）"
     )
+    threads = int(config.get("threads", 1))
+    wait_min = float(config.get("wait_min", 8.0))
+    wait_max = float(config.get("wait_max", 16.0))
+    throughput = _daily_throughput_capacity(
+        threads, wait_min, wait_max, boost_n, batch_size
+    )
+    if throughput is None:
+        print("单日吞吐上限: 不限（等待间隔为 0）")
+    else:
+        print(
+            f"单日吞吐上限: {throughput:,} 次"
+            f"（threads={threads}，实际并发≤"
+            f"{_effective_threads(threads, boost_n, batch_size)}，"
+            f"最大间隔={max(wait_min, wait_max):g}s，未计请求耗时）"
+        )
     print()
 
     header = ["日期", "基准", "倍率", "目标", "假设自然", "缺口", "备注"]
@@ -1144,12 +1165,15 @@ def _print_forecast_report(
     for row in rows:
         if row["need"] <= 0:
             note = ""
-        elif capacity <= 0:
-            note = "无容量"
-        elif row["need"] > capacity:
-            note = "容量不足"
         else:
-            note = ""
+            notes = []
+            if capacity <= 0:
+                notes.append("无容量")
+            elif row["need"] > capacity:
+                notes.append("容量不足")
+            if throughput is not None and row["need"] > throughput:
+                notes.append("吞吐不足")
+            note = "/".join(notes)
         body.append(
             [
                 row["date"],

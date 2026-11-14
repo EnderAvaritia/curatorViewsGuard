@@ -40,7 +40,11 @@ def make_config(**overrides):
         "growth_rate": 0.0,
         "boost_n": 5,
         "single_cap": 300,
+        "batch_size": 50,
         "target_ratio": 0.95,
+        "threads": 1,
+        "wait_min": 8.0,
+        "wait_max": 16.0,
     }
     config.update(overrides)
     return config
@@ -183,6 +187,81 @@ class TestForecastDays:
             days=1,
         )
         assert "over_capacity" in warning_codes(result)
+
+    def test_throughput_capacity_warning(self):
+        result = forecast_days(
+            make_history(),
+            make_config(
+                baseline_views=6000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+                boost_n=10,
+                single_cap=1000,
+                threads=1,
+                wait_min=8.0,
+                wait_max=16.0,
+            ),
+            START_TS,
+            days=1,
+        )
+        assert "throughput_capacity" in warning_codes(result)
+        assert result["summary"]["throughput_capacity"] == 5400
+
+    def test_throughput_capacity_caps_threads_at_two(self):
+        result = forecast_days(
+            make_history(),
+            make_config(
+                baseline_views=6000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+                boost_n=10,
+                single_cap=1000,
+                threads=10,
+                wait_min=8.0,
+                wait_max=16.0,
+            ),
+            START_TS,
+            days=1,
+        )
+        assert result["summary"]["throughput_capacity"] == 10800
+        assert "throughput_capacity" not in warning_codes(result)
+
+    def test_single_recommendation_limits_concurrency(self):
+        result = forecast_days(
+            make_history(),
+            make_config(
+                baseline_views=6000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+                boost_n=1,
+                single_cap=10000,
+                threads=2,
+                wait_min=8.0,
+                wait_max=16.0,
+            ),
+            START_TS,
+            days=1,
+        )
+        assert result["summary"]["effective_threads"] == 1
+        assert result["summary"]["throughput_capacity"] == 5400
+        assert "throughput_capacity" in warning_codes(result)
+
+    def test_zero_wait_has_no_throughput_limit(self):
+        result = forecast_days(
+            make_history(),
+            make_config(
+                baseline_views=6000.0,
+                boost_mode="growth",
+                growth_factor=1.5,
+                threads=1,
+                wait_min=0.0,
+                wait_max=0.0,
+            ),
+            START_TS,
+            days=1,
+        )
+        assert result["summary"]["throughput_capacity"] is None
+        assert "throughput_capacity" not in warning_codes(result)
 
     def test_empty_history_does_not_raise(self):
         result = forecast_days(make_history(), make_config(), START_TS, days=0)[
@@ -491,3 +570,29 @@ class TestForecastCli:
         assert len({cli._display_width(line) for line in table_lines}) == 1
         assert "单日容量" in out
         assert "容量不足" in out
+
+    def test_cli_table_marks_throughput_shortage(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=4000",
+                "--set",
+                "wait_max=60",
+                "--days",
+                "1",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "单日吞吐上限" in out
+        assert "吞吐不足" in out

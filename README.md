@@ -572,6 +572,12 @@ python curator_views/cli.py daemon --config config.yaml
 | `max_retries` | `3` | 连续失败达到该次数后中止本轮 |
 | `executor_cmd` | （空） | 执行器子进程命令模板；留空则同进程直调 |
 
+单日实际吞吐还受 `threads` 与 `wait_min` / `wait_max` 限制：乐观上限为
+`实际并发（min(threads, 2, boost_n, batch_size)）× 86400 /
+max(wait_min, wait_max)`（未计请求耗时）。`forecast` 在缺口超过该上限时给出
+`throughput_capacity` 警告；`run` 也会记录警告并在简报中提示。`threads` 超过 2
+按 2 计算；并发还受推荐数 `boost_n` 与批次大小 `batch_size` 限制。
+
 `boost_distribution: exact` 示例：目标 500、最近 30 条推荐 →
 前 20 条各 17 次、后 10 条各 16 次，全部配额刷满即恰好 500 次。
 
@@ -758,7 +764,7 @@ python curator_views/cli.py forecast --config config.yaml \
 ```
 
 只读推算**今天（默认）或明天起** N 天的目标浏览量、假设自然流量与刷量缺口，
-用于判断配置是否会空转（缺口恒为 0）或超载（缺口超过单日容量）。
+用于判断配置是否会空转（缺口恒为 0）或超载（缺口超过单日容量/吞吐上限）。
 
 - `--days N`：预测天数，默认 7，必须 ≥ 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，仅在内存使用，绝不写库；要求
@@ -816,7 +822,9 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 ```
 
 表格里的「备注」列会在缺口超过单日容量时显示 `容量不足`（容量为 0 时显示
-`无容量`）；单日容量 = `boost_n × single_cap`，会在表格上方单独列出。
+`无容量`），在受线程/等待间隔限制时显示 `吞吐不足`；单日容量 =
+`boost_n × single_cap`，单日吞吐上限 = `min(threads, 2, boost_n, batch_size) ×
+86400 / max(wait_min, wait_max)`（未计请求耗时），都会在表格上方单独列出。
 
 常见 warning：
 
@@ -826,6 +834,7 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
 | `need_all_zero` | 整个预测区间缺口都为 0，系统不会刷量 |
 | `multiplier_zero` | 目标倍率在某个日期归零（通常 `growth_rate` 过负） |
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
+| `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
 
 ### 8.6 boost
@@ -1348,7 +1357,7 @@ boost_list_file: "boost_plan.txt"
 python -m pytest tests/ -v
 ```
 
-当前测试共 **197** 个，覆盖：
+当前测试共 **204** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1357,7 +1366,7 @@ python -m pytest tests/ -v
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
-  表格对齐与容量备注；
+  表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；
 - daemon 的 plan_next、同日去重、状态与 info 输出。
 
 测试目录：

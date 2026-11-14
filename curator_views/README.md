@@ -196,8 +196,11 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
 - `--json`：输出 rows / warnings / summary / source 完整结构。
 
-表格的「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`）；
-单日容量 = `boost_n × single_cap`，会单独列在表格上方。
+表格的「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`），
+在受线程/等待间隔限制时标 `吞吐不足`；单日容量 = `boost_n × single_cap`，
+单日吞吐上限 = `min(threads, 2, boost_n, batch_size) × 86400 /
+max(wait_min, wait_max)`（未计请求耗时），都会单独列在表格上方。缺口超过吞吐上限时
+给出 `throughput_capacity` 警告。
 
 forecast 只以只读 URI 打开数据库，只执行 `SELECT`，不会写 `last_run_date`、不会写
 growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只
@@ -325,6 +328,11 @@ python curator_views/cli.py version
 | `wait_min` | `8.0` | 两次请求之间的最小等待秒数 |
 | `wait_max` | `16.0` | 两次请求之间的最大等待秒数 |
 | `max_retries` | `3` | 连续请求失败达到该次数后中止任务 |
+
+`threads` 实际并发上限为 2，且受 `boost_n` / `batch_size` 限制；单日吞吐上限 ≈
+`min(threads, 2, boost_n, batch_size) × 86400 / max(wait_min, wait_max)`
+（未计请求耗时）。`forecast` 会用 `throughput_capacity` 警告提示“一天跑不满”的
+配置，`run` 也会记录警告并在简报中提示。
 
 ### 预测参数里的“斜率”是什么
 
