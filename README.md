@@ -39,8 +39,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
   数据。系统能识别异常溢出，主动少刷或暂停，并让曲线自然回落。
 - **刷量可控、可审计**：只刷最近发布的少量推荐，单条有上限、请求有间隔、每批都有
   台账记录，不再盲目全量刷。
-- **配置可预测**：正式执行前可用 `forecast` 只读推算未来 N 天的目标与缺口，判断
-  配置会不会空转或超载。
+- **配置可预测**：正式执行前可用 `forecast` 只读推算今天/明天起 N 天的目标与缺口，
+  判断配置会不会空转或超载。
 
 ### 1.2 它不做什么
 
@@ -350,7 +350,7 @@ CuratorViewsGuard/
         ├── login.py         # Playwright 半自动登录，导出/校验 Cookie
         ├── predictor.py     # 中位数 + 封顶趋势预测
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣 + 斜率检测
-        ├── forecast.py      # 未来 N 天只读估算（纯函数，无 I/O）
+        ├── forecast.py      # 今天/明天起 N 天只读估算（纯函数，无 I/O）
         ├── booster.py       # 受控刷量执行器
         ├── scheduler.py     # 每日闭环编排 + 子进程执行器
         ├── daemon.py        # 常驻调度循环
@@ -430,6 +430,9 @@ python curator_views/cli.py run --config config.yaml
 # 9. 常驻守护进程（推荐长期运行）
 python curator_views/cli.py daemon --config config.yaml
 ```
+
+> **修改代码后需要重启 daemon**；只改配置不用重启（每轮热加载）。重启方法见
+> [10.1.1](#1011-重启与停止)。
 
 > **首次运行注意**：程序启动日之前的 Steam 历史（约 364 天）**不参与预测**。
 > 这些数据里可能混着以往不规则刷量和他人恶意刷量，不可靠。系统从启动日起积累
@@ -670,7 +673,7 @@ x = 日期序号（最近 N 天，N = window_days × 2，默认 28 天）
 | `daemon` | 常驻运行，每天到点执行每日流程（配置热重载） |
 | `info` | 查看守护进程状态与本地数据概况（离线只读） |
 | `check` | 只读检查：抓取统计并打印最近 7 天与预测摘要 |
-| `forecast` | 只读推算未来 N 天的目标 / 假设自然流量 / 缺口 |
+| `forecast` | 只读推算今天/明天起 N 天的目标 / 假设自然流量 / 缺口 |
 | `boost` | 手动执行一轮受控提升 |
 | `login` | 半自动登录 Steam，生成/校验 Cookie |
 | `export` | 从本地数据库导出每日统计（JSON / CSV） |
@@ -707,7 +710,7 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 行为要点：
 
 - 启动时若今天尚未执行且已过 `daily_time`，立即补跑一次；
-- 每轮循环重新加载配置，修改配置或执行时间无需重启；
+- 每轮循环重新加载配置，修改配置或执行时间无需重启；**修改 Python 代码后必须重启进程**；
 - 单次执行失败不退出进程，记录日志后等待下一天；
 - 同一天不重复执行：`last_run_date` 同时写入数据库与 `daemon_state.json`
   （`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
@@ -721,6 +724,7 @@ nohup python curator_views/cli.py daemon --config config.yaml >/dev/null 2>&1 &
 ```
 
 建议配合 systemd `Restart=always` 或 Windows 服务包装器保持常驻。
+重启、停止与状态查看见 [10.1.1](#1011-重启与停止)。
 
 ### 8.3 info
 
@@ -810,6 +814,9 @@ forecast 输出的是托底目标 `base × multiplier`；`run` 的检测参照�
       2026-11-14 需要 1,645 次
       2026-11-15 需要 1,508 次
 ```
+
+表格里的「备注」列会在缺口超过单日容量时显示 `容量不足`（容量为 0 时显示
+`无容量`）；单日容量 = `boost_n × single_cap`，会在表格上方单独列出。
 
 常见 warning：
 
@@ -1030,6 +1037,70 @@ Windows 可用 NSSM：
 nssm install curator-views "C:\Path\To\python.exe" "C:\Path\To\curator_views\cli.py daemon --config C:\Path\To\config.yaml"
 ```
 
+#### 10.1.1 重启与停止
+
+先确认 daemon 是怎么启动的：
+
+```bash
+python curator_views/cli.py info --config config.yaml
+ps -ef | grep "[c]urator_views/cli.py daemon"
+systemctl list-unit-files | grep -i curator
+```
+
+**systemd**（服务名以实际 unit 为准，下面假设为 `curator-views.service`）：
+
+```bash
+sudo systemctl restart curator-views.service
+sudo systemctl status curator-views.service --no-pager
+journalctl -u curator-views.service -n 50 -f
+```
+
+只有修改过 `.service` 文件才需要先 `sudo systemctl daemon-reload`；改代码直接
+`restart` 即可。若提示 `Unit ... could not be found`，说明还没安装该 unit，daemon
+可能是用 `nohup` 或前台方式启动的：按上面的 systemd 示例创建 unit（venv 用户把
+`ExecStart` 改成 `which python` 得到的解释器路径），然后：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now curator-views.service
+```
+
+**nohup / 后台运行**：
+
+```bash
+# 取 PID（info 的 --json 输出里 daemon.pid）
+python curator_views/cli.py info --config config.yaml --json \
+  | python -c "import json,sys; print(json.load(sys.stdin)['daemon']['pid'])"
+
+kill <PID>        # SIGTERM：优雅退出，等在途提升收尾
+# kill -INT <PID> # 立即中断，等同 Ctrl+C
+
+# 等进程完全退出后再启动
+while kill -0 <PID> 2>/dev/null; do sleep 1; done
+nohup python curator_views/cli.py daemon --config config.yaml >/dev/null 2>&1 &
+```
+
+**前台 / tmux / screen**：`Ctrl+C` 停止，然后重新执行上面的 `daemon` 命令。
+
+重启后验证：
+
+```bash
+python curator_views/cli.py info --config config.yaml
+```
+
+确认 PID 已变化、`phase` 为 `running`、`next_wake` 正常；日志见数据库同级的
+`curator_views.log`（systemd 用 `journalctl`）。
+
+注意事项：
+
+- **改配置不用重启**：daemon 每轮热加载配置（含 `daily_time`）；
+- **改代码必须重启**：进程里仍是旧模块，重启后才加载新代码；
+- **重启不会重复刷**：`last_run_date` 做同日去重。今天已跑过 → 重启后等明天；
+  今天没跑且已过 `daily_time` → 启动时立即补跑一次；
+- **信号语义**：SIGTERM 优雅退出（等在途任务收尾），SIGINT 立即中断；
+- **systemd `Restart=always`**：不要用 `kill` 测试停止，会被自动拉起；请用
+  `systemctl restart/stop`。
+
 ### 10.2 systemd timer（每天一次 run）
 
 ```ini
@@ -1181,7 +1252,8 @@ python curator_views/cli.py info --config config.yaml
 ```
 
 若 PID 不存在，查看 `curator_views.log` 与 `daemon_state.json` 的 `last_error`。
-确认 `daily_time` 是否正确、今天是否已经执行过（同日去重）。
+确认 `daily_time` 是否正确、今天是否已经执行过（同日去重）。需要重启或停止时见
+[10.1.1](#1011-重启与停止)。
 
 ### 12.7 PID 复用的误判
 
@@ -1230,16 +1302,24 @@ boost_list_file: "boost_plan.txt"
 列表模式会覆盖预测缺口；列表用完即停。若只是临时排期，用完记得清空该配置，
 否则系统不会再自动按预测刷量。
 
-### 13.3 新增 forecast 命令
+### 13.3 forecast 默认包含今天并改用自然缺口口径
 
-`forecast` 是只读命令，不写数据库、不写状态、默认不触网，可放心在升级后先用它
-验证配置：
+`forecast` 现在默认从**今天 00:00** 起算（今天的数据次日才完整，所以预测今天
+仍然是预测），并把“今天之前最近一个完整日”的 `实际 − boost_log 刷量` 作为自然
+流量基准，未来日假设自然不变。因此表格会显示每天真实需要补的缺口，而不是把
+历史高位当成自然流量后显示 0。
 
-```bash
-python curator_views/cli.py forecast --config config.yaml --days 7
-```
+- 想从明天起算：`--tomorrow`；
+- 想恢复旧的“实际趋势外推 / 收敛到目标”模型：`--natural trend` / `--natural target`；
+- 本地库不是最新时会提示 `stale_history`，可加 `--fetch` 在线补齐（仅内存）。
 
-### 13.4 配置兼容性
+### 13.4 --dry-run 不再产生副作用
+
+`run --dry-run` 现在只计算，不写 `daily_stats` / `boost_log`，不写
+`program_start` / `last_stats_date` / `last_run_date` / growth 锚点，也不发送
+每日简报。这样可以放心用它预览当天缺口，不会让 daemon 误以为当天已经执行过。
+
+### 13.5 配置兼容性
 
 - 所有旧配置键仍然有效；
 - 新增键都有默认值，不配置不会报错；
@@ -1268,7 +1348,7 @@ python curator_views/cli.py forecast --config config.yaml --days 7
 python -m pytest tests/ -v
 ```
 
-当前测试共 **183** 个，覆盖：
+当前测试共 **197** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1276,7 +1356,8 @@ python -m pytest tests/ -v
 - 调度器子进程执行器、时区工具；
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；
-- `forecast` 的逐日估算、警告、只读数据库行为；
+- `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
+  表格对齐与容量备注；
 - daemon 的 plan_next、同日去重、状态与 info 输出。
 
 测试目录：

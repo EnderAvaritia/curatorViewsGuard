@@ -96,8 +96,15 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
   文件日志仍写入数据库同级的 `curator_views.log`；
 - Ctrl+C 会**立即中断**当前执行并退出（状态文件写入 `stopped`）；SIGTERM
   （POSIX / systemd stop）则等进行中的任务收尾后优雅退出。建议配合 systemd
-  `Restart=always` 或 NSSM 保持常驻；需要释放终端请用 `nohup` / `setsid` /
-  systemd 后台运行，静默本身并不会释放控制台。
+`Restart=always` 或 NSSM 保持常驻；需要释放终端请用 `nohup` / `setsid` /
+systemd 后台运行，静默本身并不会释放控制台。
+
+**重启**：改配置无需重启；改代码需要重启。systemd 用
+`sudo systemctl restart curator-views.service`；nohup/前台先用
+`python curator_views/cli.py info --config config.yaml` 查 PID，`kill <PID>`
+（SIGTERM 优雅退出）后重新 `nohup ... &`。若提示 unit 不存在，说明还没安装
+systemd 服务；完整步骤见主 README 的
+[10.1.1](../README.md#1011-重启与停止)。
 
 ### info
 
@@ -170,8 +177,8 @@ python curator_views/cli.py check --config config.yaml
 
 ### forecast
 
-只读推算未来 N 天的目标浏览量、假设自然流量与刷量缺口，用于正式运行前判断配置是否
-会空转或超载。**不写数据库、不建库、不触网（除非 `--fetch`）**。
+只读推算今天/明天起 N 天的目标浏览量、假设自然流量与刷量缺口，用于正式运行前判断
+配置是否会空转或超载。**不写数据库、不建库、不触网（除非 `--fetch`）**。
 
 ```bash
 python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
@@ -188,6 +195,9 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
   `target` 最终收敛到目标；
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
 - `--json`：输出 rows / warnings / summary / source 完整结构。
+
+表格的「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`）；
+单日容量 = `boost_n × single_cap`，会单独列在表格上方。
 
 forecast 只以只读 URI 打开数据库，只执行 `SELECT`，不会写 `last_run_date`、不会写
 growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只
