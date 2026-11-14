@@ -64,7 +64,7 @@ def _date_to_epoch(date_str: str) -> int:
 
 
 def _resolve_growth_start(
-    storage: Storage, growth_rate: float, today_iso: str
+    storage: Storage, growth_rate: float, today_iso: str, persist: bool = True
 ) -> str:
     """返回当前速率生效的起始日；速率变化时把起点重置为今天。
 
@@ -72,6 +72,8 @@ def _resolve_growth_start(
     同一速率跨进程重启仍沿用原起点，保证"每天降 1%"按日历连续推进；
     一旦速率被改动（含从非 0 改为 0），起点重置为今天，避免历史累计
     天数突然生效造成目标跳变。
+
+    ``persist=False`` 用于 dry_run：只按“今天”起算，不写回锚点。
     """
     stored_rate = storage.load_state("growth_rate", default="")
     stored_start = storage.load_state("growth_start", default="")
@@ -81,13 +83,15 @@ def _resolve_growth_start(
     except (TypeError, ValueError):
         same_rate = False
     if not same_rate or not stored_start:
-        storage.save_state("growth_rate", f"{growth_rate:.12g}")
-        storage.save_state("growth_start", today_iso)
+        if persist:
+            storage.save_state("growth_rate", f"{growth_rate:.12g}")
+            storage.save_state("growth_start", today_iso)
         return today_iso
     try:
         _date_to_epoch(stored_start)
     except (ValueError, IndexError):
-        storage.save_state("growth_start", today_iso)
+        if persist:
+            storage.save_state("growth_start", today_iso)
         return today_iso
     return stored_start
 
@@ -279,6 +283,12 @@ boost_mode / growth_factor / growth_rate：
         「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕目标自然波动，
         避免收敛成一条直线。
 
+    dry_run：
+        为 True 时只计算、不产生任何持久化副作用：不写 daily_stats、
+        program_start / last_stats_date / last_run_date / growth 锚点，
+        也不发送每日简报；缺口与汇总仍照常计算，便于预览今天会刷多少。
+        不写 last_run_date 可避免手动 dry-run 让 daemon 误以为当天已执行。
+
     cooldown_days：
         恢复期天数。最近存在被标记为恶意刷量的日期时，恢复期内强制不刷量，
         让曲线在无注入的情况下自然回落到真实水平。
@@ -340,26 +350,29 @@ boost_mode / growth_factor / growth_rate：
     today_iso = _today_iso()
     today_ts = _today_epoch()
 
-    # 1. 抓取统计数据并入库
+    # 1. 抓取统计数据并入库（dry_run 只计算，不落库）
     stats = fetcher.fetch_stats()
-    for stat in stats:
-        storage.upsert_daily_stats(stat["date_ts"], stat["num_views"])
+    if not dry_run:
+        for stat in stats:
+            storage.upsert_daily_stats(stat["date_ts"], stat["num_views"])
     last_date_iso = ""
     if stats:
         last_ts = stats[-1]["date_ts"]
         last_date_iso = datetime.fromtimestamp(last_ts, tz=_TZ).strftime(
             "%Y-%m-%d"
         )
-    storage.save_state(
-        "last_stats_date",
-        json.dumps({"last_date": last_date_iso, "days": len(stats)}),
-    )
+    if not dry_run:
+        storage.save_state(
+            "last_stats_date",
+            json.dumps({"last_date": last_date_iso, "days": len(stats)}),
+        )
 
     # 2. 程序启动日：首次运行记录今天，之后只使用启动日之后的历史
     program_start = storage.load_state("program_start", default="")
     if not program_start:
         program_start = today_iso
-        storage.save_state("program_start", program_start)
+        if not dry_run:
+            storage.save_state("program_start", program_start)
     program_start_epoch = _date_to_epoch(program_start)
     history_sorted = sorted(
         (d for d in stats if d["date_ts"] >= program_start_epoch),
@@ -383,7 +396,9 @@ boost_mode / growth_factor / growth_rate：
     drift_start_ts = 0
     if boost_mode == "growth" and growth_rate != 0:
         drift_start_ts = _date_to_epoch(
-            _resolve_growth_start(storage, growth_rate, today_iso)
+            _resolve_growth_start(
+                storage, growth_rate, today_iso, persist=not dry_run
+            )
         )
     confirmed_flagged: set[int] = set()
     history_clean = history_sorted
@@ -557,6 +572,7 @@ boost_mode / growth_factor / growth_rate：
     # 7. 汇总字典
     summary: Dict[str, Any] = {
         "date": today_iso,
+        "dry_run": dry_run,
         "today_expected": today_expected,
         "yesterday_actual": yesterday_actual,
         "yesterday_boosted": yesterday_boosted,
@@ -641,10 +657,19 @@ boost_mode / growth_factor / growth_rate：
         or summary["boost_list_status"] in ("missing", "error", "consume_error")
     )
     level = "warning" if warning else "info"
-    notifier.send("每日简报", _format_summary(summary, dry_run), level=level)
+    if dry_run:
+        logger.info("dry_run 模式：跳过每日简报发送。")
+    else:
+        notifier.send(
+            "每日简报", _format_summary(summary, dry_run), level=level
+        )
 
     # 10. 记录当日已执行：daemon 重启后据此避免重复执行同一天；
     #     手动 run 与 daemon 共用同一状态键，谁先跑都算今天已完成。
-    storage.save_state("last_run_date", today_iso)
+    #     dry_run 不写，避免“预览一下”把当天正式执行顶掉。
+    if dry_run:
+        logger.info("dry_run 模式：不写 last_run_date（不影响当天正式执行）。")
+    else:
+        storage.save_state("last_run_date", today_iso)
 
     return summary

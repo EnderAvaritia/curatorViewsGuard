@@ -522,6 +522,64 @@ class TestLastRunDateRecord:
         assert storage.saved["last_run_date"] == summary["date"]
 
 
+class TestDryRunNoSideEffects:
+    """dry_run 只预览：不写统计、不写状态、不发简报，但照常算缺口。"""
+
+    def test_dry_run_skips_all_writes_and_notification(self):
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        notifier = FakeNotifier()
+        booster = FakeBooster()
+        summary = run_daily(
+            storage,
+            FakeFetcher(stats),
+            notifier,
+            booster,
+            {
+                "boost_enabled": True,
+                "dry_run": True,
+                "baseline_views": 200,
+            },
+        )
+        assert summary["dry_run"] is True
+        assert summary["need"] == 100
+        assert storage.written_stats == []
+        assert storage.saved == {}
+        assert notifier.sent == []
+        assert booster.last_target == 100
+        assert booster.calls[-1][2] is True
+
+    def test_dry_run_does_not_create_program_start(self):
+        storage = FakeStorage("")
+        run_daily(
+            storage,
+            FakeFetcher([{"date_ts": _today_epoch(), "num_views": 100}]),
+            FakeNotifier(),
+            FakeBooster(),
+            {"dry_run": True, "baseline_views": 200},
+        )
+        assert "program_start" not in storage.saved
+        assert "last_run_date" not in storage.saved
+
+    def test_dry_run_does_not_persist_growth_anchor(self):
+        storage = FakeStorage(program_start_str())
+        run_daily(
+            storage,
+            FakeFetcher(make_stats([100] * 30)),
+            FakeNotifier(),
+            FakeBooster(),
+            {
+                "dry_run": True,
+                "baseline_views": 200,
+                "boost_mode": "growth",
+                "growth_factor": 1.0,
+                "growth_rate": -0.01,
+            },
+        )
+        assert "growth_rate" not in storage.saved
+        assert "growth_start" not in storage.saved
+
+
 class ZeroBooster(FakeBooster):
     """模拟提升完全失败（返回 0，模拟网络/Cookie 问题）。"""
 
