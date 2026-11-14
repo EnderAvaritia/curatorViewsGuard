@@ -448,7 +448,7 @@ python curator_views/cli.py daemon --config config.yaml
 ```
 
 > **修改代码后需要重启 daemon**；只改配置不用重启（每轮热加载）。重启方法见
-> [10.1.1](#1011-重启与停止)。
+> [10.1 daemon 的「重启与停止」](#101-daemon推荐)。
 
 > **首次运行注意**：程序启动日之前的 Steam 历史（约 364 天）**不参与预测**。
 > 这些数据里可能混着以往不规则刷量和他人恶意刷量，不可靠。系统从启动日起积累
@@ -758,7 +758,7 @@ nohup python curator_views/cli.py daemon --config config.yaml >/dev/null 2>&1 &
 ```
 
 建议配合 systemd `Restart=always` 或 Windows 服务包装器保持常驻。
-重启、停止与状态查看见 [10.1.1](#1011-重启与停止)。
+重启、停止与状态查看见 [10.1 daemon 的「重启与停止」](#101-daemon推荐)。
 
 ### 8.3 info
 
@@ -1105,7 +1105,7 @@ Windows 可用 NSSM：
 nssm install curator-views "C:\Path\To\python.exe" "C:\Path\To\curator_views\cli.py daemon --config C:\Path\To\config.yaml"
 ```
 
-#### 10.1.1 重启与停止
+**重启与停止**
 
 先确认 daemon 是怎么启动的：
 
@@ -1321,7 +1321,7 @@ python curator_views/cli.py info --config config.yaml
 
 若 PID 不存在，查看 `curator_views.log` 与 `daemon_state.json` 的 `last_error`。
 确认 `daily_time` 是否正确、今天是否已经执行过（同日去重）。需要重启或停止时见
-[10.1.1](#1011-重启与停止)。
+[10.1 daemon 的「重启与停止」](#101-daemon推荐)。
 
 ### 12.7 PID 复用的误判
 

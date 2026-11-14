@@ -109,7 +109,7 @@ systemd 后台运行，静默本身并不会释放控制台。
 `python curator_views/cli.py info --config config.yaml` 查 PID，`kill <PID>`
 （SIGTERM 优雅退出）后重新 `nohup ... &`。若提示 unit 不存在，说明还没安装
 systemd 服务；完整步骤见主 README 的
-[10.1.1](../README.md#1011-重启与停止)。
+[10.1 daemon 的「重启与停止」](../README.md#101-daemon推荐)。
 
 ### info
 
