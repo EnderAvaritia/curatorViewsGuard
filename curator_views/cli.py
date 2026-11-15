@@ -268,11 +268,27 @@ growth_rate: 0.0
 target_min: 0
 target_max: 0
 
-# 刷量波动率（0~0.3，建议 ≤ 0.15）：每天实际提升量在
-# 「缺口 × (1 ± 波动率)」内随机，使浏览曲线在目标附近自然上下波动，
-# 避免收敛成一条笔直的线而显得不自然。过大易触发反作弊误判。
+# 缺口波动率：每天刷量配额在「缺口 × (1 ± 波动率)」内随机，使浏览曲线
+# 在目标附近自然上下波动，避免收敛成一条笔直的线而显得不自然。0 = 关闭。
+# 不设硬性上限；但抖动幅度会同步放大反作弊检测参照，配得过大时检出能力会
+# 相应下降。抖动值按日期持久化：同一天多个时段复用同一配额。
 # 白话：每天刷的量随机上下浮动 10%，让曲线更像真人、不像机器画的直线。
 volatility: 0.10
+
+# 缺口波动的最小幅度：抽取幅度在 [volatility_min, volatility] 内均匀取值、
+# 方向随机，防止抽到接近 0 的抖动导致曲线过于平缓。0 = 不设下限。
+volatility_min: 0.0
+
+# 目标波动率：今日目标在「目标 × (1 ± target_volatility)」内随机，再按
+# target_min / target_max 夹取后参与缺口计算。与缺口波动率不同，它按目标的
+# 比例抖动，即使缺口很小也能让总浏览量产生明显起伏。0 = 关闭。
+# 不设硬性上限；同样会放大反作弊检测参照。同一天重跑/多时段复用同一个目标。
+# 白话：想让每天的目标浏览量大起大落（如 10000 上下浮动 50%）就填 0.50。
+target_volatility: 0.0
+
+# 目标波动的最小幅度：抽取幅度在 [target_volatility_min, target_volatility]
+# 内均匀取值、方向随机；0 = 不设下限。
+target_volatility_min: 0.0
 
 # ── 每日刷量列表（可选）──────────────────────────────────────────────────
 
@@ -535,6 +551,9 @@ def _scheduler_config(
         "target_min": float(cfg["target_min"] or 0),
         "target_max": float(cfg["target_max"] or 0),
         "volatility": float(cfg["volatility"] or 0),
+        "volatility_min": float(cfg["volatility_min"] or 0),
+        "target_volatility": float(cfg["target_volatility"] or 0),
+        "target_volatility_min": float(cfg["target_volatility_min"] or 0),
         "boost_n": int(cfg["boost_n"]),
         "single_cap": int(cfg["single_cap"]),
         "batch_size": int(cfg["batch_size"]),
@@ -1336,8 +1355,17 @@ def _print_forecast_report(
     print(
         f"      基线={baseline_text} "
         f"自然模型={source.get('natural_mode', 'natural')} "
-        f"波动率={float(config.get('volatility', 0)):.2f}"
+        f"缺口波动率={float(config.get('volatility', 0)):.2f}"
+        f"（最小 {float(config.get('volatility_min', 0) or 0):.2f}） "
+        f"目标波动率={float(config.get('target_volatility', 0) or 0):.2f}"
+        f"（最小 {float(config.get('target_volatility_min', 0) or 0):.2f}）"
     )
+    if float(config.get("target_volatility", 0) or 0) > 0:
+        print(
+            "目标抖动: run 会在表中「目标」的 ±"
+            f"{float(config.get('target_volatility', 0)):.0%} 内随机，"
+            "再按上下界夹取；同一天重跑/多时段复用同一值"
+        )
     boost_n = max(0, int(config.get("boost_n", 5)))
     single_cap = max(0, int(config.get("single_cap", 300)))
     batch_size = int(config.get("batch_size", 50))
@@ -1435,8 +1463,8 @@ def _print_forecast_report(
     if natural_basis == "natural":
         print(
             "说明: 自然口径复用 run 的缺口公式（缺口 = 目标 - 假设自然 - 今日已刷，"
-            "仅首日扣已刷）；不含反作弊溢出扣减、恢复期、"
-            "波动率与刷量列表。"
+            "仅首日扣已刷）；不含反作弊溢出扣减、恢复期与刷量列表；"
+            "目标/缺口波动率不参与估算（见提示）。"
         )
     if result["warnings"]:
         print("提示:")

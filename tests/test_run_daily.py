@@ -13,6 +13,8 @@ import pytest
 from curator_views.core.scheduler import (
     _TZ,
     _date_to_epoch,
+    _jitter_bounds,
+    _sample_signed_jitter,
     _today_epoch,
     run_daily,
 )
@@ -118,9 +120,14 @@ def run_with(
     booster: FakeBooster,
     boost_totals: dict | None = None,
     saved_state: dict | None = None,
+    storage: FakeStorage | None = None,
     **config_overrides,
 ) -> dict:
-    """以指定配置运行一次 run_daily，返回汇总字典。"""
+    """以指定配置运行一次 run_daily，返回汇总字典。
+
+    ``storage`` 可传入复用同一个 FakeStorage，用于验证同日抖动复用等
+    跨多次 run 的行为。
+    """
     config = {
         "window_days": 14,
         "trend_cap": 0.15,
@@ -141,9 +148,10 @@ def run_with(
         "dry_run": False,
     }
     config.update(config_overrides)
-    storage = FakeStorage(program_start, boost_totals)
-    if saved_state:
-        storage.saved.update(saved_state)
+    if storage is None:
+        storage = FakeStorage(program_start, boost_totals)
+        if saved_state:
+            storage.saved.update(saved_state)
     fetcher = FakeFetcher(stats)
     notifier = FakeNotifier()
     summary = run_daily(storage, fetcher, notifier, booster, config)
@@ -277,9 +285,10 @@ class TestVolatility:
     def test_volatility_jitters_need(self):
         stats = make_stats([100] * 30)
         booster = FakeBooster()
-        # uniform 固定返回 +0.1 → need = 100 × 1.1 = 110
+        # 固定返回 +0.1 → 当日配额 = 100 × 1.1 = 110
         with patch(
-            "curator_views.core.scheduler.random.uniform", return_value=0.1
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.1,
         ):
             summary = run_with(
                 stats,
@@ -308,7 +317,8 @@ class TestVolatility:
         stats = make_stats([100] * 30)
         booster = FakeBooster()
         with patch(
-            "curator_views.core.scheduler.random.uniform", return_value=-0.5
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=-0.5,
         ):
             summary = run_with(
                 stats,
@@ -318,6 +328,215 @@ class TestVolatility:
                 volatility=0.30,
             )
         assert summary["need"] == 50  # round(100 × 0.5)
+
+
+class TestJitterSampling:
+    def test_bounds_normalization_and_min_floor(self):
+        assert _jitter_bounds(0.5, 0.2) == (0.2, 0.5)
+        # 下限大于上限时夹到上限（固定幅度），而不是关闭抖动
+        assert _jitter_bounds(0.1, 0.5) == (0.1, 0.1)
+        # 上限为 0 表示关闭
+        assert _jitter_bounds(0.0, 0.5) == (0.0, 0.0)
+
+    def test_sample_respects_min_magnitude(self):
+        # 幅度固定取区间下限 0.2，方向由 random.random 决定（>=0.5 → 负）
+        with patch(
+            "curator_views.core.scheduler.random.uniform", return_value=0.2
+        ) as uniform_mock, patch(
+            "curator_views.core.scheduler.random.random", return_value=0.9
+        ):
+            jitter = _sample_signed_jitter(0.5, 0.2)
+        assert jitter == -0.2
+        uniform_mock.assert_called_once_with(0.2, 0.5)
+
+
+class TestTargetVolatility:
+    def test_target_volatility_shifts_target(self):
+        stats = make_stats([100] * 30)
+        booster = FakeBooster()
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                booster,
+                baseline_views=10000,
+                target_volatility=0.50,
+            )
+        assert summary["target_jitter"] == 0.50
+        assert summary["today_expected_raw"] == 10000
+        assert summary["today_expected"] == 15000
+        assert summary["need"] == 14900
+        assert booster.last_target == 14900
+
+    def test_target_bounds_apply_after_jitter(self):
+        stats = make_stats([100] * 30)
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                baseline_views=10000,
+                target_volatility=0.50,
+                target_max=12000,
+            )
+        assert summary["today_expected"] == 12000
+        assert summary["target_bound"] == "max"
+        assert summary["need"] == 11900
+
+    def test_huge_negative_jitter_keeps_target_non_negative(self):
+        stats = make_stats([100] * 30)
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=-3.0,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                baseline_views=10000,
+                target_volatility=3.0,
+            )
+        assert summary["today_expected"] == 0
+        assert summary["need"] == 0
+
+    def test_same_day_reuses_target_jitter(self):
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            first = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=10000,
+                target_volatility=0.50,
+            )
+        # 同日第二次 run 必须复用已持久化的抖动值，不能再抽随机数
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            side_effect=AssertionError("同日不应重新抽取抖动"),
+        ):
+            second = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=10000,
+                target_volatility=0.50,
+            )
+        assert second["target_jitter"] == first["target_jitter"] == 0.50
+        assert second["today_expected"] == 15000
+
+    def test_config_change_redraws_same_day_jitter(self):
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=10000,
+                target_volatility=0.50,
+            )
+        # 基准改了 → 配置签名变化 → 允许当天重新抽取
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=-0.50,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=12000,
+                target_volatility=0.50,
+            )
+        assert summary["target_jitter"] == -0.50
+        assert summary["today_expected"] == 6000
+
+    def test_dry_run_does_not_persist_jitter(self):
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=10000,
+                target_volatility=0.50,
+                dry_run=True,
+            )
+        assert summary["today_expected"] == 15000
+        assert "daily_jitter" not in storage.saved
+
+    def test_gap_quota_survives_later_runs(self):
+        stats = make_stats([100] * 30)
+        storage = FakeStorage(program_start_str())
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=-0.50,
+        ):
+            first = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=200,
+                volatility=0.50,
+            )
+        assert first["boost_quota"] == 50
+        assert first["need"] == 50
+
+        # 模拟首轮已刷 50：后续 run 只补「配额 − 已刷」，不再把负向抖动补平
+        storage.boost_totals[today_str()] = 50
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            side_effect=AssertionError("同日不应重新抽取抖动"),
+        ):
+            second = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=200,
+                volatility=0.50,
+            )
+        assert second["boost_quota"] == 50
+        assert second["need"] == 0
+
+    def test_jittered_high_days_not_flagged_as_overflow(self):
+        # 自己 +50% 抖动产生的 16000（基线 10000）不应被判成恶意刷量
+        stats = make_stats([10000] * 28 + [16000, 16000])
+        with patch(
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.0,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                baseline_views=10000,
+                target_volatility=0.50,
+                consecutive_days=2,
+            )
+        assert summary["overflow_flag_count"] == 0
 
 
 class TestCooldown:
@@ -932,7 +1151,8 @@ class TestTargetBounds:
         stats = make_stats([100] * 30)
         booster = FakeBooster()
         with patch(
-            "curator_views.core.scheduler.random.uniform", return_value=0.30
+            "curator_views.core.scheduler._sample_signed_jitter",
+            return_value=0.30,
         ):
             summary = run_with(
                 stats,

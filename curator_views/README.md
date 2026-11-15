@@ -21,7 +21,9 @@
   参照，托底刷量不会被误判；上限也是波动后的最终刷量硬上限，只限制补量、
   不会压低自然流量；刷量列表模式不受影响；
 - 受控提升：分批、限速、单 App 上限、按目标比例提前停止，尽量模拟自然流量；
-  配置 `volatility` 波动率后，每日提升量在缺口附近随机，曲线围绕基线自然波动；
+  两级波动率：`volatility` 让当日缺口配额随机（缺口大时用），`target_volatility`
+  让今日目标随机（固定基线/缺口小时用）；`volatility_min` /
+  `target_volatility_min` 给幅度设下限，抖动按天持久化、同日多时段复用；
 - 每日刷量列表：配置 `boost_list_file` 后按列表逐行刷量，一行一个数量，
   每天消费首行并在成功后删除该行（刷完一行删一行）；
 - 缺口按昨日自然流量计算：从 `boost_log` 台账扣除昨日自己刷的量，避免把昨天的
@@ -258,9 +260,12 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 需要注意：Steam 统计滞后一天，默认从今天 00:00 起算（`--tomorrow` 改为明天），
 自然口径取今天之前最近一个完整日；本地库不是最新时给出 `stale_history` 提示。
 未来自然流量只是外推，所以结果是**估算不是精确预测**。forecast 输出的是托底目标
-`base × 目标系数（multiplier）`；`run_daily` 的检测参照是 `base × max(1, multiplier)`，
-`growth_factor < 1` 时二者不同。异常标记未持久化，`in_cooldown` 恒为 false；
-自然口径也不含恢复期、波动率与刷量列表。
+`base × 目标系数（multiplier）`；`run_daily` 的检测参照是
+`base × max(1, multiplier) × (1 + target_volatility + volatility)`，
+`growth_factor < 1` 或配置波动率时二者不同。异常标记未持久化，`in_cooldown`
+恒为 false；自然口径也不含恢复期与刷量列表。波动率不参与估算：表格给未抖动
+基准，`target_low` / `target_high` 给出目标抖动区间，并输出
+`volatility_not_modeled` 提示。
 
 ### boost
 
@@ -381,7 +386,10 @@ python curator_views/cli.py version
 | `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
 | `target_min` | `0` | 今日目标下限（次）；> 0 时目标跌破下限按下限补量，`0` 不设界 |
 | `target_max` | `0` | 今日目标上限（次）；> 0 时目标超出上限按上限补量，`0` 不设界 |
-| `volatility` | `0.10` | 刷量波动率：每日提升量在「缺口 ×(1±波动率)」内随机；建议 ≤ 0.15 |
+| `volatility` | `0.10` | 缺口波动率：当日配额 = 缺口 × (1 ± 波动率)；`0` 关闭 |
+| `volatility_min` | `0` | 缺口抖动的最小幅度；`0` 不设下限 |
+| `target_volatility` | `0` | 目标波动率：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |
+| `target_volatility_min` | `0` | 目标抖动的最小幅度；`0` 不设下限 |
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |
 | `batch_size` | `50` | 每批处理的游戏数量 |

@@ -23,6 +23,7 @@ from .scheduler import (
     _clamp_target,
     _daily_throughput_capacity,
     _effective_threads,
+    _jitter_bounds,
     _normalize_target_bounds,
     _target_multiplier,
 )
@@ -70,12 +71,16 @@ def forecast_days(
           ``scheduler._target_multiplier``；stable 模式恒为 1.0；
         - ``target``：``base * multiplier`` 再按 ``target_min`` / ``target_max``
           夹取（0 表示该方向不设界），与 ``run_daily`` 的目标上下界一致；
+        - ``target_low`` / ``target_high``：目标抖动区间预览
+          （``target`` × (1 ± ``target_volatility``) 后再夹取）；本函数不抽随机数，
+          实际 ``run`` 会在区间内随机取一个值，并让同一天复用同一值；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
         - ``need = max(0, round(target - assumed_natural))``，未来日不做溢出扣减；
         - 首日再减去 ``first_day_boosted``（今天已刷的量），重跑时按剩余缺口续刷；
         - 把假设日按 ``num_views = assumed_natural + first_day_boosted + need``
           回填进 ``local_history``，使后续天的预测窗口包含前面已刷的量。
+        - ``volatility`` 不参与估算：``run`` 在缺口上按日随机，此处只给未抖动基准。
 
     异常标记未持久化，``in_cooldown`` 恒为 False，本函数不读取数据库，也不做恢复期推算。
 
@@ -97,6 +102,18 @@ def forecast_days(
     target_max = float(config.get("target_max", 0) or 0)
     target_floor, target_ceiling = _normalize_target_bounds(
         target_min, target_max
+    )
+    target_volatility = float(config.get("target_volatility", 0) or 0)
+    target_volatility_min = float(
+        config.get("target_volatility_min", 0) or 0
+    )
+    volatility = float(config.get("volatility", 0) or 0)
+    volatility_min = float(config.get("volatility_min", 0) or 0)
+    target_jitter_low, target_jitter_high = _jitter_bounds(
+        target_volatility, target_volatility_min
+    )
+    gap_jitter_low, gap_jitter_high = _jitter_bounds(
+        volatility, volatility_min
     )
     boost_n = int(config.get("boost_n", 5))
     single_cap = int(config.get("single_cap", 300))
@@ -141,6 +158,17 @@ def forecast_days(
         target, target_bound = _clamp_target(
             raw_target, target_floor, target_ceiling
         )
+        # 目标抖动区间（预览用）：run 实际会在该区间内随机，再按上下界夹取。
+        target_low, _ = _clamp_target(
+            max(0.0, raw_target * (1.0 - target_jitter_high)),
+            target_floor,
+            target_ceiling,
+        )
+        target_high, _ = _clamp_target(
+            max(0.0, raw_target * (1.0 + target_jitter_high)),
+            target_floor,
+            target_ceiling,
+        )
 
         if first_natural is not None:
             # 今日视角：自然流量不含刷量，刷完当天也不会抬高次日的自然基准
@@ -168,6 +196,8 @@ def forecast_days(
                 "multiplier": round(float(multiplier), 4),
                 "raw_target": round(float(raw_target), 1),
                 "target": round(float(target), 1),
+                "target_low": round(float(target_low), 1),
+                "target_high": round(float(target_high), 1),
                 "target_bound": target_bound,
                 "assumed_natural": assumed_natural,
                 "already_boosted": already_boosted,
@@ -193,11 +223,35 @@ def forecast_days(
         history, rows, growth_rate, boost_n, single_cap,
         threads, wait_min, wait_max, batch_size,
     )
+    if target_jitter_high > 0 or gap_jitter_high > 0:
+        parts: List[str] = []
+        if target_jitter_high > 0:
+            parts.append(
+                f"目标在 ±{target_jitter_high:.0%}"
+                f"（最小幅度 {target_jitter_low:.0%}）内随机"
+            )
+        if gap_jitter_high > 0:
+            parts.append(
+                f"当日缺口配额在 ±{gap_jitter_high:.0%}"
+                f"（最小幅度 {gap_jitter_low:.0%}）内随机"
+            )
+        warnings.append(
+            {
+                "code": "volatility_not_modeled",
+                "message": (
+                    "forecast 不模拟随机抖动，表中目标/缺口为未抖动基准："
+                    + "；".join(parts)
+                    + "。target_low/target_high 给出目标抖动区间。"
+                ),
+            }
+        )
     summary = _build_summary(rows)
     summary["throughput_capacity"] = throughput_capacity
     summary["effective_threads"] = _effective_threads(
         threads, boost_n, batch_size
     )
+    summary["target_volatility"] = target_volatility
+    summary["volatility"] = volatility
     return {"rows": rows, "warnings": warnings, "summary": summary}
 
 

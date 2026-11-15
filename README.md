@@ -134,18 +134,25 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
               趋势修正受 |斜率| ≤ 中位数 × trend_cap 封顶
               （baseline_views > 0 时直接用该固定值，跳过自动预测）
 
-今日目标     = clamp(基准预期 × 目标系数, target_min, target_max)
+今日目标     = clamp(基准预期 × 目标系数 × (1 + 目标抖动), target_min, target_max)
               stable 模式：目标系数 = 1
               growth 模式：目标系数 = growth_factor × (1 + growth_rate × 距生效日天数)
               target_min / target_max 为 0 时表示该方向不设界
+              目标抖动 = ±uniform(target_volatility_min, target_volatility)  # 0 时关闭
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
-今日缺口     = max(0, round(今日目标 − 昨日自然流量 − 溢出扣减 − 今日已刷))
+未抖动缺口   = max(0, round(今日目标 − 昨日自然流量 − 溢出扣减))
+当日配额     = max(0, round(未抖动缺口 × (1 + 缺口抖动)))
+              缺口抖动 = ±uniform(volatility_min, volatility)  # 0 时关闭
+今日缺口     = max(0, 当日配额 − 今日已刷)
 
-今日已刷     = boost_log 里今天的累计（同一日重跑时按剩余缺口续刷）
-实际刷量     = 今日缺口 × (1 + 随机抖动)      # volatility > 0 时
+今日已刷     = boost_log 里今天的累计（同一日重跑时按剩余配额续刷）
+实际刷量     = 今日缺口                      # 抖动已并入“当日配额”
               （list 模式直接使用列表首行数值，不抖动）
+
+同一组目标/缺口抖动按「日期 + 波动配置签名」持久化：
+同一天重跑、daemon 多时段都复用同一值，后续时段只补「配额 − 今日已刷」。
 
 单条推荐上限 = single_cap
 单日总容量   = 最近推荐数 boost_n × single_cap
@@ -189,7 +196,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 - 速率锚点持久化在 `kv_store`：同一速率跨重启沿用原起点；修改速率后从当天重新
   起算，避免历史天数突然生效造成目标跳变。
 - 检测参照与补缺口目标同步：预测阶段使用 `base × max(1, multiplier)` 作为异常
-  判断参照，避免把自己刷出来的量误判为恶意刷量；长期基线仍是原始中位数。
+  判断参照，避免把自己刷出来的量误判为恶意刷量；配置波动率时参照再乘
+  `(1 + target_volatility + volatility)`（长期基线同样放大），为自身抖动留出余量。
 - `forecast` 输出的“目标”是托底目标 `base × 目标系数（multiplier）`，当
   `growth_factor < 1` 时与检测参照不同，不能混用。
 - `target_min` / `target_max` 在目标系数算完后夹取今日目标（0 表示该方向
@@ -206,8 +214,10 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 
 ```
 昨日自然流量 = max(0, 昨日实际 − boost_log 记录的昨日刷量)
+未抖动缺口   = max(0, 今日目标 − 昨日自然流量 − 溢出扣减)
+当日配额     = 未抖动缺口 × (1 + 缺口抖动)      # volatility > 0 时
+今日缺口     = max(0, 当日配额 − 今日已刷)
 今日已刷     = boost_log 里今天的累计
-今日缺口     = 今日目标 − 昨日自然流量 − 溢出扣减 − 今日已刷
 ```
 
 台账缺失时刷量按 0 处理（兼容旧数据）。刷量记录大于实际值时自然流量夹到 0，
@@ -222,21 +232,45 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 
 ### 3.6 波动率：让曲线不那么机械
 
-`volatility` 作用在**缺口**上，不作用在目标或总浏览量上：
+系统有两个独立的波动率，**作用对象不同**：
+
+| 配置 | 作用对象 | 抖动公式 | 适合 |
+| --- | --- | --- | --- |
+| `volatility` | 缺口 → 当日配额 | `配额 = round(缺口 × (1 + 抖动))` | 缺口很大时，控制每日刷量幅度 |
+| `target_volatility` | 今日目标 | `目标 = 目标 × (1 + 抖动)` 后再夹上下界 | 固定基线/缺口很小时，让总浏览量自然起伏 |
+
+两者的抖动都是“带符号的幅度”：先在 `[下限, 上限]` 内均匀抽幅度，再随机取正负号。
+`*_min` 给幅度设下限（`volatility_min` / `target_volatility_min`），防止抽到
+接近 0 的抖动导致曲线过于平缓；`0` 表示不设下限，上限为 `0` 表示关闭该波动率。
 
 ```
-jitter = random.uniform(-volatility, +volatility)
-need   = max(0, round(need × (1 + jitter)))
+目标抖动 = ±uniform(target_volatility_min, target_volatility)
+缺口抖动 = ±uniform(volatility_min, volatility)
 ```
 
-- 每天只抽一次随机数；结果小于 0 时当天不刷。
-- 缺口越小，波动对最终曲线的影响越小。
-- 恢复期（`in_cooldown`）时先强制 `need = 0`，不参与抖动。
-- 列表模式（`boost_list_file`）在抖动之后覆盖 `need`，列表数值不抖动。
-- 建议值 ≤ `0.15`；过大反而形成不自然的小幅锯齿。
+**行为细节：**
 
-例：目标 1000、昨日自然流量 900、缺口 100、`volatility: 0.10`，则今天刷
-90 ~ 110 次，今日总量约 990 ~ 1010。
+- **同日复用**：目标抖动与缺口抖动按「日期 + 波动配置签名」写入 `kv_store`
+  的 `daily_jitter`。同一天重跑、daemon 多时段都复用同一组值；改任一波动相关
+  配置（含基准/模式/上下界）会从当天重新抽取。
+- **缺口抖动作用于当日配额**：后续时段只补 `配额 − 今日已刷`。负向抖动不会被
+  后面的时段补平，正负偏差都能体现在当天总量上。
+- **目标抖动先于上下界**：抖动后的目标仍会被 `target_min` / `target_max` 夹取，
+  上限同时也是最终刷量的硬上限。
+- **恢复期优先**：`in_cooldown` 时强制不刷，不参与抖动。
+- **列表模式优先**：`boost_list_file` 的数值在抖动之后覆盖配额，列表数值不抖动。
+- **无硬性上限**：`volatility` / `target_volatility` 不再限制 0.3 或 0.15；但抖动
+  幅度会同步放大反作弊检测参照（`×(1 + target_volatility + volatility)`），
+  配得越大，对真实外部刷量的检出越迟钝，需要自行权衡。
+- **forecast 不模拟随机**：`forecast` 输出未抖动基准，`target_low` / `target_high`
+  给出目标抖动区间，并提示波动率未参与估算；`run --dry-run` 才按实际抖动计算。
+
+例 1（缺口抖动）：目标 1000、昨日自然 900、缺口 100、`volatility: 0.10`，
+今天配额 90 ~ 110，总量约 990 ~ 1010。
+
+例 2（目标抖动）：`baseline_views: 10000`、`boost_mode: stable`、
+`target_volatility: 0.50`，则今天目标在 5000 ~ 15000 之间随机；若昨日自然流量
+约 9000，缺口约 0 ~ 6000。叠加 `volatility: 0.10` 时，配额再浮动 ±10%。
 
 ### 3.7 每日刷量列表（`boost_list_file`）
 
@@ -626,7 +660,10 @@ python curator_views/cli.py daemon --config config.yaml
 | `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%） |
 | `target_min` | `0` | 今日目标下限（次）；> 0 时目标跌破下限按下限补量，`0` 不设界 |
 | `target_max` | `0` | 今日目标上限（次）；> 0 时目标超出上限按上限补量，`0` 不设界 |
-| `volatility` | `0.10` | 缺口随机抖动幅度；建议 ≤ 0.15 |
+| `volatility` | `0.10` | 缺口随机抖动幅度：当日配额 = 缺口 × (1 ± 波动率)；`0` 关闭 |
+| `volatility_min` | `0` | 缺口抖动的最小幅度，防止抽到接近 0 导致曲线过平；`0` 不设下限 |
+| `target_volatility` | `0` | 目标随机抖动幅度：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |
+| `target_volatility_min` | `0` | 目标抖动的最小幅度；`0` 不设下限 |
 
 **说明：**
 
@@ -664,7 +701,11 @@ python curator_views/cli.py daemon --config config.yaml
   托底，自然流量已高于下限时不会额外刷量，也不会强制每天刷量。下限会同步
   抬高短期与长期检测参照，托底刷量不会被判成恶意刷量；刷量列表模式直接
   覆盖缺口，不受上下界约束。
-- `volatility` 作用于缺口而非目标，详见 [3.6](#36-波动率让曲线不那么机械)。
+- `volatility` 作用于缺口（当日配额），`target_volatility` 作用于今日目标；
+  两者抖动值按日期持久化，同一天重跑/多时段复用。带 `*_min` 时幅度在
+  `[min, max]` 内均匀取值、方向随机，避免曲线过于平缓。两者都没有硬性上限，
+  但会按 `1 + target_volatility + volatility` 放大反作弊检测参照。详见
+  [3.6](#36-波动率让曲线不那么机械)。
 
 ### 7.7 刷量列表
 
@@ -758,6 +799,9 @@ growth_rate: 0.0
 target_min: 0
 target_max: 0
 volatility: 0.10
+volatility_min: 0.0
+target_volatility: 0.0
+target_volatility_min: 0.0
 
 boost_list_file: ""
 
@@ -864,9 +908,9 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
   执行，之后仍可手动 `run` 补跑（单时段时等同于等第二天）；
 - 时段级去重：`daemon_state.json` 用 `last_run_slot`（`YYYY-MM-DD#HH:MM`）记录最近
   完成的时段，重启后当天只补跑尚未完成的时段；
-- 每个时段执行完整流程（抓取 → 预测 → 检测 → 提升 → 通知）。后一时段按
-  `need = max(0, 目标 − 昨日自然流量 − 溢出扣减 − 今日已刷)` 自动只补剩余缺口，
-  因此第二时段通常比首轮短；
+- 每个时段执行完整流程（抓取 → 预测 → 检测 → 提升 → 通知）。目标/缺口抖动
+  按天复用，后一时段只补 `need = max(0, 当日配额 − 今日已刷)`，因此第二时段
+  通常比首轮短，负向抖动也不会被补平；
 - 手动 `run` 只写日期级 `last_run_date`，daemon 视“此刻之前的所有时段”已完成，
   之后的时段仍会执行以补足缺口；
 - 时段串行执行：上一时段的提升还没结束时，下一时段会等它结束后再开始（不并发），
@@ -960,12 +1004,14 @@ python curator_views/cli.py forecast --config config.yaml \
 首日基准取今天之前最近一个完整日；若本地库最新日期早于昨天，会给出
 `stale_history` 提示，建议加 `--fetch`。
 这是**估算不是精确预测**：未来自然流量只是外推；异常标记未持久化，因此
-`in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期、
-波动率与刷量列表，只复用 `run` 的缺口公式。
+`in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期与
+刷量列表，只复用 `run` 的缺口公式。波动率也不参与估算：配置了
+`target_volatility` / `volatility` 时，表格给的是未抖动基准，`target_low` /
+`target_high` 给出目标抖动区间，并输出 `volatility_not_modeled` 提示。
 
 forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run` 的检测参照是
-`base × max(1, multiplier)`。当 `growth_factor < 1` 时两者不同，不要把托底
-目标当成检测参照。
+`base × max(1, multiplier) × (1 + target_volatility + volatility)`。当
+`growth_factor < 1` 或配置了波动率时两者不同，不要把托底目标当成检测参照。
 
 输出示例：
 
@@ -975,7 +1021,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 自然口径: 基准日 2026-11-13 实际 5,449 - 刷量 0 = 自然 5,449；未来日假设自然不变
 今日已刷: 0 次（2026-11-14，来自 boost_log；首日缺口已按剩余量计算）
 参数: boost_mode=growth factor=0.85 rate=-0.01
-      基线=auto 自然模型=natural 波动率=0.10
+      基线=auto 自然模型=natural 缺口波动率=0.10（最小 0.00） 目标波动率=0.00（最小 0.00）
 单日容量: 1,500 次（boost_n=5 × single_cap=300）
 
 日期           基准  目标系数     目标  假设自然  今日已刷   缺口  备注
@@ -1022,6 +1068,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
 | `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
+| `volatility_not_modeled` | 配置了 `target_volatility` / `volatility`：forecast 不模拟随机抖动，表格为未抖动基准（`target_low` / `target_high` 给出目标区间） |
 
 ### 8.6 boost
 
@@ -1129,15 +1176,20 @@ python curator_views/cli.py run --config config.yaml --no-boost
 
 先积累几周平稳数据，再开启提升，预测会更可靠。
 
-### 9.2 稳定在固定浏览量
+### 9.2 固定基线 + 目标波动（让总量自然起伏）
 
 ```yaml
-baseline_views: 1000
+baseline_views: 10000
 boost_mode: stable
-volatility: 0.10
+target_volatility: 0.50      # 目标在 5000 ~ 15000 之间随机
+target_volatility_min: 0.10  # 每天至少偏离 10%，避免过于平缓
+volatility: 0.10             # 当日配额再浮动 ±10%
+volatility_min: 0.05         # 至少偏离 5%
 ```
 
-系统会把曲线补到 1000 附近，缺口小的时候波动也小。
+系统每天先抽一个目标（5000 ~ 15000），再按「目标 − 昨日自然流量」算缺口并
+浮动 ±10%，最后补到当日配额；同一天重跑/多时段复用同一组抖动值。
+缺口很小时，只靠 `target_volatility` 就能让曲线明显起伏。
 
 ### 9.3 匀速缓降
 
@@ -1511,7 +1563,8 @@ VALUES ('2026-11-01', 500, 'manual', '2026-11-01T12:00:00');
 不会。缺口公式会先减去 `boost_log` 里今天的累计（`today_boosted`）：
 
 ```
-need = max(0, 今日目标 - 昨日自然流量 - 溢出扣减 - 今日已刷)
+当日配额 = max(0, round(未抖动缺口 × (1 + 缺口抖动)))   # 同日复用同一值
+need     = max(0, 当日配额 - 今日已刷)
 ```
 
 所以中断后重跑、容量不足再补、手动补跑，都只补剩余部分。`forecast` 的
@@ -1711,12 +1764,14 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **315** 个，覆盖：
+当前测试共 **328** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
 - 手动基线、growth 模式、growth_rate 锚点、目标上下界（封顶 / 托底 /
   不设界 / 波动不越界 / 长期基线同步）、波动率、恢复期、标记日剔除；
+- 目标波动率、最小波动幅度、同日抖动复用（重跑/多时段/配置变更）、
+  缺口配额跨时段续刷、抖动日不被误判为溢出；
 - 调度器子进程执行器、时区工具；
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；

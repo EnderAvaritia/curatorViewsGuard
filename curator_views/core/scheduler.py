@@ -126,6 +126,129 @@ def _normalize_target_bounds(
     return low, high
 
 
+_JITTER_STATE_KEY = "daily_jitter"
+
+
+def _jitter_bounds(max_volatility: float, min_volatility: float = 0.0) -> tuple[float, float]:
+    """归一化抖动区间，返回 ``(下限, 上限)``。
+
+    - 负数按绝对值处理，非数按 0；
+    - 上限为 0 时视为关闭抖动，返回 ``(0, 0)``；
+    - ``min_volatility`` 大于上限时夹到上限（等价于固定幅度），
+      避免配错方向后抖动被静默关闭。
+    """
+    high = abs(float(max_volatility or 0))
+    low = abs(float(min_volatility or 0))
+    if high <= 0:
+        return 0.0, 0.0
+    return min(low, high), high
+
+
+def _sample_signed_jitter(max_volatility: float, min_volatility: float = 0.0) -> float:
+    """抽取带符号抖动，保证 ``min <= |jitter| <= max``。
+
+    ``min_volatility`` 用于防止“抽到接近 0 的抖动导致曲线过于平缓”：
+    幅度在 ``[min, max]`` 内均匀取值，方向随机（各 50%）。
+    上限为 0 时不抖动，返回 0。
+    """
+    low, high = _jitter_bounds(max_volatility, min_volatility)
+    if high <= 0:
+        return 0.0
+    magnitude = random.uniform(low, high)
+    sign = 1.0 if random.random() < 0.5 else -1.0
+    return sign * magnitude
+
+
+def _jitter_signature(
+    baseline_views: float,
+    boost_mode: str,
+    growth_factor: float,
+    growth_rate: float,
+    target_min: float,
+    target_max: float,
+    volatility: float,
+    volatility_min: float,
+    target_volatility: float,
+    target_volatility_min: float,
+) -> str:
+    """生成当日抖动配置签名：配置未变时同一天复用同一组抖动值。"""
+    return json.dumps(
+        [
+            round(float(baseline_views), 6),
+            str(boost_mode),
+            round(float(growth_factor), 6),
+            round(float(growth_rate), 6),
+            round(float(target_min), 6),
+            round(float(target_max), 6),
+            round(float(volatility), 6),
+            round(float(volatility_min), 6),
+            round(float(target_volatility), 6),
+            round(float(target_volatility_min), 6),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _resolve_daily_jitters(
+    storage: Storage,
+    today_iso: str,
+    signature: str,
+    target_high: float,
+    target_low: float,
+    gap_high: float,
+    gap_low: float,
+    persist: bool = True,
+) -> tuple[float, float]:
+    """取当日目标抖动与缺口抖动，返回 ``(target_jitter, gap_jitter)``。
+
+    抖动值按“日期 + 配置签名”持久化在 ``kv_store`` 的 ``daily_jitter`` 键：
+
+    - 同一天多次 run / daemon 多时段复用同一组值，避免目标在时段之间跳变，
+      也避免缺口抖动被后续时段“补平”；
+    - 改动任一波动相关配置后签名变化，从当天重新抽取；
+    - ``persist=False``（dry_run）只读已有值，不写回；没有值时临时抽取。
+    """
+    if target_high <= 0 and gap_high <= 0:
+        return 0.0, 0.0
+
+    raw = storage.load_state(_JITTER_STATE_KEY, default="")
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("date") == today_iso
+            and payload.get("signature") == signature
+        ):
+            try:
+                return float(payload["target"]), float(payload["gap"])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+    target_jitter = (
+        _sample_signed_jitter(target_high, target_low) if target_high > 0 else 0.0
+    )
+    gap_jitter = _sample_signed_jitter(gap_high, gap_low) if gap_high > 0 else 0.0
+    if persist:
+        storage.save_state(
+            _JITTER_STATE_KEY,
+            json.dumps(
+                {
+                    "date": today_iso,
+                    "signature": signature,
+                    "target": target_jitter,
+                    "gap": gap_jitter,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    return target_jitter, gap_jitter
+
+
 def _clamp_target(
     target: float, target_min: float = 0.0, target_max: float = 0.0
 ) -> tuple[float, str]:
@@ -200,11 +323,24 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
     ]
     if summary.get("target_bound"):
         bound_label = "下限" if summary["target_bound"] == "min" else "上限"
-        raw = summary.get("today_expected_raw", summary["today_expected"])
+        raw = summary.get(
+            "today_expected_jittered", summary["today_expected"]
+        )
         lines.append(
             f"目标{bound_label}夹取: {summary['today_expected']:.0f}"
             f"（原始 {raw:.0f}，下限={summary.get('target_min', 0):g}，"
             f"上限={summary.get('target_max', 0):g}）"
+        )
+    if summary.get("target_jitter"):
+        lines.append(
+            f"目标抖动: {summary['target_jitter']:+.2%}"
+            f"（{summary.get('today_expected_raw', 0):.0f} → "
+            f"{summary.get('today_expected_jittered', 0):.0f}）"
+        )
+    if summary.get("gap_jitter"):
+        lines.append(
+            f"缺口抖动: {summary['gap_jitter']:+.2%}"
+            f"（当日配额 {summary.get('boost_quota', 0):,}）"
         )
     lines.extend([
         f"今日预期浏览量: {summary['today_expected']:.0f}",
@@ -350,7 +486,9 @@ def run_daily(
         threads, wait_min, wait_max,
         baseline_views, boost_mode, growth_factor,
         target_min, target_max,
-        volatility, cooldown_days, exclude_flagged,
+        volatility, volatility_min,
+        target_volatility, target_volatility_min,
+        cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool),
         boost_list_file (str)
@@ -384,10 +522,23 @@ boost_mode / growth_factor / growth_rate：
         growth_rate 的生效起点是首次使用该速率的当天（持久化在 kv_store），
         改动速率会从改动当天重新起算，避免目标突然跳变。
 
-    volatility：
-        刷量波动率（0~0.3，建议 ≤0.15）。>0 时每日实际提升目标在
-        「缺口 ×(1 ± volatility)」内随机，使浏览曲线围绕目标自然波动，
-        避免收敛成一条直线。
+    volatility / volatility_min：
+        缺口波动率。>0 时当日刷量配额在「缺口 ×(1 ± volatility)」内随机，
+        使浏览曲线围绕目标自然波动。``volatility_min`` 给抖动幅度设下限
+        （幅度在 ``[min, max]`` 内均匀取值、方向随机），防止抽到接近 0 的
+        抖动导致曲线过于平缓。抖动值按日期持久化：同一天多个时段复用同一
+        配额，后续时段只补 ``配额 − 今日已刷``，不会把负向抖动补平。
+        不设上限，但幅度过大会挤压反作弊判定余量（见下）。
+
+    target_volatility / target_volatility_min：
+        目标波动率。>0 时今日目标在「目标 ×(1 ± target_volatility)」内随机，
+        再按 ``target_min`` / ``target_max`` 夹取后参与缺口计算。与缺口波动率
+        不同，它按目标的比例抖动，因此即使缺口很小也能让总浏览量产生明显
+        起伏。``target_volatility_min`` 同样给抖动幅度设下限。
+        目标抖动值按日期持久化：同一天重跑/多时段使用同一个目标。
+        两者都无硬性上限；但抖动幅度会同步放大反作弊检测参照
+        （``1 + target_volatility + volatility``），避免把自己抖出来的量
+        判成恶意刷量。
 
     target_min / target_max：
         今日目标浏览量的上下界（0 表示该方向不设界）。目标先按
@@ -451,6 +602,13 @@ boost_mode / growth_factor / growth_rate：
         target_min, target_max
     )
     volatility = float(config.get("volatility", 0) or 0)
+    volatility_min = float(config.get("volatility_min", 0) or 0)
+    target_volatility = float(config.get("target_volatility", 0) or 0)
+    target_volatility_min = float(config.get("target_volatility_min", 0) or 0)
+    gap_low, gap_high = _jitter_bounds(volatility, volatility_min)
+    target_jitter_low, target_jitter_high = _jitter_bounds(
+        target_volatility, target_volatility_min
+    )
     cooldown_days = int(config.get("cooldown_days", 7))
     exclude_flagged = bool(config.get("exclude_flagged", True))
     baseline_days = int(config.get("baseline_days", 60))
@@ -516,8 +674,10 @@ boost_mode / growth_factor / growth_rate：
     #    growth 模式倍率为 growth_factor，速率因子按 growth_rate 线性推进。
     #    检测参照：增长时用抬高后的目标（避免把自己刷的量误判为恶意刷量），
     #    下调时用自然预期（避免"实际高于下滑目标"被误判为异常）。
+    #    自身抖动会让实际值进一步偏离目标，参照按最大抖动幅度同步放大。
     manual_baseline = baseline_views > 0
     multiplier = growth_factor if boost_mode == "growth" else 1.0
+    jitter_uplift = 1.0 + target_jitter_high + gap_high
     drift_start_ts = 0
     if boost_mode == "growth" and growth_rate != 0:
         drift_start_ts = _date_to_epoch(
@@ -546,12 +706,16 @@ boost_mode / growth_factor / growth_rate：
             if target_floor > 0:
                 long_baseline = max(long_baseline, target_floor)
         # 持续上升斜率检测：慢性爬升型刷量（需要长期基线参照，防止
-        # 把真实增长误判为异常）
+        # 把真实增长误判为异常）。检测用基线同样按抖动幅度放大，
+        # 避免自己抖出来的高位日被当成慢性爬升。
+        detection_baseline = (
+            long_baseline * jitter_uplift if long_baseline is not None else None
+        )
         drift_days = detect_drift(
             history_clean,
             slope_days=slope_days,
             slope_threshold=slope_threshold,
-            long_baseline=long_baseline,
+            long_baseline=detection_baseline,
             k=outlier_k,
         )
         predictions: Dict[int, float] = {}
@@ -575,13 +739,14 @@ boost_mode / growth_factor / growth_rate：
             # - 下滑时不把"实际高于下滑目标"误判为异常（参照仍为 base）；
             # - 托底时参照同步抬到下限，避免托底刷量被误判；
             # - 封顶后参照不再虚高，超出上限的外部异常仍能及时发现。
+            # - 最后按 jitter_uplift 放大，为自身抖动留出判定余量。
             day_target, _ = _clamp_target(
                 base * day_multiplier, target_floor, target_ceiling
             )
-            predictions[day["date_ts"]] = max(base, day_target)
+            predictions[day["date_ts"]] = max(base, day_target) * jitter_uplift
         overflow = detect_overflow(
             history_clean, predictions, outlier_k, consecutive_days,
-            long_baseline=long_baseline,
+            long_baseline=detection_baseline,
             extra_candidates=drift_days,
         )
         if not first_overflow:
@@ -631,17 +796,51 @@ boost_mode / growth_factor / growth_rate：
         multiplier, growth_rate, drift_start_ts, today_ts
     )
     today_expected_raw = base_expected * today_multiplier
+    # 目标层抖动：按当日配置签名抽取并持久化，同一天重跑/多时段复用同一值。
+    target_jitter, gap_jitter = _resolve_daily_jitters(
+        storage,
+        today_iso,
+        _jitter_signature(
+            baseline_views,
+            boost_mode,
+            growth_factor,
+            growth_rate,
+            target_floor,
+            target_ceiling,
+            volatility,
+            volatility_min,
+            target_volatility,
+            target_volatility_min,
+        ),
+        target_jitter_high,
+        target_jitter_low,
+        gap_high,
+        gap_low,
+        persist=not dry_run,
+    )
+    today_expected_jittered = today_expected_raw
+    if target_jitter:
+        today_expected_jittered = max(
+            0.0, today_expected_raw * (1.0 + target_jitter)
+        )
+        logger.info(
+            "目标抖动 %+.2f%%（最小幅度 %.2f%%）: %.1f → %.1f",
+            target_jitter * 100.0,
+            target_jitter_low * 100.0,
+            today_expected_raw,
+            today_expected_jittered,
+        )
     # 目标上下界：0 表示该方向不设界。上限防 growth 目标无限上涨，
     # 下限托底防目标持续下滑；夹取后的目标再参与缺口计算。
     today_expected, target_bound = _clamp_target(
-        today_expected_raw, target_floor, target_ceiling
+        today_expected_jittered, target_floor, target_ceiling
     )
     if target_bound:
         bound_label = "下限" if target_bound == "min" else "上限"
         logger.info(
             "今日目标 %.1f 命中%s，按 %.1f 计算缺口"
             "（target_min=%g，target_max=%g）。",
-            today_expected_raw, bound_label, today_expected,
+            today_expected_jittered, bound_label, today_expected,
             target_floor, target_ceiling,
         )
 
@@ -664,11 +863,21 @@ boost_mode / growth_factor / growth_rate：
         0, round(today_expected - yesterday_natural - today_deduction)
     )
     today_boosted = max(0, int(storage.get_boost_total(today_iso)))
-    need = max(0, gross_need - today_boosted)
+    # 缺口抖动作用于“当日总量配额”，而不是每次剩余的缺口：
+    # 多时段/同日重跑时 later run 只补「配额 − 今日已刷」，
+    # 负向抖动不会被后续时段补平，正负抖动都能体现在当日总量上。
+    boost_quota = gross_need
+    if gap_high > 0 and gross_need > 0:
+        boost_quota = max(0, round(gross_need * (1.0 + gap_jitter)))
+        logger.info(
+            "缺口抖动 %+.2f%%（最小幅度 %.2f%%）: 缺口 %d → 当日配额 %d",
+            gap_jitter * 100.0, gap_low * 100.0, gross_need, boost_quota,
+        )
+    need = max(0, boost_quota - today_boosted)
     if today_boosted > 0:
         logger.info(
-            "今日已刷 %d 次，缺口 %d → %d（按剩余量继续）。",
-            today_boosted, gross_need, need,
+            "今日已刷 %d 次，配额 %d → %d（按剩余量继续）。",
+            today_boosted, boost_quota, need,
         )
     in_cooldown = False
     days_since_flagged = -1
@@ -683,14 +892,6 @@ boost_mode / growth_factor / growth_rate：
             days_since_flagged, cooldown_days,
         )
         need = 0
-    elif volatility > 0 and need > 0:
-        base_need = need
-        jitter = random.uniform(-volatility, volatility)
-        need = max(0, round(need * (1.0 + jitter)))
-        logger.info(
-            "波动率 %.2f: 缺口 %d → 提升目标 %d",
-            volatility, base_need, need,
-        )
 
     # 6.4 上限同时作为实际刷量的硬上限：波动率可能把缺口从目标值再抬高
     #     （自然流量越接近 0 越明显），这里再夹一次，保证 run / daemon
@@ -796,6 +997,7 @@ boost_mode / growth_factor / growth_rate：
         "dry_run": dry_run,
         "today_expected": today_expected,
         "today_expected_raw": round(today_expected_raw, 1),
+        "today_expected_jittered": round(today_expected_jittered, 1),
         "target_min": target_floor,
         "target_max": target_ceiling,
         "target_bound": target_bound,
@@ -804,6 +1006,7 @@ boost_mode / growth_factor / growth_rate：
         "yesterday_natural": yesterday_natural,
         "today_boosted": today_boosted,
         "gross_need": gross_need,
+        "boost_quota": boost_quota,
         "need": need,
         "deduction": today_deduction,
         "overflow_flag_count": len(flagged_days),
@@ -817,6 +1020,11 @@ boost_mode / growth_factor / growth_rate：
         "target_multiplier": round(today_multiplier, 4),
         "today_target": round(today_expected, 1),
         "volatility": volatility,
+        "volatility_min": volatility_min,
+        "target_volatility": target_volatility,
+        "target_volatility_min": target_volatility_min,
+        "target_jitter": round(target_jitter, 6),
+        "gap_jitter": round(gap_jitter, 6),
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,
         "boost_list_status": list_status,

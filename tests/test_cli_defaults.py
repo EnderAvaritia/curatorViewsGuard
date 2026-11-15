@@ -17,6 +17,9 @@ class TestLoadConfigDefaults:
 
         assert cfg["clan_id"] == "123"
         assert cfg["volatility"] == 0.10
+        assert cfg["volatility_min"] == 0.0
+        assert cfg["target_volatility"] == 0.0
+        assert cfg["target_volatility_min"] == 0.0
         assert cfg["growth_factor"] == 1.5
         assert cfg["growth_rate"] == 0.0
         assert cfg["boost_mode"] == "stable"
@@ -88,5 +91,8 @@ class TestDefaultSources:
 
         assert sched["growth_factor"] == 1.5
         assert sched["volatility"] == 0.10
+        assert sched["volatility_min"] == 0.0
+        assert sched["target_volatility"] == 0.0
+        assert sched["target_volatility_min"] == 0.0
         assert sched["boost_distribution"] == "ratio"
         assert sched["threads"] == 1

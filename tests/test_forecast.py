@@ -363,6 +363,50 @@ def make_today_db(
     return db_path
 
 
+class TestTargetVolatilityForecast:
+    def test_previews_target_range(self):
+        result = forecast_days(
+            make_history(views=10000),
+            make_config(baseline_views=10000, target_volatility=0.50),
+            START_TS,
+            days=1,
+        )
+        row = result["rows"][0]
+        assert row["target"] == 10000
+        assert row["target_low"] == 5000
+        assert row["target_high"] == 15000
+        assert "volatility_not_modeled" in warning_codes(result)
+
+    def test_range_respects_target_bounds(self):
+        result = forecast_days(
+            make_history(views=10000),
+            make_config(
+                baseline_views=10000,
+                target_volatility=0.50,
+                target_min=6000,
+                target_max=12000,
+            ),
+            START_TS,
+            days=1,
+        )
+        row = result["rows"][0]
+        assert row["target"] == 10000
+        assert row["target_low"] == 6000
+        assert row["target_high"] == 12000
+
+    def test_zero_volatility_has_no_range_or_warning(self):
+        result = forecast_days(
+            make_history(views=10000),
+            make_config(baseline_views=10000),
+            START_TS,
+            days=1,
+        )
+        row = result["rows"][0]
+        assert row["target_low"] == row["target"]
+        assert row["target_high"] == row["target"]
+        assert "volatility_not_modeled" not in warning_codes(result)
+
+
 class TestForecastCli:
     def test_cli_is_readonly_and_prints_dates(self, tmp_path, capsys):
         config_path = tmp_path / "config.yaml"
