@@ -228,7 +228,7 @@ python curator_views/cli.py check --config config.yaml --no-write
 ```bash
 python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
   [--today | --tomorrow] [--natural trend|target] [--set KEY=VALUE ...] \
-  [--no-volatility] [--chart [PATH]] [--json]
+  [--no-volatility] [--chart [PATH]] [--day-step DAYS] [--chart-only] [--json]
 ```
 
 - `--days N`：预测天数，默认 7，必须 >= 1；
@@ -246,6 +246,12 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
   自包含 HTML（内联 SVG，无第三方依赖，相对路径基于配置文件目录），`--json`
   时路径在 `source.chart_path`；`--chart -` 也表示控制台；`--json` + 控制台图
   时图表写 stderr，标准输出仍是纯 JSON；
+- `--day-step DAYS`：表格与图每隔 DAYS 天输出一次，默认 1（每天）；同时影响
+  表格、控制台/HTML 图和 JSON 的 `rows`，汇总与警告仍按完整区间计算。
+  从首日开始取样，首尾日期始终保留；最后一天不是间隔点时会额外补上，
+  因此末尾间隔可能小于 DAYS；
+- `--chart-only`：只输出图表本身，不打印 forecast 表格、图外说明与汇总；
+  未指定 `--chart` 时自动使用控制台图，不能与 `--json` 同用；
 - `--json`：输出 rows / warnings / summary / source 完整结构；
   `source.today_boosted` 为今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 为首日扣除量。
@@ -282,7 +288,8 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 `--chart` 直接在控制台输出两张点状字符图：目标 vs 假设自然流量、当日配额 vs
 实际待刷，并在图上方标注模式、基线、波动率与目标上下界；`--chart PATH` 则改为
 写自包含 HTML，额外显示目标区间带，直接双击用浏览器打开即可。控制台宽度自动
-适配终端，两条线重叠时显示 `*`。图中曲线同样是一次抽样结果，重新运行可能不同。
+适配终端，两条线重叠时显示 `*`。`--day-step N` 控制表格与图的输出间隔（首尾日期保留）；
+`--chart-only` 只输出图本身。图中曲线同样是一次抽样结果，重新运行可能不同。
 
 ### boost
 

@@ -1314,6 +1314,18 @@ def _pad_display(text: str, width: int, align: str = "left") -> str:
     return text + " " * padding
 
 
+def _sample_forecast_rows(
+    rows: list[Dict[str, Any]], step: int
+) -> list[Dict[str, Any]]:
+    """按间隔抽样展示行；首尾始终保留，避免漏掉预测期末日。"""
+    if step <= 1 or len(rows) <= 1:
+        return rows
+    sampled = rows[::step]
+    if (len(rows) - 1) % step:
+        sampled.append(rows[-1])
+    return sampled
+
+
 def _print_forecast_report(
     result: Dict[str, Any],
     config: Dict[str, Any],
@@ -1331,6 +1343,12 @@ def _print_forecast_report(
         f"（{summary['days']} 天"
         f"{'，含今天' if today_mode else '，从明天起'}）"
     )
+    day_step = int(source.get("day_step", 1) or 1)
+    if day_step > 1:
+        print(
+            f"输出间隔: 每 {day_step} 天（表格仅显示抽样行；"
+            "汇总与警告仍按完整区间）"
+        )
     source_text = "Steam 在线抓取" if fetched else f"本地数据库 {db_path}"
     print(
         f"数据来源: {source_text}（{source['history_days']} 天，"
@@ -1502,6 +1520,15 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         _print_error("--days 必须 >= 1")
         return 1
 
+    chart_only = bool(getattr(args, "chart_only", False))
+    day_step = getattr(args, "day_step", 1)
+    if chart_only and args.json:
+        _print_error("--chart-only 不能与 --json 同用")
+        return 1
+    if day_step < 1:
+        _print_error("--day-step 必须 >= 1")
+        return 1
+
     config_path = Path(args.config)
     cfg = _load_config(config_path)
     cfg_dir = config_path.resolve().parent
@@ -1670,11 +1697,24 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "yesterday_natural": first_natural,
         "today_boosted": None if start_tomorrow else today_boosted,
         "volatility_modeled": bool(getattr(args, "model_volatility", True)),
+        "day_step": day_step,
     }
+    if day_step > 1:
+        result = {
+            **result,
+            "rows": _sample_forecast_rows(result["rows"], day_step),
+        }
     chart_arg = getattr(args, "chart", None)
+    if chart_only and chart_arg is None:
+        chart_arg = "-"
     console_chart: Optional[str] = None
     if chart_arg == "-":
-        console_chart = render_forecast_console(result, sched_cfg, source)
+        console_chart = render_forecast_console(
+            result,
+            sched_cfg,
+            source,
+            include_meta=not chart_only,
+        )
         source["chart_format"] = "console"
     elif chart_arg:
         chart_target = _resolve_path(cfg_dir, str(chart_arg))
@@ -1697,6 +1737,11 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         if console_chart:
             print(console_chart, file=sys.stderr)
+        return 0
+
+    if chart_only:
+        if console_chart:
+            print(console_chart)
         return 0
 
     _print_forecast_report(result, sched_cfg, source, args.fetch, db_path)
@@ -1831,6 +1876,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="输出控制台点状折线图；带 PATH 时写 HTML 文件（相对路径基于配置文件目录，"
              "'-' 也表示控制台）",
+    )
+    p_forecast.add_argument(
+        "--day-step", type=int, default=1, metavar="DAYS",
+        help="表格与图每隔 DAYS 天输出一次（默认 1，即每天）",
+    )
+    p_forecast.add_argument(
+        "--chart-only", action="store_true",
+        help="只输出折线图本身，不打印 forecast 表格、说明与汇总；未指定 --chart 时默认控制台",
     )
     p_forecast.add_argument("--json", action="store_true",
                             help="输出完整 JSON（含 rows/warnings/summary/source）")

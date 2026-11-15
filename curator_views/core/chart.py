@@ -76,8 +76,8 @@ def _x_positions(count: int) -> List[float]:
 def _x_label_indexes(count: int, limit: int = 8) -> List[int]:
     if count <= 0:
         return []
-    step = max(1, math.ceil(count / limit))
-    indexes = list(range(0, count, step))
+    auto_step = max(1, math.ceil(count / limit))
+    indexes = list(range(0, count, auto_step))
     if indexes[-1] != count - 1:
         indexes.append(count - 1)
     return indexes
@@ -339,6 +339,7 @@ def render_forecast_console(
     config: Dict[str, Any],
     source: Optional[Dict[str, Any]] = None,
     width: Optional[int] = None,
+    include_meta: bool = True,
 ) -> str:
     """把 forecast 结果渲染为控制台点状折线图。"""
     rows = list(result.get("rows") or [])
@@ -359,6 +360,7 @@ def render_forecast_console(
     baseline_text = "自动预测" if baseline <= 0 else f"固定 {baseline:,.0f}"
     mode = str(config.get("boost_mode", "stable"))
     source_text = "Steam 在线抓取" if source.get("mode") == "fetch" else "本地数据库"
+    day_step = int(source.get("day_step", 1) or 1)
 
     target_vol = _config_float(config, "target_volatility")
     target_vol_min = _config_float(config, "target_volatility_min")
@@ -393,30 +395,48 @@ def render_forecast_console(
         {"key": "need", "name": "实际待刷", "marker": _CONSOLE_MARKERS["need"]},
     ]
 
-    lines = [
-        f"预测区间：{first_date} ~ {last_date}（{days} 天） · {source_text}",
-        f"模式：{mode} · 基线：{baseline_text}{bounds_text}",
-        f"波动率：{vol_text} · {vol_detail}",
-        "",
-    ]
+    lines = []
+    if include_meta:
+        lines.extend(
+            [
+                f"预测区间：{first_date} ~ {last_date}（{days} 天） · {source_text}",
+                f"模式：{mode} · 基线：{baseline_text}{bounds_text}",
+                f"波动率：{vol_text} · {vol_detail}",
+                *(
+                    [f"输出间隔：每 {day_step} 天（仅抽样显示，汇总按完整区间）"]
+                    if day_step > 1
+                    else []
+                ),
+                "",
+            ]
+        )
     lines.extend(
         _console_chart(
-            rows, view_series, width, "浏览量：目标 vs 假设自然流量"
+            rows,
+            view_series,
+            width,
+            "浏览量：目标 vs 假设自然流量",
         )
     )
     lines.append("")
     lines.extend(
-        _console_chart(rows, boost_series, width, "刷量：当日配额 vs 实际待刷")
+        _console_chart(
+            rows,
+            boost_series,
+            width,
+            "刷量：当日配额 vs 实际待刷",
+        )
     )
-    lines.append("")
-    lines.append(
-        "区间预计刷量 "
-        f"{_fmt(float(summary.get('total_need', 0) or 0))} · 目标 "
-        f"{_fmt(float(summary.get('target_first', 0) or 0))} → "
-        f"{_fmt(float(summary.get('target_last', 0) or 0))}"
-    )
-    if modeled:
-        lines.append("注：随机波动为本次抽样，重新运行可能不同。")
+    if include_meta:
+        lines.append("")
+        lines.append(
+            "区间预计刷量 "
+            f"{_fmt(float(summary.get('total_need', 0) or 0))} · 目标 "
+            f"{_fmt(float(summary.get('target_first', 0) or 0))} → "
+            f"{_fmt(float(summary.get('target_last', 0) or 0))}"
+        )
+        if modeled:
+            lines.append("注：随机波动为本次抽样，重新运行可能不同。")
     return "\n".join(lines)
 
 
@@ -477,6 +497,12 @@ def render_forecast_html(
         f"缺口 ±{gap_vol:.0%}（最小 {gap_vol_min:.0%}）"
     )
     source_text = "Steam 在线抓取" if source.get("mode") == "fetch" else "本地数据库"
+    day_step = int(source.get("day_step", 1) or 1)
+    step_meta = (
+        f'\n  <p class="meta">输出间隔：每 {day_step} 天（仅抽样显示，汇总按完整区间）</p>'
+        if day_step > 1
+        else ""
+    )
     bounds = []
     if _config_float(config, "target_min") > 0:
         bounds.append(f"下限 {_config_float(config, 'target_min'):,.0f}")
@@ -552,7 +578,7 @@ def render_forecast_html(
   <h1>CuratorViewsGuard 预测折线图</h1>
   <p class="meta">区间：{_esc(first_date)} ~ {_esc(last_date)}（{_esc(days)} 天） · 生成时间：{_esc(generated)}</p>
   <p class="meta">模式：{_esc(mode)} · 基线：{_esc(baseline_text)} · 数据来源：{_esc(source_text)}</p>
-  <p class="meta">波动率：{_esc(vol_text)} · {_esc(vol_detail)}{_esc(bounds_text)}</p>
+  <p class="meta">波动率：{_esc(vol_text)} · {_esc(vol_detail)}{_esc(bounds_text)}</p>{step_meta}
   <p class="note">{_esc(note)}</p>
 
   <section class="card">

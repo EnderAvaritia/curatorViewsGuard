@@ -207,7 +207,7 @@ class TestRenderForecastConsole:
 
 
 class TestForecastChartCli:
-    def _run(self, tmp_path, extra):
+    def _run(self, tmp_path, extra, days=3):
         config_path = tmp_path / "config.yaml"
         config_path.write_text(CLI_CONFIG, encoding="utf-8")
         db_path = make_cli_db(tmp_path)
@@ -219,7 +219,7 @@ class TestForecastChartCli:
                 "--set",
                 f"db_path={db_path}",
                 "--days",
-                "3",
+                str(days),
                 *extra,
             ]
         )
@@ -243,6 +243,89 @@ class TestForecastChartCli:
         assert "浏览量：目标 vs 假设自然流量" in captured.out
         assert "刷量：当日配额 vs 实际待刷" in captured.out
         assert not (tmp_path / "forecast.html").exists()
+
+    def test_day_step_samples_table_and_chart(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--day-step", "2", "--chart-only"])
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "11-15" in captured.out
+        assert "11-17" in captured.out
+        assert "11-16" not in captured.out
+
+    def test_day_step_samples_table(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--day-step", "2"])
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "输出间隔: 每 2 天" in captured.out
+        assert "11-15" in captured.out
+        assert "11-17" in captured.out
+        assert "11-16" not in captured.out
+
+    def test_day_step_samples_json_rows(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--day-step", "2", "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [row["date"] for row in payload["rows"]] == [
+            "2026-11-15",
+            "2026-11-17",
+        ]
+        assert payload["summary"]["days"] == 3
+        assert payload["source"]["day_step"] == 2
+
+    def test_chart_only_skips_forecast_table(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--chart-only"])
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "浏览量：目标 vs 假设自然流量" in captured.out
+        assert "刷量：当日配额 vs 实际待刷" in captured.out
+        assert "目标系数" not in captured.out
+        assert "汇总:" not in captured.out
+        assert "预测区间：" not in captured.out
+        assert "区间预计刷量" not in captured.out
+        assert not (tmp_path / "forecast.html").exists()
+
+    def test_chart_only_with_html_path_writes_file_without_report(
+        self, tmp_path, capsys
+    ):
+        chart_path = tmp_path / "chart.html"
+
+        code = self._run(
+            tmp_path, ["--chart", str(chart_path), "--chart-only"]
+        )
+
+        captured = capsys.readouterr()
+        assert code == 0
+        assert captured.out == ""
+        assert chart_path.is_file()
+
+    def test_day_step_keeps_last_day_when_not_aligned(self, tmp_path, capsys):
+        code = self._run(
+            tmp_path, ["--day-step", "3", "--json"], days=5
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert [row["date"] for row in payload["rows"]] == [
+            "2026-11-15",
+            "2026-11-18",
+            "2026-11-19",
+        ]
+
+    def test_day_step_rejects_zero(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--day-step", "0"])
+
+        assert code == 1
+        assert "--day-step" in capsys.readouterr().err
+
+    def test_chart_only_rejects_json(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--chart-only", "--json"])
+
+        assert code == 1
+        assert "--chart-only" in capsys.readouterr().err
 
     def test_chart_dash_prints_console(self, tmp_path, capsys):
         code = self._run(tmp_path, ["--chart", "-"])
@@ -271,6 +354,19 @@ class TestForecastChartCli:
         payload = json.loads(captured.out)
         assert payload["source"]["chart_format"] == "console"
         assert "浏览量：目标 vs 假设自然流量" in captured.err
+
+    def test_day_step_applies_to_html(self, tmp_path):
+        chart_path = tmp_path / "chart.html"
+
+        code = self._run(
+            tmp_path, ["--chart", str(chart_path), "--day-step", "2"]
+        )
+
+        assert code == 0
+        page = chart_path.read_text(encoding="utf-8")
+        assert "2026-11-15" in page
+        assert "2026-11-17" in page
+        assert "2026-11-16" not in page
 
     def test_no_chart_by_default(self, tmp_path, capsys):
         code = self._run(tmp_path, [])

@@ -975,7 +975,8 @@ python curator_views/cli.py check --config config.yaml [--no-write]
 ```bash
 python curator_views/cli.py forecast --config config.yaml \
   [--days N] [--fetch] [--today | --tomorrow] [--natural trend|target] \
-  [--set KEY=VALUE ...] [--no-volatility] [--chart [PATH]] [--json]
+  [--set KEY=VALUE ...] [--no-volatility] [--chart [PATH]] \
+  [--day-step DAYS] [--chart-only] [--json]
 ```
 
 只读推算**今天（默认）或明天起** N 天的目标浏览量、假设自然流量与刷量缺口，
@@ -999,6 +1000,12 @@ python curator_views/cli.py forecast --config config.yaml \
   无第三方依赖，相对路径基于配置文件目录），`--json` 时路径写入
   `source.chart_path`；`--chart -` 也表示控制台；`--json` + 控制台图时图表
   写入 stderr，标准输出仍是纯 JSON；
+- `--day-step DAYS`：控制输出间隔，表格与图每隔 DAYS 天显示一条/一个点，
+  默认 1（每天）。同时影响表格、控制台/HTML 图和 JSON 的 `rows`；
+  汇总与警告仍按完整预测区间计算。从首日开始取样，首尾日期始终保留；
+  若最后一天不是间隔点会额外补上，因此末尾间隔可能小于 DAYS；
+- `--chart-only`：只输出图表本身，不打印 forecast 表格、图外说明与汇总；
+  未指定 `--chart` 时自动使用控制台图，不能与 `--json` 同用；
 - `--json`：输出 `rows` / `warnings` / `summary` / `source` 完整结构；
   `source.today_boosted` 是今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 是首日扣除的已刷量，其余行恒为 0。
@@ -1098,6 +1105,12 @@ python curator_views/cli.py forecast --config config.yaml --chart reports/week.h
 
 # 显式指定控制台（等价于不带 PATH）
 python curator_views/cli.py forecast --config config.yaml --chart -
+
+# 表格与图每 7 天输出一次
+python curator_views/cli.py forecast --config config.yaml --chart --day-step 7
+
+# 只输出图，不打印 forecast 表格
+python curator_views/cli.py forecast --config config.yaml --chart-only
 ```
 
 控制台图用点状字符绘制，适合 SSH、日志和快速巡检：
@@ -1118,6 +1131,8 @@ python curator_views/cli.py forecast --config config.yaml --chart -
 - 图 2「刷量」：当日配额 vs 实际待刷；
 - 上方标注区间、数据来源、模式、基线、波动率与目标上下界；
 - 控制台宽度按终端自动适配（48~120 列），超过宽度会压缩绘图区；
+- `--day-step N` 控制表格与图的输出间隔，首尾日期保留；`--chart-only`
+  只打印图本身；
 - 两条线落在同一字符格时显示 `*`，图例里标注「重叠」。
 
 带 PATH 时生成**自包含 HTML**（内联 SVG，无外部 JS/CSS/图片），直接双击用
@@ -1824,7 +1839,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **351** 个，覆盖：
+当前测试共 **360** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1838,8 +1853,9 @@ python -m pytest tests/ -v
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
   表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；默认纳入波动率
   随机抽样、`--no-volatility` 关闭、目标区间与抖动字段；
-- forecast 折线图：控制台点状字符渲染、宽度适配、空数据、HTML/SVG 渲染、
-  目标区间带、`--chart` 控制台/写文件、`--json` 兼容与写失败报错；
+- forecast 折线图：控制台点状字符渲染、宽度适配、日期标签间隔、只输出图、
+  空数据、HTML/SVG 渲染、目标区间带、`--chart` 控制台/写文件、`--day-step`
+  首尾保留、`--json` 兼容与写失败报错；
 - `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
 - 当日已刷：只扣首日缺口、`forecast` 表格与 JSON、同日续刷、列表模式不误消费；
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`
