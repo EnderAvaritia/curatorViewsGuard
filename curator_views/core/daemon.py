@@ -7,7 +7,8 @@
   （抓取-预测-检测-提升-通知）；
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次（守护进程刚启动
   或前一天失败也不影响当天任务）；
-- 单次执行失败不退出进程：记录异常后等待下一天；
+- 执行失败不退出进程，也**不把今天标记为已完成**：按配置的间隔在当天重试
+  （retry_delay_minutes / retry_max_times），重试用尽后等明天；
 - 支持优雅退出：KeyboardInterrupt（Ctrl+C）或 SIGTERM。
 
 调度逻辑（纯函数 plan_next，便于测试）：
@@ -40,6 +41,11 @@ except ZoneInfoNotFoundError:
 
 # 分段睡眠步长（秒）：即使目标是几小时后，也定期醒来检查退出标志
 SLEEP_STEP = 30.0
+
+# 执行失败后的默认重试间隔与重试次数（可在配置里用
+# retry_delay_minutes / retry_max_times 覆盖）
+DEFAULT_RETRY_DELAY_SECONDS = 30 * 60.0
+DEFAULT_RETRY_MAX_TIMES = 3
 
 
 def parse_daily_time(daily_time: str) -> tuple[int, int]:
@@ -101,6 +107,8 @@ class Daemon:
         last_run_date_provider: 每次循环开始调用的回调，返回最新的已完成日期
             （通常查数据库）。用于覆盖「daemon 等待期间手动 run 已执行当天」
             的情况；返回值比内存中的日期新时才会采用。
+        retry_settings_provider: 每次失败时调用的回调，返回
+            ``(重试间隔秒数, 当天最多重试次数)``；默认 1800 秒 / 3 次。
     """
 
     def __init__(
@@ -113,6 +121,9 @@ class Daemon:
         state_path: Optional[str] = None,
         fallback_last_run_date: str = "",
         last_run_date_provider: Optional[Callable[[], str]] = None,
+        retry_settings_provider: Optional[
+            Callable[[], tuple[float, int]]
+        ] = None,
     ) -> None:
         self._load_daily_time = load_daily_time
         self._execute = execute
@@ -140,7 +151,32 @@ class Daemon:
         # 状态文件没记录时用数据库兜底（手动 run 也会写 last_run_date）
         if not self._last_run_date:
             self._last_run_date = fallback_last_run_date
+
+        # 旧版本在执行失败时也会把 last_run_date 记为今天，导致当天不再重试。
+        # 状态文件同时满足「今天是 last_run_date / 有错误 / 今天执行过」时，
+        # 说明今天那次是失败，按未执行处理；若数据库里确实有今天的成功记录，
+        # 循环开始时的外部同步会把它重新采用，不会重复执行。
+        today = self._now().strftime("%Y-%m-%d")
+        if (
+            self._last_run_date == today
+            and self._last_error
+            and str(self._last_run_at or "").startswith(today)
+        ):
+            logger.warning(
+                "状态文件显示今天执行失败（%s），按未执行处理，今天会重新尝试。",
+                self._last_error,
+            )
+            self._last_run_date = ""
+
         self._last_run_date_provider = last_run_date_provider
+        self._retry_settings = retry_settings_provider or (
+            lambda: (DEFAULT_RETRY_DELAY_SECONDS, DEFAULT_RETRY_MAX_TIMES)
+        )
+        # 当日重试状态：跨天自动清零；失败不写 last_run_date
+        self._attempt_date = ""
+        self._attempts_today = 0
+        self._retry_at: Optional[datetime] = None
+        self._gave_up_date = ""
 
         if install_handlers:
             self._install_signal_handlers()
@@ -250,13 +286,35 @@ class Daemon:
                     })
                     self._write_state()
 
+                today_iso = now.strftime("%Y-%m-%d")
+                # 跨天：清空当天的重试状态
+                if self._attempt_date != today_iso:
+                    self._attempt_date = today_iso
+                    self._attempts_today = 0
+                    self._retry_at = None
+                    self._gave_up_date = ""
+
                 should_run, next_wake = plan_next(now, last_run_date, daily_time)
+                if should_run and self._gave_up_date == today_iso:
+                    # 今天重试用尽：当天不再尝试，等明天
+                    should_run = False
+                    _, next_wake = plan_next(now, today_iso, daily_time)
+                elif (
+                    should_run
+                    and self._retry_at is not None
+                    and now < self._retry_at
+                ):
+                    # 距下次重试还有一段时间
+                    should_run = False
+                    next_wake = self._retry_at
+
                 next_wake_iso = next_wake.isoformat(timespec="seconds")
                 self._write_state(
                     phase="waiting",
                     daily_time=daily_time,
                     next_wake=next_wake_iso,
                     last_run_date=last_run_date,
+                    attempts_today=self._attempts_today,
                 )
 
                 if should_run:
@@ -271,35 +329,71 @@ class Daemon:
                             summary = result
                     except Exception as exc:  # noqa: BLE001 - 单次失败不退出进程
                         error = str(exc)
-                        logger.exception("每日执行失败，等待下一天继续: %s", exc)
+                        logger.exception("每日执行失败: %s", exc)
 
-                    last_run_date = self._now().strftime("%Y-%m-%d")
-                    run_at = self._now_iso()
-                    self._last_run_date = last_run_date
-                    self._last_run_at = run_at
-                    if summary is not None:
-                        self._last_summary = summary
-                    # 成功时清空上次错误；失败时记录本次异常
-                    self._last_error = error or ""
+                    if error is None:
+                        # 只有成功才推进 last_run_date，避免失败吃掉当天
+                        last_run_date = self._now().strftime("%Y-%m-%d")
+                        self._last_run_date = last_run_date
+                        self._last_run_at = self._now_iso()
+                        if summary is not None:
+                            self._last_summary = summary
+                        self._last_error = ""
+                        self._retry_at = None
+                        self._attempts_today = 0
+                    else:
+                        self._last_error = error
+                        self._attempts_today += 1
+                        delay, max_times = self._retry_settings()
+                        if delay <= 0 or self._attempts_today > max_times:
+                            self._gave_up_date = self._now().strftime("%Y-%m-%d")
+                            self._retry_at = None
+                            logger.error(
+                                "今日已失败 %d 次（重试上限 %d），放弃今天的执行；"
+                                "不会标记为已完成，可手动 run 或等明天。",
+                                self._attempts_today, max_times,
+                            )
+                        else:
+                            self._retry_at = self._now() + timedelta(seconds=delay)
+                            logger.warning(
+                                "第 %d 次失败，%s 重试（今日最多重试 %d 次）",
+                                self._attempts_today,
+                                self._retry_at.strftime("%Y-%m-%d %H:%M:%S"),
+                                max_times,
+                            )
 
                     _, next_wake = plan_next(
                         self._now(), last_run_date, daily_time,
                     )
+                    if self._retry_at is not None:
+                        next_wake = min(next_wake, self._retry_at)
                     next_wake_iso = next_wake.isoformat(timespec="seconds")
                     self._write_state(
                         phase="waiting",
                         daily_time=daily_time,
                         next_wake=next_wake_iso,
                         last_run_date=last_run_date,
-                        last_run_at=run_at,
+                        last_run_at=self._last_run_at,
                         last_summary=self._last_summary,
                         last_error=self._last_error,
+                        attempts_today=self._attempts_today,
                     )
-                    logger.info("今日任务完成，下次执行: %s", next_wake)
+                    if error is None:
+                        logger.info("今日任务完成，下次执行: %s", next_wake)
+                    else:
+                        logger.info("今日任务未完成，下次尝试: %s", next_wake)
                 else:
+                    if self._retry_at is not None:
+                        reason = (
+                            f"等待第 {self._attempts_today} 次失败后的重试"
+                        )
+                    elif self._gave_up_date == today_iso:
+                        reason = "今日重试已用尽，等待明天"
+                    else:
+                        reason = f"今日无需执行（daily_time={daily_time}）"
                     logger.info(
-                        "今日无需执行（daily_time=%s），下次执行: %s",
-                        daily_time,
+                        "%s，下次执行: %s",
+                        reason,
                         next_wake.strftime("%Y-%m-%d %H:%M:%S %Z"),
                     )
 

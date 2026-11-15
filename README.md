@@ -501,9 +501,15 @@ python curator_views/cli.py daemon --config config.yaml
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `daily_time` | `"10:00"` | daemon 每日执行时刻，格式 `HH:MM` |
+| `retry_delay_minutes` | `30` | 执行失败后当天重试的间隔（分钟），`0` 表示不重试 |
+| `retry_max_times` | `3` | 当天最多重试次数（不含首次执行），用尽后等第二天 |
 
-`daemon` 每次循环都会重新加载配置文件，修改任意配置（含执行时间）无需重启。
+`daemon` 每次循环都会重新加载配置文件，修改任意配置（含执行时间、重试参数）无需重启。
 时间非法时回退到 10:00 并记录警告。
+
+执行失败（网络、Cookie 失效、抓取异常等）**不会**把当天标记为已完成：daemon 会按
+`retry_delay_minutes` 间隔在当天重试，`retry_max_times` 次仍失败才放弃当天。
+放弃后也不会写 `last_run_date`，因此可以随时手动 `run` 补跑，或等第二天自动执行。
 
 ### 7.4 预测参数
 
@@ -625,6 +631,8 @@ ntfy_topic: ""
 boost_enabled: true
 
 daily_time: "10:00"
+retry_delay_minutes: 30
+retry_max_times: 3
 
 window_days: 14
 trend_cap: 0.15
@@ -745,7 +753,10 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 
 - 启动时若今天尚未执行且已过 `daily_time`，立即补跑一次；
 - 每轮循环重新加载配置，修改配置或执行时间无需重启；**修改 Python 代码后必须重启进程**；
-- 单次执行失败不退出进程，记录日志后等待下一天；
+- 执行失败不退出进程，并**不把当天标记为已完成**：按 `retry_delay_minutes`
+  在当天重试，最多 `retry_max_times` 次；用尽后等第二天，之后仍可手动 `run` 补跑；
+- 统计 Cookie 失效会单独告警（ntfy 或日志），重新 `login` 覆盖 Cookie 文件后，
+  下一次重试会自动读取新文件，**不需要重启 daemon**；
 - 同一天不重复执行：`last_run_date` 同时写入数据库与 `daemon_state.json`
   （`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
 - Ctrl+C（SIGINT）立即中断当前执行并退出；SIGTERM 优雅收尾后退出；
@@ -1084,7 +1095,7 @@ target_min: 1000   # 目标不低于 1000，跌破时按下限补量
 python curator_views/cli.py daemon --config config.yaml
 ```
 
-配置热重载、同日去重、失败不退出、优雅退出。适合长期常驻。
+配置热重载、同日去重、失败当天重试、优雅退出。适合长期常驻。
 
 systemd 服务示例：
 
@@ -1290,7 +1301,14 @@ CLI 只警告不退出。统计后台通常需要登录，因此 `run` / `check`
 ### 12.2 Cookie 失效 / 抓取报“未找到 g_StatsAppViews”
 
 症状：`admin/overview` 被重定向到公开 curator 页，fetcher 提示
-“请求被重定向到公开页面（可能 Cookie 已失效或未登录）”。
+“统计页被重定向到公开页面（Cookie 已失效或未登录）”，或返回 HTTP 401/403。
+
+`daemon` 的处理方式：
+
+- 把这类错误与普通网络/解析错误区分开（`StatsAuthError`），**不把当天标记为已完成**；
+- 推送一条 `error` 级通知（未配置 ntfy 时写入日志），正文直接给出重新登录命令；
+- 按 `retry_delay_minutes` 在当天重试。你重新 `login` 覆盖 Cookie 文件后，
+  下一次重试会自动读取新文件，无需重启 daemon。
 
 解决：
 
@@ -1298,6 +1316,8 @@ CLI 只警告不退出。统计后台通常需要登录，因此 `run` / `check`
 python curator_views/cli.py login --config config.yaml --validate-only
 python curator_views/cli.py login --config config.yaml
 ```
+
+`run`、`check`、`forecast --fetch` 遇到同样的错误会直接提示登录命令并以 1 退出。
 
 ### 12.3 启动后头几天为什么不刷量
 
@@ -1416,6 +1436,24 @@ boost_list_file: "boost_plan.txt"
 排查“`forecast` 显示的数据比 `check` 旧”时，现在跑一次 `check` 即可对齐，不必等
 下一次 `run`。
 
+### 13.7 daemon 失败当天重试，不再吃掉当天
+
+旧版本在执行失败时也会把 `last_run_date` 记为今天，导致“10:00 失败一次，当天再也
+不跑”，且重启 daemon 也无效。
+
+现在：
+
+- 只有执行成功才推进 `last_run_date`；
+- 失败后按 `retry_delay_minutes`（默认 30 分钟）在当天重试，最多
+  `retry_max_times`（默认 3 次）；
+- 重试用尽也不写 `last_run_date`，可随时手动 `run` 补跑；
+- 状态文件里“今天已执行 + 有错误 + 今天执行过”的旧记录会在启动时自动纠正为
+  未执行（若数据库里确实有今天的成功记录，外部同步会重新采用，不会重复执行）；
+- 统计 Cookie 失效单独归为 `StatsAuthError`，推送可操作告警；重新 `login` 后，
+  下一次重试自动生效，无需重启 daemon。
+
+新增配置键都有默认值，旧配置无需修改。
+
 ---
 
 ## 14. 安全与合规
@@ -1438,7 +1476,7 @@ boost_list_file: "boost_plan.txt"
 python -m pytest tests/ -v
 ```
 
-当前测试共 **222** 个，覆盖：
+当前测试共 **233** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1450,7 +1488,9 @@ python -m pytest tests/ -v
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
   表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；
 - `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
-- daemon 的 plan_next、同日去重、状态与 info 输出。
+- `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`
+  的重新登录提示、Cookie 失效告警；
+- daemon 的 plan_next、同日去重、失败当天重试与重试用尽、旧状态纠正、状态与 info 输出。
 
 测试目录：
 
@@ -1460,11 +1500,13 @@ tests/
 ├── test_anti_cheat.py
 ├── test_booster.py
 ├── test_cli_check.py
+├── test_cli_cookie.py
 ├── test_cli_info.py
 ├── test_cli_logging.py
 ├── test_convergence.py
 ├── test_cookie_optional.py
 ├── test_daemon.py
+├── test_fetcher.py
 ├── test_forecast.py
 ├── test_login.py
 ├── test_predictor.py

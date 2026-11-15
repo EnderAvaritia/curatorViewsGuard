@@ -60,6 +60,7 @@ from curator_views.core.forecast import forecast_days  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
     CookieFileError,
     Fetcher,
+    StatsAuthError,
     extract_cookie,
     validate_cookie_header,
 )
@@ -142,6 +143,12 @@ boost_enabled: true
 # 本配置文件——修改此处或任意配置均无需重启进程。
 # 白话：每天几点跑，改这里就行，daemon 不用重启。
 daily_time: "10:00"
+
+# 执行失败后当天重试的间隔（分钟）与最多重试次数（不含首次执行）。
+# 失败不会把当天标记为已完成：重试用尽后等第二天，也可随时手动 run。
+# 白话：10:00 失败后隔 30 分钟再试，最多再试 3 次；修好 Cookie 后会自动接上。
+retry_delay_minutes: 30
+retry_max_times: 3
 
 # ── 预测参数 ──────────────────────────────────────────────────────────────
 
@@ -530,15 +537,27 @@ def _execute_daily(
 
     sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run, cfg_dir)
     executor_cmd = str(cfg.get("executor_cmd", "") or "")
-    return run_daily(
-        storage,
-        fetcher,
-        notifier,
-        booster,
-        sched_cfg,
-        executor_cmd=executor_cmd,
-        config_path=config_path,
-    )
+    try:
+        return run_daily(
+            storage,
+            fetcher,
+            notifier,
+            booster,
+            sched_cfg,
+            executor_cmd=executor_cmd,
+            config_path=config_path,
+        )
+    except StatsAuthError as exc:
+        # Cookie 失效是可人工修复的问题：立刻推送一条可操作的告警，
+        # 然后交给 daemon 的重试机制（重试时 Fetcher 会重新读取 Cookie 文件）。
+        notifier.send(
+            "统计 Cookie 失效，今日执行失败",
+            f"{exc}\n\n"
+            f"处理：python curator_views/cli.py login --config {config_path}\n"
+            "重新登录后无需重启 daemon，下一次重试会自动读取新的 Cookie 文件。",
+            level="error",
+        )
+        raise
 
 
 def _setup_logging(
@@ -649,12 +668,26 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         )
         return summary
 
+    def load_retry_settings() -> tuple[float, int]:
+        """每次失败后重载重试参数：改配置无需重启 daemon。"""
+        cfg = _load_config(config_path)
+        try:
+            delay_minutes = float(cfg.get("retry_delay_minutes", 30) or 0)
+        except (TypeError, ValueError):
+            delay_minutes = 30.0
+        try:
+            max_times = int(cfg.get("retry_max_times", 3) or 0)
+        except (TypeError, ValueError):
+            max_times = 3
+        return max(0.0, delay_minutes * 60.0), max(0, max_times)
+
     state_path = status.default_state_path(db_path)
     daemon = Daemon(
         load_daily_time,
         execute_once,
         state_path=state_path,
         last_run_date_provider=read_db_last_run_date,
+        retry_settings_provider=load_retry_settings,
     )
     try:
         daemon.run_forever()
@@ -850,7 +883,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     _check_cookie_file(cookie_file, "统计 Cookie")
 
     fetcher = Fetcher(clan_id, cookie_file, proxy)
-    history = fetcher.fetch_stats()
+    try:
+        history = fetcher.fetch_stats()
+    except StatsAuthError as exc:
+        _print_error(str(exc))
+        _print_error(
+            "提示: 运行 `python curator_views/cli.py login --config "
+            f"{args.config}` 重新登录后再试。"
+        )
+        return 1
     history = sorted(history, key=lambda entry: entry["date_ts"])
 
     print(f"共获取到 {len(history)} 天的统计数据。")
@@ -1327,7 +1368,15 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             return 1
         cookie_file, _boost_cookie = _resolve_cookie_paths(cfg, cfg_dir)
         fetcher = Fetcher(clan_id, cookie_file, cfg.get("proxy") or None)
-        fetched = fetcher.fetch_stats()
+        try:
+            fetched = fetcher.fetch_stats()
+        except StatsAuthError as exc:
+            _print_error(str(exc))
+            _print_error(
+                "提示: 运行 `python curator_views/cli.py login --config "
+                f"{args.config}` 重新登录后再试，或去掉 --fetch 只用本地库。"
+            )
+            return 1
         merged = {
             int(item["date_ts"]): int(item["num_views"]) for item in history
         }

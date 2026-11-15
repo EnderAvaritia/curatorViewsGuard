@@ -10,7 +10,7 @@ import os
 import signal
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -306,7 +306,113 @@ class TestDaemonState:
         state = status.read_state(str(state_path))
         assert state is not None
         assert state["last_error"] == "模拟执行失败"
+        # 失败不推进 last_run_date：当天仍算未完成，可重试/可手动补跑
+        assert state["last_run_date"] == ""
+        assert state["attempts_today"] == 1
+        # 默认 30 分钟后重试
+        assert state["next_wake"] == "2026-01-01T10:30:00+08:00"
+
+    def test_retries_after_delay_then_succeeds(self, tmp_path):
+        state_path = tmp_path / "daemon_state.json"
+        clock = {"now": dt(10, 0)}
+        calls = []
+        daemon = None
+
+        def execute():
+            calls.append(clock["now"])
+            if len(calls) == 1:
+                raise RuntimeError("统计页被重定向到公开页面")
+            daemon.stop()
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        daemon = Daemon(
+            lambda: "10:00", execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            state_path=str(state_path),
+            retry_settings_provider=lambda: (1800.0, 3),
+        )
+        daemon.run_forever()
+
+        assert len(calls) == 2
+        assert calls[1] - calls[0] >= timedelta(minutes=30)
+        state = status.read_state(str(state_path))
+        assert state is not None
         assert state["last_run_date"] == "2026-01-01"
+        assert state["last_error"] == ""
+        assert state["attempts_today"] == 0
+
+    def test_gives_up_after_max_retries_without_marking_done(self, tmp_path):
+        state_path = tmp_path / "daemon_state.json"
+        clock = {"now": dt(10, 0)}
+        calls = []
+        daemon = None
+
+        def execute():
+            calls.append(1)
+            raise RuntimeError("模拟执行失败")
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+            if clock["now"] >= dt(12, 0):
+                daemon.stop()
+
+        daemon = Daemon(
+            lambda: "10:00", execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            state_path=str(state_path),
+            retry_settings_provider=lambda: (600.0, 2),
+        )
+        daemon.run_forever()
+
+        assert len(calls) == 3  # 首次 + 2 次重试
+        state = status.read_state(str(state_path))
+        assert state is not None
+        assert state["last_error"] == "模拟执行失败"
+        assert state["last_run_date"] == ""
+        assert state["attempts_today"] == 3
+
+    def test_restart_retries_day_that_failed_in_old_state(self, tmp_path):
+        # 旧版本把失败日写进 last_run_date；新版本启动时应纠正并重试
+        state_path = tmp_path / "daemon_state.json"
+        status.write_state(
+            str(state_path),
+            {
+                "pid": 1,
+                "phase": "waiting",
+                "started_at": "2026-01-01T09:00:00+08:00",
+                "updated_at": "2026-01-01T10:01:00+08:00",
+                "last_run_date": "2026-01-01",
+                "last_run_at": "2026-01-01T10:01:00+08:00",
+                "last_summary": None,
+                "last_error": "统计页被重定向到公开页面",
+            },
+        )
+        calls = []
+        daemon = None
+
+        def execute():
+            calls.append(1)
+            daemon.stop()
+
+        def sleeper(secs):
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: "10:00", execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: dt(11, 0),
+            state_path=str(state_path),
+        )
+        daemon.run_forever()
+
+        assert calls == [1]
+        state = status.read_state(str(state_path))
+        assert state["last_run_date"] == "2026-01-01"
+        assert state["last_error"] == ""
 
 
 class TestStopResponsiveness:

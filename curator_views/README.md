@@ -29,6 +29,8 @@
 - 调度器/执行器分离：默认同进程直调 Booster，也可配置 `executor_cmd` 以独立
   子进程方式唤起执行器刷量（调度器崩了不影响执行器，执行器可被手动单独触发）；
 - 每日完整流程：抓取统计 -> 入库 -> 预测 -> 溢出检测 -> 计算缺口 -> 提升 -> 通知；
+- 失败当天重试：daemon 执行失败不标记当天完成，按间隔重试；统计 Cookie 失效会
+  单独告警，重新登录后下一次重试自动生效，无需重启进程；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
 - 巡检与数据导出：`check` 抓取统计并写入本地库，随时查看最近 7 天与预测摘要，
   或导出历史统计数据。
@@ -95,7 +97,10 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 ```
 
 - 启动时若今天尚未执行且已过执行时刻，立即补跑一次；
-- 单次执行失败不退出进程，记录日志后等待下一天；
+- 执行失败不退出进程，也**不把当天标记为已完成**：按 `retry_delay_minutes`
+  在当天重试，最多 `retry_max_times` 次；用尽后等第二天，随时可手动 `run` 补跑；
+- 统计 Cookie 失效（重定向到公开页 / 401 / 403）会推送 `error` 级告警；
+  重新 `login` 覆盖 Cookie 文件后，下一次重试自动读取新文件，无需重启 daemon；
 - **同一天不重复执行**：`run_daily` 会把 `last_run_date` 写进数据库，daemon
   每轮到点前会核对它，因此手动 `run` 与 daemon 谁先执行都算当天已完成；
 - 前台运行时 INFO 日志同时输出到控制台（启动即打印日志路径与下次执行时间），
@@ -142,6 +147,10 @@ python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no
 - `--dry-run`：演练模式，计算一切但实际不发送提升请求，也不发简报、不写库
   （统计 / 状态 / `last_run_date` / growth 锚点），不会把当天标记为已执行；
 - `--boost`：强制启用提升；`--no-boost`：强制关闭提升（优先于配置）。
+
+统计 Cookie 失效（重定向到公开页 / 401 / 403）时，`run` 会推送一条可操作的告警
+并以 1 退出；`check` / `forecast --fetch` 会提示重新登录命令。重新登录方式见主
+README 的 [12.2 Cookie 失效](../README.md#122-cookie-失效--抓取报未找到-g_statsappviews)。
 
 ### 调度器 / 执行器分离
 
@@ -325,6 +334,8 @@ python curator_views/cli.py version
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
 | `daily_time` | `"10:00"` | daemon 模式的每日执行时刻（Asia/Shanghai，HH:MM） |
+| `retry_delay_minutes` | `30` | 执行失败后当天重试的间隔（分钟），`0` 表示不重试 |
+| `retry_max_times` | `3` | 当天最多重试次数（不含首次执行），用尽后等第二天 |
 | `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
 | `boost_list_file` | （空） | 每日刷量列表文件路径；非空时一行一个刷量数，每天消费首行，成功刷完后删除该行 |
 | `window_days` | `14` | 中位数计算窗口（天数） |

@@ -37,6 +37,14 @@ class CookieFileError(RuntimeError):
     """Cookie 文件内容不可用（非 UTF-8，或含无法放入 HTTP 头的字符）。"""
 
 
+class StatsAuthError(RuntimeError):
+    """统计页被重定向到公开页或返回 401/403：Cookie 缺失、失效或权限不足。
+
+    与普通 ``RuntimeError`` 区分，便于 daemon 判断是否值得在当天重试，
+    以及在通知里直接给出“重新 login”的操作提示。
+    """
+
+
 # 行首的 "Cookie:" 前缀（大小写不敏感）
 _COOKIE_PREFIX_RE = re.compile(r"^\s*cookie\s*:\s*", re.I)
 # 请求头块中的 Cookie 行；同一段文本有多行时取最后一条
@@ -256,12 +264,18 @@ class Fetcher:
             ``date_ts`` 为 Unix 时间戳。
 
         Raises:
+            StatsAuthError: 未登录 / Cookie 失效 / 无权限（401、403 或重定向）。
             RuntimeError: HTTP 状态非 200，或页面中未找到 /
                 无法解析 g_StatsAppViews 数据。
         """
         url = STATS_URL.format(clan_id=self._clan_id)
         response = self._session.get(url, timeout=self._timeout)
         if response.status_code != 200:
+            if response.status_code in (401, 403):
+                raise StatsAuthError(
+                    f"获取浏览量统计失败：HTTP {response.status_code}"
+                    "（Cookie 已失效或权限不足）"
+                )
             raise RuntimeError(
                 f"获取浏览量统计失败：HTTP {response.status_code}"
             )
@@ -269,14 +283,11 @@ class Fetcher:
         if match is None:
             # 区分“未登录/重定向到公开页”与“页面结构改变”
             if response.url != url or "/admin/" not in response.url:
-                hint = (
-                    "请求被重定向到公开页面（可能 Cookie 已失效或未登录），"
-                    "请更新 cookie.txt 中的 Steam 登录 Cookie"
+                raise StatsAuthError(
+                    "统计页被重定向到公开页面（Cookie 已失效或未登录）"
                 )
-            else:
-                hint = "可能未登录或页面结构已改变"
             raise RuntimeError(
-                "页面中未找到 g_StatsAppViews 数据，" + hint
+                "页面中未找到 g_StatsAppViews 数据，可能未登录或页面结构已改变"
             )
         try:
             raw_stats = json.loads(match.group(1))
