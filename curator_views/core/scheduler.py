@@ -452,6 +452,29 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
     return "\n".join(lines)
 
 
+def _last_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """从执行器 stdout 中提取最后一个合法的 JSON 对象。
+
+    执行器可能把结果打印成单行 JSON，也可能用 ``indent=2`` 打印成多行，
+    还可能在 JSON 前后夹带日志。这里用 ``raw_decode`` 逐个 ``{`` 尝试解析，
+    解析成功后跳过该对象内部（避免把嵌套 dict 当成候选），保留最后出现的
+    最外层对象。没有可解析对象时返回 ``None``。
+    """
+    decoder = json.JSONDecoder()
+    last: Optional[Dict[str, Any]] = None
+    index = text.find("{")
+    while index != -1:
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)
+            continue
+        if isinstance(obj, dict):
+            last = obj
+        index = end
+    return last
+
+
 def _run_executor(
     executor_cmd: str,
     need: int,
@@ -468,7 +491,8 @@ def _run_executor(
     - 执行器可被手动单独触发（如 ``cli.py boost --target N``）。
 
     命令模板支持占位符：{need} / {apps} / {config}。
-    执行器应以 JSON 输出 ``{"boosted": N, ...}``。
+    执行器应以 JSON 输出 ``{"boosted": N, ...}``；单行、缩进多行以及
+    前后夹带日志都可以，调度器取 stdout 中最后一个 JSON 对象。
 
     Returns:
         执行结果摘要：{"boosted": int, "ok": bool, "cmd": str, "stderr": str}
@@ -523,14 +547,20 @@ def _run_executor(
         }
 
     boosted = 0
-    try:
-        payload = json.loads(proc.stdout.strip().splitlines()[-1])
-        boosted = int(payload.get("boosted", 0))
-    except (json.JSONDecodeError, ValueError, IndexError):
+    payload = _last_json_object(proc.stdout)
+    if payload is None:
         logger.warning(
             "无法解析执行器 JSON 输出，按 0 处理。输出尾部: %s",
             proc.stdout.strip()[-200:],
         )
+    else:
+        try:
+            boosted = int(payload.get("boosted", 0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "执行器 JSON 的 boosted 字段无效（%r），按 0 处理。",
+                payload.get("boosted"),
+            )
     return {"boosted": boosted, "ok": True, "cmd": cmd_text, "stderr": ""}
 
 

@@ -78,6 +78,68 @@ class TestRunExecutor:
         assert result["ok"] is True
         assert result["boosted"] == 42
 
+    def test_parses_pretty_printed_multiline_json(self, tmp_path):
+        # 真实 CLI 用 indent=2 打印多行 JSON，最后一行是 "}"，不能只取最后一行
+        mini = tmp_path / "cv_mini_exec_pretty.py"
+        mini.write_text(
+            "import json; print(json.dumps({'boosted': 42}, indent=2))\n",
+            encoding="utf-8",
+        )
+        result = _run_executor(
+            sys.executable + " " + str(mini),
+            need=100,
+            boost_n=5,
+            dry_run=False,
+        )
+        assert result["ok"] is True
+        assert result["boosted"] == 42
+
+    def test_parses_json_with_logs_around_it(self, tmp_path):
+        mini = tmp_path / "cv_mini_exec_logs.py"
+        mini.write_text(
+            "import json\n"
+            "print('starting executor')\n"
+            "print(json.dumps({'boosted': 7}, indent=2))\n"
+            "print('done')\n",
+            encoding="utf-8",
+        )
+        result = _run_executor(
+            sys.executable + " " + str(mini),
+            need=100,
+            boost_n=5,
+            dry_run=False,
+        )
+        assert result["ok"] is True
+        assert result["boosted"] == 7
+
+    def test_nested_object_does_not_shadow_top_level(self, tmp_path):
+        mini = tmp_path / "cv_mini_exec_nested.py"
+        mini.write_text(
+            "import json\n"
+            "print(json.dumps({'boosted': 11, 'meta': {'boosted': 999}}, indent=2))\n",
+            encoding="utf-8",
+        )
+        result = _run_executor(
+            sys.executable + " " + str(mini),
+            need=100,
+            boost_n=5,
+            dry_run=False,
+        )
+        assert result["ok"] is True
+        assert result["boosted"] == 11
+
+    def test_unparsable_stdout_falls_back_to_zero(self, tmp_path):
+        mini = tmp_path / "cv_mini_exec_text.py"
+        mini.write_text("print('no json here')\n", encoding="utf-8")
+        result = _run_executor(
+            sys.executable + " " + str(mini),
+            need=100,
+            boost_n=5,
+            dry_run=False,
+        )
+        assert result["ok"] is True
+        assert result["boosted"] == 0
+
     def test_nonzero_exit_returns_failure(self):
         # python -c 返回非零退出码
         cmd = sys.executable + ' -c "import sys; sys.exit(3)"'
