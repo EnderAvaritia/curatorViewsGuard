@@ -396,7 +396,8 @@ python curator_views/cli.py version
 `boost_n` / `batch_size` 限制；单日吞吐上限 ≈
 `min(threads, MAX_WORKERS, boost_n, batch_size) × 86400 / max(wait_min, wait_max)`
 （未计请求耗时）。`forecast` 会用 `throughput_capacity` 警告提示“一天跑不满”的
-配置，`run` 也会记录警告并在简报中提示。
+配置，`run` 也会记录警告并在简报中提示。需要更高上限时改 `booster.py` 里的
+`MAX_WORKERS`（唯一生效点，吞吐估算自动跟随），代价是并发更高、更像机器行为。
 
 ### 预测参数里的“斜率”是什么
 

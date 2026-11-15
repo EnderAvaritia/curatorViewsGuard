@@ -670,6 +670,11 @@ max(wait_min, wait_max)`（未计请求耗时）。`forecast` 在缺口超过该
 是 `booster.py` 里的模块常量（默认 8），`threads` 超过它按它计算；并发还受
 推荐数 `boost_n` 与批次大小 `batch_size` 限制。
 
+需要更高并发时改 `curator_views/core/booster.py` 的 `MAX_WORKERS` 常量，这是唯一
+生效点（`forecast` / `run` 的吞吐估算共用它）。代价是同一秒打到 Steam 的请求更多、
+更接近机器行为，且 `threads > 1` 时中止判定按“批内失败总数”累计，不如顺序模式
+精确；详见 [12.11](#1211-并发线程数最高能到多少)。
+
 单轮容量 `boost_n × single_cap` 是另一条硬限制：缺口超过它时 `run` 同样会给出
 `capacity_warning`（“本轮跑不满”），稍后再次 `run` 会按当日已刷扣减后继续补剩余。
 
@@ -1497,6 +1502,25 @@ need = max(0, 今日目标 - 昨日自然流量 - 溢出扣减 - 今日已刷)
 `run` 之后删除 `daemon_state.json`（或全新启动 daemon），更早的时段会被当成已完成，
 当天某个从未执行过的早期时段就不会再补跑；需要时手动 `run` 一次，或等第二天。
 
+### 12.11 并发线程数最高能到多少
+
+实现上限由 `curator_views/core/booster.py` 的模块常量 `MAX_WORKERS` 决定（默认
+8）。实际并发还要被 `boost_n`、`batch_size` 与批内活跃推荐数再压一层：
+
+```
+实际并发 = min(threads, MAX_WORKERS, boost_n, batch_size, 批内活跃 app 数)
+```
+
+- `threads <= 1` 走顺序执行，不开线程池，计数最确定；
+- `threads` 配得比 `MAX_WORKERS` 大不会报错，但会被静默截断到上限；
+- 同一个游戏在同一批里只访问一次，所以并发数不会超过可用推荐条数（`boost_n: 1`
+  时 `threads` 配多少实际都是 1）；
+- 想再提高上限：改 `booster.py` 里的 `MAX_WORKERS`，这是唯一生效点，`forecast`
+  与 `run` 的吞吐估算会自动跟随；
+- 提高上限的代价：同一秒并发请求更多、更接近机器行为；且并发模式下连续失败按
+  “批内失败总数”累计，中止判定不如顺序模式精确。除非单日吞吐确实不够，否则
+  保持 `threads: 1`。
+
 ---
 
 ## 13. 升级与迁移
@@ -1667,7 +1691,8 @@ python -m pytest tests/ -v
 - 通知的级别过滤、每日简报开关、静默时段区间解析（含跨午夜）与队列补发（FIFO、
   失败保留、上限裁剪）、daemon 补发回调与 dry-run 不补发；
 - 配置默认值：缺键回退模板默认值、用户值覆盖、`null` 视为未写、显式空串保留、
-  模板与默认值字典同源一致性。
+  模板与默认值字典同源一致性；
+- 并发上限：线程池大小被 `MAX_WORKERS` 截断、`threads` 未超上限时原样生效。
 
 测试目录：
 

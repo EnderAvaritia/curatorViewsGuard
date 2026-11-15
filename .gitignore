@@ -19,6 +19,9 @@ daemon_state.json
 views_history.json
 notify_queue.json
 
+# 本地规划 / 工作文件目录
+.omo/
+
 # 系统
 .DS_Store
 Thumbs.db
