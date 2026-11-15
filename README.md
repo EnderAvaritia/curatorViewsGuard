@@ -367,9 +367,7 @@ CuratorViewsGuard/
 ├── tests/                   # pytest 测试
 └── curator_views/
     ├── cli.py               # 命令行入口与命令实现
-    ├── config.yaml          # 示例配置（与 init-config 模板一致）
     ├── README.md            # 子系统速查
-    ├── requirements.txt     # 依赖清单副本（与根目录一致）
     └── core/
         ├── fetcher.py       # 抓取 g_StatsAppViews 与推荐列表
         ├── login.py         # Playwright 半自动登录，导出/校验 Cookie
