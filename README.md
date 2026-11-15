@@ -56,7 +56,7 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 ### 1.3 运行形态
 
 - 单机 CLI：`python curator_views/cli.py <command> --config config.yaml`
-- 常驻守护进程：`daemon` 子命令每天定时执行一次完整流程
+- 常驻守护进程：`daemon` 子命令按配置的时刻执行完整流程，`daily_times` 可配置一天多个时段
 - 也可交给 systemd timer、cron 或 Windows 任务计划程序定时调用 `run`
 
 ---
@@ -90,7 +90,7 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 `run` 与 `daemon` 的每日执行都走同一条闭环：
 
 ```
-                        每日到点（默认 10:00 Asia/Shanghai）
+                        每日到点（默认 10:00；可配置多个时段 daily_times，如 10:00 / 20:00）
                                       │
                                       ▼
                      抓取 g_StatsAppViews 并写入 daily_stats
@@ -509,16 +509,20 @@ python curator_views/cli.py daemon --config config.yaml
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `daily_time` | `"10:00"` | daemon 每日执行时刻，格式 `HH:MM` |
-| `retry_delay_minutes` | `30` | 执行失败后当天重试的间隔（分钟），`0` 表示不重试 |
-| `retry_max_times` | `3` | 当天最多重试次数（不含首次执行），用尽后等第二天 |
+| `daily_times` | `[]` | 每日执行时刻列表，如 `["10:00", "20:00"]`；非空时优先于 `daily_time`；每个时段执行一次完整流程，后一时段按当日已刷补剩余缺口 |
+| `daily_time` | `"10:00"` | 单时刻回退配置，`daily_times` 为空时生效；格式 `HH:MM` |
+| `retry_delay_minutes` | `30` | 每个时段执行失败后的重试间隔（分钟），`0` 表示该时段内不重试 |
+| `retry_max_times` | `3` | 每个时段最多重试次数（不含首次执行），用尽后放弃该时段 |
 
 `daemon` 每次循环都会重新加载配置文件，修改任意配置（含执行时间、重试参数）无需重启。
-时间非法时回退到 10:00 并记录警告。
+`daily_times` 接受列表，也接受逗号或空格分隔的字符串；非法条目跳过并记录警告。
+`daily_times` 为空（或未配置）时回退到 `daily_time`；完全解析不出有效时刻时回退到
+`10:00` 并记录警告。
 
-执行失败（网络、Cookie 失效、抓取异常等）**不会**把当天标记为已完成：daemon 会按
-`retry_delay_minutes` 间隔在当天重试，`retry_max_times` 次仍失败才放弃当天。
-放弃后也不会写 `last_run_date`，因此可以随时手动 `run` 补跑，或等第二天自动执行。
+执行失败（网络、Cookie 失效、抓取异常等）**不会**把该时段标记为已完成：daemon 会按
+`retry_delay_minutes` 间隔在该时段内重试，`retry_max_times` 次仍失败才放弃该时段。
+放弃后也不会写 `last_run_slot`，因此可以随时手动 `run` 补跑，或等下一个时段/第二天
+自动执行。一天多个时段时，各时段独立重试，某时段重试用尽不会阻塞当天后续时段。
 
 ### 7.4 预测参数
 
@@ -642,6 +646,7 @@ ntfy_url: ""
 ntfy_topic: ""
 boost_enabled: true
 
+daily_times: []
 daily_time: "10:00"
 retry_delay_minutes: 30
 retry_max_times: 3
@@ -724,7 +729,7 @@ x = 日期序号（最近 N 天，N = window_days × 2，默认 28 天）
 | 命令 | 作用 |
 | --- | --- |
 | `run` | 每日完整流程（抓取 → 预测 → 检测 → 提升 → 通知） |
-| `daemon` | 常驻运行，每天到点执行每日流程（配置热重载） |
+| `daemon` | 常驻运行，按配置时刻执行每日流程（`daily_times` 支持多时段，配置热重载） |
 | `info` | 查看守护进程状态与本地数据概况（离线只读） |
 | `check` | 抓取统计并写入本地库，打印最近 7 天与预测摘要（`--no-write` 只读） |
 | `forecast` | 只读推算今天/明天起 N 天的目标 / 假设自然流量 / 缺口 |
@@ -767,14 +772,24 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 
 行为要点：
 
-- 启动时若今天尚未执行且已过 `daily_time`，立即补跑一次；
+- 启动时若今天尚有未执行的时段且已过其时刻，立即补跑这些剩余时段；
 - 每轮循环重新加载配置，修改配置或执行时间无需重启；**修改 Python 代码后必须重启进程**；
-- 执行失败不退出进程，并**不把当天标记为已完成**：按 `retry_delay_minutes`
-  在当天重试，最多 `retry_max_times` 次；用尽后等第二天，之后仍可手动 `run` 补跑；
+- 执行失败不退出进程，并**不把该时段标记为已完成**：按 `retry_delay_minutes`
+  在该时段内重试，最多 `retry_max_times` 次；用尽后放弃该时段，当天后续时段照常
+  执行，之后仍可手动 `run` 补跑（单时段时等同于等第二天）；
+- 时段级去重：`daemon_state.json` 用 `last_run_slot`（`YYYY-MM-DD#HH:MM`）记录最近
+  完成的时段，重启后当天只补跑尚未完成的时段；
+- 每个时段执行完整流程（抓取 → 预测 → 检测 → 提升 → 通知）。后一时段按
+  `need = max(0, 目标 − 昨日自然流量 − 溢出扣减 − 今日已刷)` 自动只补剩余缺口，
+  因此第二时段通常比首轮短；
+- 手动 `run` 只写日期级 `last_run_date`，daemon 视“此刻之前的所有时段”已完成，
+  之后的时段仍会执行以补足缺口；
+- 时段串行执行：上一时段的提升还没结束时，下一时段会等它结束后再开始（不并发），
+  所以不要把时段安排得太密；
 - 统计 Cookie 失效会单独告警（ntfy 或日志），重新 `login` 覆盖 Cookie 文件后，
   下一次重试会自动读取新文件，**不需要重启 daemon**；
-- 同一天不重复执行：`last_run_date` 同时写入数据库与 `daemon_state.json`
-  （`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
+- 同一时段不重复执行：`last_run_slot` 写入 `daemon_state.json`，`last_run_date`
+  同时写入数据库与状态文件（`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
 - Ctrl+C（SIGINT）立即中断当前执行并退出；SIGTERM 优雅收尾后退出；
 - 前台运行时 INFO 日志同时输出到控制台。
 
@@ -1118,7 +1133,7 @@ target_min: 1000   # 目标不低于 1000，跌破时按下限补量
 python curator_views/cli.py daemon --config config.yaml
 ```
 
-配置热重载、同日去重、失败当天重试、优雅退出。适合长期常驻。
+配置热重载、时段级去重、失败重试、优雅退出。适合长期常驻。
 
 systemd 服务示例：
 
@@ -1204,10 +1219,12 @@ python curator_views/cli.py info --config config.yaml
 
 注意事项：
 
-- **改配置不用重启**：daemon 每轮热加载配置（含 `daily_time`）；
+- **改配置不用重启**：daemon 每轮热加载配置（含 `daily_times` / `daily_time`）；
 - **改代码必须重启**：进程里仍是旧模块，重启后才加载新代码；
-- **重启不会重复刷**：`last_run_date` 做同日去重。今天已跑过 → 重启后等明天；
-  今天没跑且已过 `daily_time` → 启动时立即补跑一次；
+- **重启不会重复刷**：`last_run_slot` 做时段级去重。当天已完成到当前时刻的时段 →
+  重启后等下一个时段；尚有未完成时段且已过其时刻 → 启动时立即补跑；
+- **多个时段串行执行**：上一时段提升未结束时下一时段会等待，单轮刷量耗时较长时
+  （如 1,500 次请求、8~16 秒间隔，一轮约 5 小时）不要把时段排得太密；
 - **信号语义**：SIGTERM 优雅退出（等在途任务收尾），SIGINT 立即中断；
 - **systemd `Restart=always`**：不要用 `kill` 测试停止，会被自动拉起；请用
   `systemctl restart/stop`。
@@ -1283,7 +1300,8 @@ sudo systemctl enable --now curator-views.timer
 
 - `program_start`：程序启动日，过滤更早历史；
 - `last_stats_date`：最近一次抓取的统计日期与天数；
-- `last_run_date`：最近一次完成每日流程的日期（同日去重）；
+- `last_run_date`：最近一次完成每日流程的日期（日期级标记；daemon 时段去重另见
+  状态文件的 `last_run_slot`）；
 - `growth_rate` / `growth_start`：growth 速率锚点。
 
 ### 11.2 日志
@@ -1297,11 +1315,14 @@ sudo systemctl enable --now curator-views.timer
 `daemon_state.json` 写在数据库同级目录，包含：
 
 - `pid`、`started_at`、`phase`、`updated_at`；
-- `last_run_date`、`last_run_at`、`last_summary`、`last_error`；
+- `last_run_date`、`last_run_slot`（最近完成的时段 `YYYY-MM-DD#HH:MM`）、
+  `last_run_at`、`last_summary`、`last_error`；
+- `daily_times`、`attempts_today`（当前时段已失败次数）；
 - `next_wake`。
 
-`info` 读取该文件；数据库里的 `last_run_date` 也会被 daemon 每轮核对，因此手动
-`run` 与 daemon 谁先执行，当天都只跑一次。
+`info` 读取该文件；数据库里的 `last_run_date` 也会被 daemon 每轮核对，手动 `run`
+只写日期级 `last_run_date`，daemon 视为“此刻之前的时段都已完成”，之后的时段仍会
+执行以补足缺口。
 
 ### 11.4 数据导出
 
@@ -1372,7 +1393,7 @@ python curator_views/cli.py info --config config.yaml
 ```
 
 若 PID 不存在，查看 `curator_views.log` 与 `daemon_state.json` 的 `last_error`。
-确认 `daily_time` 是否正确、今天是否已经执行过（同日去重）。需要重启或停止时见
+确认 `daily_times` / `daily_time` 是否正确、当前时段是否已经执行过（时段级去重）。需要重启或停止时见
 [10.1 daemon 的「重启与停止」](#101-daemon推荐)。
 
 ### 12.7 PID 复用的误判
@@ -1412,6 +1433,11 @@ need = max(0, 今日目标 - 昨日自然流量 - 溢出扣减 - 今日已刷)
 
 也不要并发启动两个 `run`：两者在开始前读到相同的 `today_boosted`，会各刷一份
 剩余量，造成超额。
+
+**配置多个时段时**：手动 `run` 只写日期级 `last_run_date`，daemon 视为“此刻之前的
+所有时段都已完成”，后续时段仍会执行并自动只补剩余缺口。注意一个副作用：如果手动
+`run` 之后删除 `daemon_state.json`（或全新启动 daemon），更早的时段会被当成已完成，
+当天某个从未执行过的早期时段就不会再补跑；需要时手动 `run` 一次，或等第二天。
 
 ---
 
@@ -1467,7 +1493,7 @@ boost_list_file: "boost_plan.txt"
 `check` 现在会把抓取到的统计写入 `daily_stats`（默认行为），不再只是内存预览：
 
 - 只写统计表，不写 `boost_log` / `program_start` / `last_run_date` /
-  `last_stats_date` / growth 锚点，因此不影响 daemon 的同日去重；
+  `last_stats_date` / growth 锚点，因此不影响 daemon 的时段去重；
 - 想保留旧的纯只读行为，用 `check --no-write`；
 - 写库失败（路径不可写、数据库损坏等）会报错并以 1 退出。
 
@@ -1501,6 +1527,31 @@ boost_list_file: "boost_plan.txt"
 - 刷量列表模式当天已刷过时状态为 `already_boosted`，不续刷也不消费下一行；
 - 判断依据是 `boost_log`，若你手动刷量没有写台账，续刷会把这部分当成未刷。
 
+### 13.9 daemon 支持一天多个时段
+
+新增 `daily_times`，可配置一天多个执行时刻：
+
+```yaml
+daily_times: ["10:00", "20:00"]
+daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修改
+```
+
+- `daily_times` 非空时优先于 `daily_time`；接受列表，也接受逗号或空格分隔的
+  字符串；非法条目跳过并记录警告。`daily_times` 为空时回退到 `daily_time`，
+  完全解析不出有效时刻时回退到 `10:00`；
+- 每个时段执行一次完整流程（抓取 → 预测 → 检测 → 提升 → 通知）。后一时段按
+  缺口公式自动扣掉今日已刷，只补剩余部分，所以通常比首轮短；
+- 时段级去重：`daemon_state.json` 新增 `last_run_slot`（`YYYY-MM-DD#HH:MM`）与
+  `daily_times`，`attempts_today` 改为按当前时段计数；重启后当天只补跑尚未完成的
+  时段；
+- 重试参数按“每个时段”生效：某时段重试用尽只放弃该时段，当天后续时段照常执行；
+  `retry_delay_minutes: 0` 表示该时段内不重试；
+- 手动 `run` 只写日期级 `last_run_date`，daemon 视为此刻之前的时段已完成，后续
+  时段仍会执行补足缺口；
+- 旧配置不含 `daily_times` 时行为与之前完全一致（每天一次）。升级时若旧
+  `daemon_state.json` 的 `last_run_date` 是今天但没有 `last_run_slot`，daemon
+  视为今天已全部完成，避免启动后立刻重复执行。
+
 ---
 
 ## 14. 安全与合规
@@ -1523,7 +1574,7 @@ boost_list_file: "boost_plan.txt"
 python -m pytest tests/ -v
 ```
 
-当前测试共 **242** 个，覆盖：
+当前测试共 **264** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1538,7 +1589,8 @@ python -m pytest tests/ -v
 - 当日已刷：只扣首日缺口、`forecast` 表格与 JSON、同日续刷、列表模式不误消费；
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`
   的重新登录提示、Cookie 失效告警；
-- daemon 的 plan_next、同日去重、失败当天重试与重试用尽、旧状态纠正、状态与 info 输出。
+- daemon 的 plan_next、同日去重、失败当天重试与重试用尽、旧状态纠正、状态与 info 输出；
+- daemon 多时段调度（时段解析、时段级去重、跨重启、手动 run 标记、时段级重试）。
 
 测试目录：
 

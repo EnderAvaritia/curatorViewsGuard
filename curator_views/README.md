@@ -30,7 +30,9 @@
   子进程方式唤起执行器刷量（调度器崩了不影响执行器，执行器可被手动单独触发）；
 - 每日完整流程：抓取统计 -> 入库 -> 预测 -> 溢出检测 -> 计算缺口 -> 提升 -> 通知；
 - 当日已刷续刷：缺口扣除 `boost_log` 里今天的累计，同一天重跑只补剩余量；
-- 失败当天重试：daemon 执行失败不标记当天完成，按间隔重试；统计 Cookie 失效会
+- 多时段调度：`daily_times` 可配置一天多个执行时刻，时段级去重，后一时段按当日
+  已刷自动补剩余缺口；
+- 失败重试：daemon 执行失败不标记该时段完成，按间隔重试；统计 Cookie 失效会
   单独告警，重新登录后下一次重试自动生效，无需重启进程；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
 - 巡检与数据导出：`check` 抓取统计并写入本地库，随时查看最近 7 天与预测摘要，
@@ -89,21 +91,27 @@ python curator_views/cli.py init-config [--path config.yaml]
 
 ### daemon
 
-守护进程模式：进程常驻运行，每天到达配置的 `daily_time`（默认 `10:00`，
-Asia/Shanghai）自动执行一次每日完整流程。**每次循环重新加载配置文件**，
-修改任意配置（含执行时间）无需重启进程。
+守护进程模式：进程常驻运行，每天到达配置的 `daily_times`（默认回退 `daily_time`，
+例如 `["10:00", "20:00"]`，Asia/Shanghai）自动执行每日完整流程；未配置
+`daily_times` 时行为与单时刻的 `daily_time`（默认 `10:00`）一致。**每次循环
+重新加载配置文件**，修改任意配置（含执行时间）无需重启进程。
 
 ```bash
 python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | --no-boost]
 ```
 
-- 启动时若今天尚未执行且已过执行时刻，立即补跑一次；
-- 执行失败不退出进程，也**不把当天标记为已完成**：按 `retry_delay_minutes`
-  在当天重试，最多 `retry_max_times` 次；用尽后等第二天，随时可手动 `run` 补跑；
+- 启动时若今天尚未完成所有时段且已过对应时刻，立即补跑剩余时段；
+- 执行失败不退出进程，也**不把该时段标记为已完成**：按 `retry_delay_minutes`
+  在该时段内重试，最多 `retry_max_times` 次；用尽后只放弃该时段，后续时段照常
+  执行，随时可手动 `run` 补跑；
+- 时段级去重：`daemon_state.json` 记录 `last_run_slot`（`YYYY-MM-DD#HH:MM`），
+  重启后当天只补跑尚未完成的时段；手动 `run` 只写日期级 `last_run_date`，daemon
+  视为此刻之前的时段已完成，之后的时段仍会执行补足缺口（细节见主 README 的
+  13.9 与 12.10）；
 - 统计 Cookie 失效（重定向到公开页 / 401 / 403）会推送 `error` 级告警；
   重新 `login` 覆盖 Cookie 文件后，下一次重试自动读取新文件，无需重启 daemon；
-- **同一天不重复执行**：`run_daily` 会把 `last_run_date` 写进数据库，daemon
-  每轮到点前会核对它，因此手动 `run` 与 daemon 谁先执行都算当天已完成；
+- 同一时段不重复执行：`last_run_slot` 与 `last_run_date` 都会写入状态文件，
+  daemon 每轮核对，因此手动 `run` 与 daemon 不会把同一时段刷两遍；
 - 前台运行时 INFO 日志同时输出到控制台（启动即打印日志路径与下次执行时间），
   文件日志仍写入数据库同级的 `curator_views.log`；
 - Ctrl+C 会**立即中断**当前执行并退出（状态文件写入 `stopped`）；SIGTERM
@@ -131,8 +139,8 @@ python curator_views/cli.py info --config config.yaml --json
 
 人类可读输出包含 PID、当前阶段、心跳、上次/下次执行时间与本地数据概况；
 `--json` 输出同样的原始字典，便于脚本处理。长时间提升期间心跳可能暂停，
-存活仍以 PID 为准；PID 复用是已知限制。状态文件还持久化 `last_run_date`，
-daemon 重启后同一天不会重复执行。
+存活仍以 PID 为准；PID 复用是已知限制。状态文件还持久化 `last_run_date` 与
+`last_run_slot`，daemon 重启后同一天只补跑尚未完成的时段。
 
 ### run
 
@@ -191,7 +199,7 @@ boost_list_file: "boost_plan.txt"
 不产生任何提升请求。
 
 - 只写 `daily_stats`；不写 `boost_log`，也不写 `program_start` / `last_run_date` /
-  `last_stats_date` / growth 锚点，daemon 的同日去重不受影响；
+  `last_stats_date` / growth 锚点，daemon 的时段去重不受影响；
 - 抓取结果按 `date_ts` 幂等覆盖，重复执行不会产生重复行；
 - 数据库不可写时报错并以 1 退出。
 
@@ -341,9 +349,10 @@ python curator_views/cli.py version
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
-| `daily_time` | `"10:00"` | daemon 模式的每日执行时刻（Asia/Shanghai，HH:MM） |
-| `retry_delay_minutes` | `30` | 执行失败后当天重试的间隔（分钟），`0` 表示不重试 |
-| `retry_max_times` | `3` | 当天最多重试次数（不含首次执行），用尽后等第二天 |
+| `daily_times` | `[]` | 每日执行时刻列表（如 `["10:00", "20:00"]`）；非空时优先于 `daily_time`，每个时段执行一次完整流程，后一时段按当日已刷补剩余缺口 |
+| `daily_time` | `"10:00"` | 单时刻回退配置，`daily_times` 为空时生效（Asia/Shanghai，HH:MM） |
+| `retry_delay_minutes` | `30` | 每个时段执行失败后的重试间隔（分钟），`0` 表示该时段内不重试 |
+| `retry_max_times` | `3` | 每个时段最多重试次数（不含首次执行），用尽后放弃该时段 |
 | `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
 | `boost_list_file` | （空） | 每日刷量列表文件路径；非空时一行一个刷量数，每天消费首行，成功刷完后删除该行 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
