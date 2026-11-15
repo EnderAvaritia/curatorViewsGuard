@@ -55,7 +55,10 @@ import yaml  # noqa: E402
 from curator_views.core import status  # noqa: E402
 from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
-from curator_views.core.chart import write_forecast_chart  # noqa: E402
+from curator_views.core.chart import (  # noqa: E402
+    render_forecast_console,
+    write_forecast_chart,
+)
 from curator_views.core.daemon import (  # noqa: E402
     Daemon, parse_daily_times, pick_run_marker,
 )
@@ -1669,7 +1672,11 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "volatility_modeled": bool(getattr(args, "model_volatility", True)),
     }
     chart_arg = getattr(args, "chart", None)
-    if chart_arg:
+    console_chart: Optional[str] = None
+    if chart_arg == "-":
+        console_chart = render_forecast_console(result, sched_cfg, source)
+        source["chart_format"] = "console"
+    elif chart_arg:
         chart_target = _resolve_path(cfg_dir, str(chart_arg))
         try:
             chart_path = write_forecast_chart(
@@ -1679,6 +1686,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             _print_error(f"生成折线图失败: {exc}")
             return 1
         source["chart_path"] = str(chart_path)
+        source["chart_format"] = "html"
     if args.json:
         payload = {
             "rows": result["rows"],
@@ -1687,9 +1695,14 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             "source": source,
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
+        if console_chart:
+            print(console_chart, file=sys.stderr)
         return 0
 
     _print_forecast_report(result, sched_cfg, source, args.fetch, db_path)
+    if console_chart:
+        print()
+        print(console_chart)
     return 0
 
 
@@ -1814,9 +1827,10 @@ def build_parser() -> argparse.ArgumentParser:
              "每天独立抽样",
     )
     p_forecast.add_argument(
-        "--chart", nargs="?", const="forecast.html", default=None,
+        "--chart", nargs="?", const="-", default=None,
         metavar="PATH",
-        help="生成 HTML 折线图（默认 forecast.html，相对路径基于配置文件目录）",
+        help="输出控制台点状折线图；带 PATH 时写 HTML 文件（相对路径基于配置文件目录，"
+             "'-' 也表示控制台）",
     )
     p_forecast.add_argument("--json", action="store_true",
                             help="输出完整 JSON（含 rows/warnings/summary/source）")

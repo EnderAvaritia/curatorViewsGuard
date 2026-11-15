@@ -39,9 +39,9 @@
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；可配置总开关、最低推送级别、
   关闭例行简报（异常仍推）与静默时段（静默期排队到 `notify_queue.json`，离开静默后
   自动补发）；
-- 预测折线图：`forecast --chart` 生成自包含 HTML（内联 SVG，无第三方依赖），
-  展示目标/目标区间 vs 假设自然流量、当日配额 vs 实际待刷；默认纳入随机波动，
-  `--no-volatility` 可生成未抖动基准图；
+- 预测折线图：`forecast --chart` 在控制台输出点状字符折线图，`--chart PATH`
+  写自包含 HTML（内联 SVG，无第三方依赖），展示目标/目标区间 vs 假设自然流量、
+  当日配额 vs 实际待刷；默认纳入随机波动，`--no-volatility` 可输出未抖动基准图；
 - 巡检与数据导出：`check` 抓取统计并写入本地库，随时查看最近 7 天与预测摘要，
   或导出历史统计数据。
 
@@ -242,9 +242,10 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
 - `--no-volatility`：不纳入目标/缺口波动率，输出未抖动基准；默认纳入，
   每天独立抽样（`summary.volatility_modeled` 标记）；
-- `--chart [PATH]`：生成自包含 HTML 折线图（内联 SVG，无第三方依赖），默认
-  `forecast.html`（相对配置文件目录）；`--json` 时路径在 `source.chart_path`，
-  标准输出仍是纯 JSON；
+- `--chart [PATH]`：不带 PATH 时输出控制台点状字符折线图；带 PATH 时写
+  自包含 HTML（内联 SVG，无第三方依赖，相对路径基于配置文件目录），`--json`
+  时路径在 `source.chart_path`；`--chart -` 也表示控制台；`--json` + 控制台图
+  时图表写 stderr，标准输出仍是纯 JSON；
 - `--json`：输出 rows / warnings / summary / source 完整结构；
   `source.today_boosted` 为今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 为首日扣除量。
@@ -278,9 +279,10 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 `volatility_not_modeled`。抽样不读写 `kv_store`，同日重复执行结果会不同，
 也不保证复现 `run` 当天的持久化值。
 
-`--chart` 生成的 HTML 包含两张图：目标/目标区间 vs 假设自然流量、当日配额 vs
-实际待刷，并标注模式、基线、波动率、目标上下界与区间刷量汇总；直接双击用浏览器
-打开即可。图中曲线同样是一次抽样结果，重新运行可能不同。
+`--chart` 直接在控制台输出两张点状字符图：目标 vs 假设自然流量、当日配额 vs
+实际待刷，并在图上方标注模式、基线、波动率与目标上下界；`--chart PATH` 则改为
+写自包含 HTML，额外显示目标区间带，直接双击用浏览器打开即可。控制台宽度自动
+适配终端，两条线重叠时显示 `*`。图中曲线同样是一次抽样结果，重新运行可能不同。
 
 ### boost
 

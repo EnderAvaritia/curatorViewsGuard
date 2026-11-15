@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import math
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -203,6 +204,220 @@ def _legend(series: List[Dict[str, Any]], band_label: Optional[str]) -> str:
             f"{_esc(band_label)}</span>"
         )
     return "".join(items)
+
+
+_CONSOLE_HEIGHT = 15
+_CONSOLE_MARKERS = {
+    "target": "●",
+    "natural": "○",
+    "quota": "◆",
+    "need": "◇",
+}
+
+
+def _line_cells(
+    x1: int, y1: int, x2: int, y2: int
+) -> List[tuple[int, int]]:
+    """Bresenham 直线，返回终端字符网格上的坐标。"""
+    cells: List[tuple[int, int]] = []
+    dx = abs(x2 - x1)
+    sx = 1 if x1 < x2 else -1
+    dy = -abs(y2 - y1)
+    sy = 1 if y1 < y2 else -1
+    error = dx + dy
+    while True:
+        cells.append((x1, y1))
+        if x1 == x2 and y1 == y2:
+            return cells
+        double = 2 * error
+        if double >= dy:
+            error += dy
+            x1 += sx
+        if double <= dx:
+            error += dx
+            y1 += sy
+
+
+def _console_chart(
+    rows: List[Dict[str, Any]],
+    series: List[Dict[str, Any]],
+    width: int,
+    title: str,
+) -> List[str]:
+    """用点状字符画一张图；返回可直接 print 的多行文本。"""
+    if not rows:
+        return [title, "  （没有可绘制的数据）"]
+
+    values = [
+        float(row.get(item["key"], 0) or 0)
+        for item in series
+        for row in rows
+    ]
+    y_max = _nice_max(values)
+    height = _CONSOLE_HEIGHT
+
+    def axis_text(value: float) -> str:
+        if y_max >= 10:
+            return f"{value:,.0f}"
+        return f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+
+    label_values = {
+        round((1 - value / y_max) * (height - 1)): axis_text(value)
+        for value in (y_max * step / 4 for step in range(5))
+    }
+    y_labels = [label_values.get(row, "") for row in range(height)]
+    label_width = max(len(label) for label in y_labels)
+    plot_width = max(24, int(width) - label_width - 3)
+    grid: List[List[Optional[str]]] = [
+        [None] * plot_width for _ in range(height)
+    ]
+
+    def x_index(index: int) -> int:
+        if len(rows) <= 1:
+            return plot_width // 2
+        return round(index * (plot_width - 1) / (len(rows) - 1))
+
+    def y_index(value: float) -> int:
+        ratio = min(1.0, max(0.0, value / (y_max or 1.0)))
+        return round((1.0 - ratio) * (height - 1))
+
+    def put_marker(x: int, y: int, marker: str) -> None:
+        current = grid[y][x]
+        if current is None or current == "·":
+            grid[y][x] = marker
+        elif current != marker and current != "*":
+            grid[y][x] = "*"
+
+    for item in series:
+        marker = item.get("marker", "●")
+        points = [
+            (x_index(index), y_index(float(row.get(item["key"], 0) or 0)))
+            for index, row in enumerate(rows)
+        ]
+        for x, y in points:
+            put_marker(x, y, marker)
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            for x, y in _line_cells(x1, y1, x2, y2):
+                current = grid[y][x]
+                if current is None:
+                    grid[y][x] = "·"
+                elif current != marker and current not in ("·", "*"):
+                    grid[y][x] = "*"
+
+    lines = [title]
+    for row_index in range(height):
+        cells = "".join(cell or " " for cell in grid[row_index]).rstrip()
+        lines.append(
+            f"{y_labels[row_index]:>{label_width}} ┤ {cells}"
+        )
+    lines.append(f"{'':>{label_width}} └ " + "─" * plot_width)
+
+    date_line = [" "] * plot_width
+    for index in _x_label_indexes(len(rows), limit=max(2, plot_width // 8)):
+        text = str(rows[index].get("date", ""))
+        text = text[5:] if len(text) == 10 else text
+        start = min(
+            max(0, x_index(index) - len(text) // 2),
+            plot_width - len(text),
+        )
+        if any(char != " " for char in date_line[start:start + len(text)]):
+            continue
+        date_line[start:start + len(text)] = list(text)
+    lines.append(f"{'':>{label_width}}   " + "".join(date_line).rstrip())
+
+    legend = "   ".join(
+        f"{item.get('marker', '●')} {item['name']}" for item in series
+    )
+    if any("*" in row for row in grid):
+        legend += "   * 重叠"
+    lines.append(f"{'':>{label_width}}   {legend}")
+    return lines
+
+
+def render_forecast_console(
+    result: Dict[str, Any],
+    config: Dict[str, Any],
+    source: Optional[Dict[str, Any]] = None,
+    width: Optional[int] = None,
+) -> str:
+    """把 forecast 结果渲染为控制台点状折线图。"""
+    rows = list(result.get("rows") or [])
+    if not rows:
+        return "预测折线图：没有可绘制的数据。"
+
+    summary = result.get("summary") or {}
+    source = source or {}
+    if width is None:
+        width = shutil.get_terminal_size((80, 24)).columns
+    width = max(48, min(int(width), 120))
+
+    first_date = summary.get("first_date") or rows[0]["date"]
+    last_date = summary.get("last_date") or rows[-1]["date"]
+    days = summary.get("days", len(rows))
+    modeled = bool(summary.get("volatility_modeled", True))
+    baseline = _config_float(config, "baseline_views")
+    baseline_text = "自动预测" if baseline <= 0 else f"固定 {baseline:,.0f}"
+    mode = str(config.get("boost_mode", "stable"))
+    source_text = "Steam 在线抓取" if source.get("mode") == "fetch" else "本地数据库"
+
+    target_vol = _config_float(config, "target_volatility")
+    target_vol_min = _config_float(config, "target_volatility_min")
+    gap_vol = _config_float(config, "volatility")
+    gap_vol_min = _config_float(config, "volatility_min")
+    vol_text = "已纳入随机波动" if modeled else "未纳入随机波动"
+    vol_detail = (
+        f"目标 ±{target_vol:.0%}（最小 {target_vol_min:.0%}） · "
+        f"缺口 ±{gap_vol:.0%}（最小 {gap_vol_min:.0%}）"
+    )
+    bounds = []
+    if _config_float(config, "target_min") > 0:
+        bounds.append(f"下限 {_config_float(config, 'target_min'):,.0f}")
+    if _config_float(config, "target_max") > 0:
+        bounds.append(f"上限 {_config_float(config, 'target_max'):,.0f}")
+    bounds_text = " · " + " / ".join(bounds) if bounds else ""
+
+    view_series = [
+        {"key": "target", "name": "目标", "marker": _CONSOLE_MARKERS["target"]},
+        {
+            "key": "assumed_natural",
+            "name": "假设自然流量",
+            "marker": _CONSOLE_MARKERS["natural"],
+        },
+    ]
+    boost_series = [
+        {
+            "key": "boost_quota",
+            "name": "当日配额",
+            "marker": _CONSOLE_MARKERS["quota"],
+        },
+        {"key": "need", "name": "实际待刷", "marker": _CONSOLE_MARKERS["need"]},
+    ]
+
+    lines = [
+        f"预测区间：{first_date} ~ {last_date}（{days} 天） · {source_text}",
+        f"模式：{mode} · 基线：{baseline_text}{bounds_text}",
+        f"波动率：{vol_text} · {vol_detail}",
+        "",
+    ]
+    lines.extend(
+        _console_chart(
+            rows, view_series, width, "浏览量：目标 vs 假设自然流量"
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _console_chart(rows, boost_series, width, "刷量：当日配额 vs 实际待刷")
+    )
+    lines.append("")
+    lines.append(
+        "区间预计刷量 "
+        f"{_fmt(float(summary.get('total_need', 0) or 0))} · 目标 "
+        f"{_fmt(float(summary.get('target_first', 0) or 0))} → "
+        f"{_fmt(float(summary.get('target_last', 0) or 0))}"
+    )
+    if modeled:
+        lines.append("注：随机波动为本次抽样，重新运行可能不同。")
+    return "\n".join(lines)
 
 
 def render_forecast_html(

@@ -5,7 +5,11 @@ import sqlite3
 from datetime import datetime
 
 from curator_views import cli
-from curator_views.core.chart import render_forecast_html, write_forecast_chart
+from curator_views.core.chart import (
+    render_forecast_console,
+    render_forecast_html,
+    write_forecast_chart,
+)
 from curator_views.core.forecast import forecast_days
 from curator_views.core.scheduler import _TZ, _date_to_epoch, _today_epoch
 
@@ -158,6 +162,50 @@ class TestRenderForecastHtml:
         assert "<svg" in target.read_text(encoding="utf-8")
 
 
+class TestRenderForecastConsole:
+    def test_renders_two_dot_charts(self):
+        text = render_forecast_console(make_result(), make_config(), width=80)
+
+        assert "浏览量：目标 vs 假设自然流量" in text
+        assert "刷量：当日配额 vs 实际待刷" in text
+        assert "·" in text
+        assert "● 目标" in text
+        assert "○ 假设自然流量" in text
+        assert "◆ 当日配额" in text
+        assert "◇ 实际待刷" in text
+        assert "2026-11-14" in text
+        assert "区间预计刷量" in text
+        assert "[" not in text
+
+    def test_respects_requested_width(self):
+        text = render_forecast_console(make_result(), make_config(), width=60)
+
+        axis_lines = [line for line in text.splitlines() if "┤" in line or "└" in line]
+        assert axis_lines
+        assert max(len(line) for line in axis_lines) <= 60
+
+    def test_reports_random_sampling_state(self):
+        modeled = forecast_days(
+            make_history(),
+            make_config(volatility=0.10),
+            START_TS,
+            days=2,
+        )
+        text = render_forecast_console(
+            modeled, make_config(volatility=0.10), width=72
+        )
+
+        assert "已纳入随机波动" in text
+        assert "重新运行可能不同" in text
+
+    def test_empty_rows_do_not_crash(self):
+        text = render_forecast_console(
+            {"rows": [], "summary": {}, "warnings": []}, make_config()
+        )
+
+        assert "没有可绘制的数据" in text
+
+
 class TestForecastChartCli:
     def _run(self, tmp_path, extra):
         config_path = tmp_path / "config.yaml"
@@ -187,11 +235,20 @@ class TestForecastChartCli:
         assert chart_path.is_file()
         assert "折线图:" in capsys.readouterr().out
 
-    def test_chart_default_path_is_next_to_config(self, tmp_path):
+    def test_chart_without_path_prints_console(self, tmp_path, capsys):
         code = self._run(tmp_path, ["--chart"])
 
+        captured = capsys.readouterr()
         assert code == 0
-        assert (tmp_path / "forecast.html").is_file()
+        assert "浏览量：目标 vs 假设自然流量" in captured.out
+        assert "刷量：当日配额 vs 实际待刷" in captured.out
+        assert not (tmp_path / "forecast.html").exists()
+
+    def test_chart_dash_prints_console(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--chart", "-"])
+
+        assert code == 0
+        assert "浏览量：目标 vs 假设自然流量" in capsys.readouterr().out
 
     def test_chart_with_json_keeps_stdout_valid(self, tmp_path, capsys):
         chart_path = tmp_path / "chart.html"
@@ -203,12 +260,24 @@ class TestForecastChartCli:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert payload["source"]["chart_path"] == str(chart_path)
+        assert payload["source"]["chart_format"] == "html"
         assert chart_path.is_file()
 
-    def test_no_chart_by_default(self, tmp_path):
+    def test_console_chart_with_json_uses_stderr(self, tmp_path, capsys):
+        code = self._run(tmp_path, ["--chart", "--json"])
+
+        captured = capsys.readouterr()
+        assert code == 0
+        payload = json.loads(captured.out)
+        assert payload["source"]["chart_format"] == "console"
+        assert "浏览量：目标 vs 假设自然流量" in captured.err
+
+    def test_no_chart_by_default(self, tmp_path, capsys):
         code = self._run(tmp_path, [])
 
+        captured = capsys.readouterr()
         assert code == 0
+        assert "浏览量：目标 vs 假设自然流量" not in captured.out
         assert not (tmp_path / "forecast.html").exists()
 
     def test_chart_write_failure_returns_error(

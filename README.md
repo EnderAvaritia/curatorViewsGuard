@@ -43,8 +43,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
   防止 growth 模式长期运行后目标无限膨胀，或一路下滑跌破底线；`0` 表示该方向
   不设界，run / daemon 实际执行与 forecast 预览都使用同一口径。
 - **配置可预测**：正式执行前可用 `forecast` 只读推算今天/明天起 N 天的目标与缺口，
-  判断配置会不会空转或超载；`--chart` 可同时生成自包含 HTML 折线图
-  （目标/自然流量/配额/待刷），直接浏览器打开查看。
+  判断配置会不会空转或超载；`--chart` 可直接在控制台输出点状字符折线图
+  （目标/自然流量/配额/待刷），`--chart PATH` 还可写自包含 HTML 用浏览器查看。
 
 ### 1.2 它不做什么
 
@@ -442,7 +442,7 @@ CuratorViewsGuard/
         ├── predictor.py     # 中位数 + 封顶趋势预测
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣 + 斜率检测
         ├── forecast.py      # 今天/明天起 N 天只读估算（纯函数，无 I/O）
-        ├── chart.py         # forecast 折线图（自包含 HTML + 内联 SVG）
+        ├── chart.py         # forecast 折线图（控制台点状字符 + 自包含 HTML/SVG）
         ├── boost_list.py    # 每日刷量列表解析与原子消费
         ├── booster.py       # 受控刷量执行器
         ├── scheduler.py     # 每日闭环编排 + 子进程执行器
@@ -516,6 +516,9 @@ python curator_views/cli.py forecast --config config.yaml --days 7
 
 # 6b. 只看今天该刷多少（默认含今天，首日自然 = 昨日实际 − 昨日刷量）
 python curator_views/cli.py forecast --config config.yaml --fetch
+
+# 6c. 控制台点状折线图；--chart PATH 可改为写 HTML
+python curator_views/cli.py forecast --config config.yaml --chart
 
 # 7. 演练模式：完整计算但不真正刷量
 python curator_views/cli.py run --config config.yaml --dry-run
@@ -991,9 +994,11 @@ python curator_views/cli.py forecast --config config.yaml \
 - `--set KEY=VALUE`：覆盖配置做 what-if，可重复，也能覆盖 `db_path`；
 - `--no-volatility`：不把 `target_volatility` / `volatility` 纳入预测，输出
   未抖动基准；默认纳入，每天独立抽样（`summary.volatility_modeled` 标记）；
-- `--chart [PATH]`：额外生成 HTML 折线图（内联 SVG，无第三方依赖），默认
-  `forecast.html`（相对路径基于配置文件目录）；`--json` 时路径写入
-  `source.chart_path`，标准输出仍是纯 JSON；
+- `--chart [PATH]`：不带 PATH 时在控制台输出点状字符折线图（`·` 连线，
+  `●` / `○` / `◆` / `◇` 标记数据点）；带 PATH 时写自包含 HTML（内联 SVG，
+  无第三方依赖，相对路径基于配置文件目录），`--json` 时路径写入
+  `source.chart_path`；`--chart -` 也表示控制台；`--json` + 控制台图时图表
+  写入 stderr，标准输出仍是纯 JSON；
 - `--json`：输出 `rows` / `warnings` / `summary` / `source` 完整结构；
   `source.today_boosted` 是今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 是首日扣除的已刷量，其余行恒为 0。
@@ -1082,25 +1087,45 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
 | `volatility_not_modeled` | 使用了 `--no-volatility` 且配置了波动率：表格为未抖动基准（`target_low` / `target_high` 仍给出目标区间） |
 
-### 8.5.1 forecast 折线图
+### 8.5.1 forecast 折线图（控制台 + HTML）
 
 ```bash
-# 默认生成 <配置目录>/forecast.html
+# 不带 PATH：直接在控制台输出点状字符折线图
 python curator_views/cli.py forecast --config config.yaml --chart
 
-# 指定输出路径
+# 带 PATH：写自包含 HTML，浏览器打开
 python curator_views/cli.py forecast --config config.yaml --chart reports/week.html
+
+# 显式指定控制台（等价于不带 PATH）
+python curator_views/cli.py forecast --config config.yaml --chart -
 ```
 
-生成的是**自包含 HTML**（内联 SVG，无外部 JS/CSS/图片），直接双击用浏览器打开：
+控制台图用点状字符绘制，适合 SSH、日志和快速巡检：
 
-- 图 1「浏览量」：目标（含目标抖动区间）vs 假设自然流量；
+```text
+浏览量：目标 vs 假设自然流量
+1,500 ┤
+1,125 ┤ *·················*·················*
+  750 ┤
+  375 ┤
+    0 ┤
+      └ ────────────────────────────────────
+        11-14           11-15           11-16
+        ● 目标   ○ 假设自然流量   * 重叠
+```
+
+- 图 1「浏览量」：目标 vs 假设自然流量；
 - 图 2「刷量」：当日配额 vs 实际待刷；
-- 页面标注模式、基线、波动率是否纳入、目标上下界、区间预计刷量与目标变化。
+- 上方标注区间、数据来源、模式、基线、波动率与目标上下界；
+- 控制台宽度按终端自动适配（48~120 列），超过宽度会压缩绘图区；
+- 两条线落在同一字符格时显示 `*`，图例里标注「重叠」。
+
+带 PATH 时生成**自包含 HTML**（内联 SVG，无外部 JS/CSS/图片），直接双击用
+浏览器打开；页面额外显示目标抖动区间带。
 
 默认纳入随机波动时，图中曲线是**本次抽样**的结果，重新运行会变化；加
-`--no-volatility` 可生成未抖动基准图。图表只读取 forecast 结果，不写数据库、
-不触网；`--json` 与 `--chart` 可同时使用。
+`--no-volatility` 可输出未抖动基准图。图表只读取 forecast 结果，不写数据库、
+不触网；`--json` 与 `--chart` 可同时使用（控制台图写 stderr，不污染 JSON）。
 
 ### 8.6 boost
 
@@ -1267,6 +1292,9 @@ CLI 不会因 Cookie 缺失退出；但统计抓取通常需要登录，`run` / 
 ```bash
 # 今天该刷多少（默认含今天；--fetch 会在线补齐统计，仅内存使用）
 python curator_views/cli.py forecast --config config.yaml --fetch
+
+# 控制台点状折线图（带 PATH 则写 HTML）
+python curator_views/cli.py forecast --config config.yaml --chart
 
 # 未来两周的空转/超载检查
 python curator_views/cli.py forecast --config config.yaml --days 14
@@ -1796,7 +1824,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **345** 个，覆盖：
+当前测试共 **351** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1810,8 +1838,8 @@ python -m pytest tests/ -v
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
   表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；默认纳入波动率
   随机抽样、`--no-volatility` 关闭、目标区间与抖动字段；
-- forecast 折线图：HTML/SVG 渲染、目标区间带、空数据、默认路径、`--chart`
-  写文件、`--json` 兼容与写失败报错；
+- forecast 折线图：控制台点状字符渲染、宽度适配、空数据、HTML/SVG 渲染、
+  目标区间带、`--chart` 控制台/写文件、`--json` 兼容与写失败报错；
 - `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
 - 当日已刷：只扣首日缺口、`forecast` 表格与 JSON、同日续刷、列表模式不误消费；
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`
