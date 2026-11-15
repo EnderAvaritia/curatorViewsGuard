@@ -236,6 +236,8 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
   “今天该刷多少”）；显式指定时改用旧模型：`trend` 按实际趋势延续，
   `target` 最终收敛到目标；
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
+- `--no-volatility`：不纳入目标/缺口波动率，输出未抖动基准；默认纳入，
+  每天独立抽样（`summary.volatility_modeled` 标记）；
 - `--json`：输出 rows / warnings / summary / source 完整结构；
   `source.today_boosted` 为今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 为首日扣除量。
@@ -263,9 +265,11 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 `base × 目标系数（multiplier）`；`run_daily` 的检测参照是
 `base × max(1, multiplier) × (1 + target_volatility + volatility)`，
 `growth_factor < 1` 或配置波动率时二者不同。异常标记未持久化，`in_cooldown`
-恒为 false；自然口径也不含恢复期与刷量列表。波动率不参与估算：表格给未抖动
-基准，`target_low` / `target_high` 给出目标抖动区间，并输出
-`volatility_not_modeled` 提示。
+恒为 false；自然口径也不含恢复期与刷量列表。波动率默认纳入估算：每天独立
+抽样目标/缺口抖动，表格「目标」「缺口」是本次抽样结果，`target_low` /
+`target_high` 给出目标区间；`--no-volatility` 则输出未抖动基准并提示
+`volatility_not_modeled`。抽样不读写 `kv_store`，同日重复执行结果会不同，
+也不保证复现 `run` 当天的持久化值。
 
 ### boost
 

@@ -25,6 +25,7 @@ from .scheduler import (
     _effective_threads,
     _jitter_bounds,
     _normalize_target_bounds,
+    _sample_signed_jitter,
     _target_multiplier,
 )
 
@@ -43,6 +44,7 @@ def forecast_days(
     natural_mode: str = "trend",
     first_natural: Optional[int] = None,
     first_day_boosted: int = 0,
+    model_volatility: bool = True,
 ) -> Dict[str, Any]:
     """逐日推算未来 ``days`` 天的目标、假设自然流量与刷量缺口。
 
@@ -63,24 +65,32 @@ def forecast_days(
         first_day_boosted: 首日（今天）已经刷出的量；只从首日缺口里扣减，
             后续日期不受影响（明天的“昨日自然流量”已经把它扣过），与
             ``run_daily`` 的“今日已刷”续刷口径一致。
+        model_volatility: 是否把 ``target_volatility`` / ``volatility`` 纳入
+            预测。默认 True：每天独立抽样一次目标抖动与缺口抖动，按 ``run``
+            的口径算目标与缺口；False：输出未抖动基准（用于确定性预览）。
 
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
           ``predict_expected(local_history)["expected"]``；
         - ``multiplier``：目标系数（表格列名「目标系数」），复用
           ``scheduler._target_multiplier``；stable 模式恒为 1.0；
-        - ``target``：``base * multiplier`` 再按 ``target_min`` / ``target_max``
-          夹取（0 表示该方向不设界），与 ``run_daily`` 的目标上下界一致；
+        - ``target``：``base * multiplier`` 乘 ``(1 + 目标抖动)`` 后按
+          ``target_min`` / ``target_max`` 夹取（0 表示该方向不设界），与
+          ``run_daily`` 一致；不纳入波动率时目标抖动为 0；
         - ``target_low`` / ``target_high``：目标抖动区间预览
-          （``target`` × (1 ± ``target_volatility``) 后再夹取）；本函数不抽随机数，
-          实际 ``run`` 会在区间内随机取一个值，并让同一天复用同一值；
+          （未抖动目标 × (1 ± ``target_volatility``) 后再夹取）；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
-        - ``need = max(0, round(target - assumed_natural))``，未来日不做溢出扣减；
-        - 首日再减去 ``first_day_boosted``（今天已刷的量），重跑时按剩余缺口续刷；
+        - ``gross_need = max(0, round(target - assumed_natural))``，
+          未抖动缺口；未来日不做溢出扣减；
+        - ``boost_quota = round(gross_need × (1 + 缺口抖动))``（不低于 0）；
+        - ``need = max(0, boost_quota - first_day_boosted)``，后续日不扣已刷；
         - 把假设日按 ``num_views = assumed_natural + first_day_boosted + need``
           回填进 ``local_history``，使后续天的预测窗口包含前面已刷的量。
-        - ``volatility`` 不参与估算：``run`` 在缺口上按日随机，此处只给未抖动基准。
+
+    随机抽样只在本次调用内生效，不读写 ``kv_store``：同一次 forecast 内每天
+    独立抽样，结果与 ``run`` 当天的持久化抖动值可能不同（预览是采样，不是
+    精确复现）。
 
     异常标记未持久化，``in_cooldown`` 恒为 False，本函数不读取数据库，也不做恢复期推算。
 
@@ -155,10 +165,20 @@ def forecast_days(
         base = baseline_views if baseline_views > 0 else prediction
         multiplier = _target_multiplier(factor, growth_rate, drift_start, date_ts)
         raw_target = base * multiplier
+        target_jitter = 0.0
+        if model_volatility and target_jitter_high > 0:
+            target_jitter = _sample_signed_jitter(
+                target_jitter_high, target_jitter_low
+            )
+        jittered_target = raw_target
+        if target_jitter:
+            jittered_target = max(
+                0.0, raw_target * (1.0 + target_jitter)
+            )
         target, target_bound = _clamp_target(
-            raw_target, target_floor, target_ceiling
+            jittered_target, target_floor, target_ceiling
         )
-        # 目标抖动区间（预览用）：run 实际会在该区间内随机，再按上下界夹取。
+        # 目标抖动区间（预览用）：不随本次抽样变化，始终展示可能范围。
         target_low, _ = _clamp_target(
             max(0.0, raw_target * (1.0 - target_jitter_high)),
             target_floor,
@@ -180,13 +200,22 @@ def forecast_days(
         assumed_natural = max(0, assumed_natural)
 
         # 未来日没有已被标记的溢出量，因此不做任何扣减；
-        # 只有首日扣“今天已经刷过的量”，重跑时按剩余缺口续刷。
+        # 只有首日扣“今天已经刷过的量”，重跑时按剩余配额续刷。
         already_boosted = (
             max(0, int(first_day_boosted)) if index == 0 else 0
         )
-        need = max(
-            0, int(round(target - assumed_natural - already_boosted))
-        )
+        gross_need = max(0, int(round(target - assumed_natural)))
+        gap_jitter = 0.0
+        if model_volatility and gap_jitter_high > 0:
+            gap_jitter = _sample_signed_jitter(
+                gap_jitter_high, gap_jitter_low
+            )
+        boost_quota = gross_need
+        if gap_jitter:
+            boost_quota = max(
+                0, int(round(gross_need * (1.0 + gap_jitter)))
+            )
+        need = max(0, boost_quota - already_boosted)
         cumulative_boost += need
         rows.append(
             {
@@ -198,9 +227,13 @@ def forecast_days(
                 "target": round(float(target), 1),
                 "target_low": round(float(target_low), 1),
                 "target_high": round(float(target_high), 1),
+                "target_jitter": round(float(target_jitter), 6),
                 "target_bound": target_bound,
                 "assumed_natural": assumed_natural,
                 "already_boosted": already_boosted,
+                "gross_need": gross_need,
+                "gap_jitter": round(float(gap_jitter), 6),
+                "boost_quota": boost_quota,
                 "need": need,
                 "cumulative_boost": cumulative_boost,
                 "in_cooldown": False,
@@ -223,7 +256,7 @@ def forecast_days(
         history, rows, growth_rate, boost_n, single_cap,
         threads, wait_min, wait_max, batch_size,
     )
-    if target_jitter_high > 0 or gap_jitter_high > 0:
+    if (target_jitter_high > 0 or gap_jitter_high > 0) and not model_volatility:
         parts: List[str] = []
         if target_jitter_high > 0:
             parts.append(
@@ -239,9 +272,9 @@ def forecast_days(
             {
                 "code": "volatility_not_modeled",
                 "message": (
-                    "forecast 不模拟随机抖动，表中目标/缺口为未抖动基准："
+                    "已用 --no-volatility 关闭随机化，表中目标/缺口为未抖动基准："
                     + "；".join(parts)
-                    + "。target_low/target_high 给出目标抖动区间。"
+                    + "。target_low/target_high 仍给出目标抖动区间。"
                 ),
             }
         )
@@ -252,6 +285,7 @@ def forecast_days(
     )
     summary["target_volatility"] = target_volatility
     summary["volatility"] = volatility
+    summary["volatility_modeled"] = bool(model_volatility)
     return {"rows": rows, "warnings": warnings, "summary": summary}
 
 

@@ -262,8 +262,10 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 - **无硬性上限**：`volatility` / `target_volatility` 不再限制 0.3 或 0.15；但抖动
   幅度会同步放大反作弊检测参照（`×(1 + target_volatility + volatility)`），
   配得越大，对真实外部刷量的检出越迟钝，需要自行权衡。
-- **forecast 不模拟随机**：`forecast` 输出未抖动基准，`target_low` / `target_high`
-  给出目标抖动区间，并提示波动率未参与估算；`run --dry-run` 才按实际抖动计算。
+- **forecast 默认纳入随机化**：每天独立抽样目标抖动与缺口抖动，按 `run` 的
+  口径估算目标/配额/缺口；`--no-volatility` 可关闭随机化、输出未抖动基准，
+  并给出 `volatility_not_modeled` 提示。`target_low` / `target_high` 始终给出
+  目标抖动区间。抽样不读写 `kv_store`，与 `run` 当天持久化值可能不同。
 
 例 1（缺口抖动）：目标 1000、昨日自然 900、缺口 100、`volatility: 0.10`，
 今天配额 90 ~ 110，总量约 990 ~ 1010。
@@ -985,6 +987,8 @@ python curator_views/cli.py forecast --config config.yaml \
   - `trend`：假设自然流量按实际趋势延续；
   - `target`：假设自然流量最终收敛到目标（首日用初始预测，之后用上一天目标）；
 - `--set KEY=VALUE`：覆盖配置做 what-if，可重复，也能覆盖 `db_path`；
+- `--no-volatility`：不把 `target_volatility` / `volatility` 纳入预测，输出
+  未抖动基准；默认纳入，每天独立抽样（`summary.volatility_modeled` 标记）；
 - `--json`：输出 `rows` / `warnings` / `summary` / `source` 完整结构；
   `source.today_boosted` 是今天的已刷量（`--tomorrow` 时为 `null`），
   `rows[0].already_boosted` 是首日扣除的已刷量，其余行恒为 0。
@@ -1005,9 +1009,11 @@ python curator_views/cli.py forecast --config config.yaml \
 `stale_history` 提示，建议加 `--fetch`。
 这是**估算不是精确预测**：未来自然流量只是外推；异常标记未持久化，因此
 `in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期与
-刷量列表，只复用 `run` 的缺口公式。波动率也不参与估算：配置了
-`target_volatility` / `volatility` 时，表格给的是未抖动基准，`target_low` /
-`target_high` 给出目标抖动区间，并输出 `volatility_not_modeled` 提示。
+刷量列表，只复用 `run` 的缺口公式。波动率默认纳入估算：每天独立抽样
+`target_volatility` / `volatility`，表格的「目标」「缺口」是本次抽样结果，
+`target_low` / `target_high` 给出目标可能区间；加 `--no-volatility` 则输出
+未抖动基准，并给出 `volatility_not_modeled` 提示。抽样不读写 `kv_store`，
+因此同一天反复执行 `forecast` 结果会不同，也不保证复现 `run` 当天的持久化值。
 
 forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run` 的检测参照是
 `base × max(1, multiplier) × (1 + target_volatility + volatility)`。当
@@ -1022,6 +1028,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 今日已刷: 0 次（2026-11-14，来自 boost_log；首日缺口已按剩余量计算）
 参数: boost_mode=growth factor=0.85 rate=-0.01
       基线=auto 自然模型=natural 缺口波动率=0.10（最小 0.00） 目标波动率=0.00（最小 0.00）
+波动率: 已纳入预测（每天独立抽样；与 run 当日持久化值可能不同）
 单日容量: 1,500 次（boost_n=5 × single_cap=300）
 
 日期           基准  目标系数     目标  假设自然  今日已刷   缺口  备注
@@ -1068,7 +1075,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
 | `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
-| `volatility_not_modeled` | 配置了 `target_volatility` / `volatility`：forecast 不模拟随机抖动，表格为未抖动基准（`target_low` / `target_high` 给出目标区间） |
+| `volatility_not_modeled` | 使用了 `--no-volatility` 且配置了波动率：表格为未抖动基准（`target_low` / `target_high` 仍给出目标区间） |
 
 ### 8.6 boost
 
@@ -1764,7 +1771,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **328** 个，覆盖：
+当前测试共 **334** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1776,7 +1783,8 @@ python -m pytest tests/ -v
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
-  表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；
+  表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；默认纳入波动率
+  随机抽样、`--no-volatility` 关闭、目标区间与抖动字段；
 - `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
 - 当日已刷：只扣首日缺口、`forecast` 表格与 JSON、同日续刷、列表模式不误消费；
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`

@@ -1360,11 +1360,24 @@ def _print_forecast_report(
         f"目标波动率={float(config.get('target_volatility', 0) or 0):.2f}"
         f"（最小 {float(config.get('target_volatility_min', 0) or 0):.2f}）"
     )
-    if float(config.get("target_volatility", 0) or 0) > 0:
+    target_vol = float(config.get("target_volatility", 0) or 0)
+    gap_vol = float(config.get("volatility", 0) or 0)
+    modeled = bool(summary.get("volatility_modeled", True))
+    if target_vol > 0 or gap_vol > 0:
         print(
-            "目标抖动: run 会在表中「目标」的 ±"
-            f"{float(config.get('target_volatility', 0)):.0%} 内随机，"
-            "再按上下界夹取；同一天重跑/多时段复用同一值"
+            "波动率: "
+            + (
+                "已纳入预测（每天独立抽样；与 run 当日持久化值可能不同）"
+                if modeled
+                else "未纳入预测（--no-volatility，输出未抖动基准）"
+            )
+        )
+    if target_vol > 0:
+        print(
+            "目标抖动区间: 表中「目标」±"
+            f"{target_vol:.0%}（最小幅度 "
+            f"{float(config.get('target_volatility_min', 0) or 0):.0%}），"
+            "再按上下界夹取；端点见 target_low / target_high"
         )
     boost_n = max(0, int(config.get("boost_n", 5)))
     single_cap = max(0, int(config.get("single_cap", 300)))
@@ -1464,7 +1477,7 @@ def _print_forecast_report(
         print(
             "说明: 自然口径复用 run 的缺口公式（缺口 = 目标 - 假设自然 - 今日已刷，"
             "仅首日扣已刷）；不含反作弊溢出扣减、恢复期与刷量列表；"
-            "目标/缺口波动率不参与估算（见提示）。"
+            "波动率默认纳入预测（--no-volatility 可关闭）。"
         )
     if result["warnings"]:
         print("提示:")
@@ -1477,6 +1490,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
 
     默认只读本地数据库、不触网；--fetch 才在线抓取（仅在内存使用，不写库）。
     --set 可覆盖任意配置键做 what-if；数据库不存在或无历史时以 1 退出，绝不建库。
+    波动率默认纳入预测（每天独立抽样）；--no-volatility 关闭随机化，输出基准值。
     """
     if args.days < 1:
         _print_error("--days 必须 >= 1")
@@ -1622,6 +1636,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         natural_mode=natural_mode_arg or "trend",
         first_natural=first_natural,
         first_day_boosted=today_boosted,
+        model_volatility=bool(getattr(args, "model_volatility", True)),
     )
     if stale_warning:
         result["warnings"].append(
@@ -1648,6 +1663,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "yesterday_boosted": yesterday_boosted,
         "yesterday_natural": first_natural,
         "today_boosted": None if start_tomorrow else today_boosted,
+        "volatility_modeled": bool(getattr(args, "model_volatility", True)),
     }
     if args.json:
         payload = {
@@ -1777,6 +1793,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_forecast.add_argument("--set", action="append", default=[],
                             metavar="KEY=VALUE",
                             help="覆盖配置项做 what-if，可重复")
+    p_forecast.add_argument(
+        "--no-volatility", dest="model_volatility", action="store_false",
+        default=True,
+        help="不把目标/缺口波动率纳入预测（输出未抖动基准）；默认纳入，"
+             "每天独立抽样",
+    )
     p_forecast.add_argument("--json", action="store_true",
                             help="输出完整 JSON（含 rows/warnings/summary/source）")
     p_forecast.set_defaults(func=cmd_forecast)

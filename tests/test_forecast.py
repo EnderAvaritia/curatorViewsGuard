@@ -9,6 +9,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime
+from unittest.mock import patch
 
 from curator_views import cli
 from curator_views.core.forecast import forecast_days
@@ -288,6 +289,7 @@ clan_id: ""
 cookie_file: "missing_cookie.txt"
 db_path: "views.db"
 boost_mode: stable
+volatility: 0.0
 """
 
 
@@ -364,18 +366,81 @@ def make_today_db(
 
 
 class TestTargetVolatilityForecast:
-    def test_previews_target_range(self):
+    def test_previews_target_range_without_randomization(self):
         result = forecast_days(
             make_history(views=10000),
             make_config(baseline_views=10000, target_volatility=0.50),
             START_TS,
             days=1,
+            model_volatility=False,
         )
         row = result["rows"][0]
         assert row["target"] == 10000
         assert row["target_low"] == 5000
         assert row["target_high"] == 15000
+        assert row["target_jitter"] == 0.0
+        assert row["need"] == 0
+        assert result["summary"]["volatility_modeled"] is False
         assert "volatility_not_modeled" in warning_codes(result)
+
+    def test_models_target_jitter_by_default(self):
+        with patch(
+            "curator_views.core.forecast._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            result = forecast_days(
+                make_history(views=10000),
+                make_config(baseline_views=10000, target_volatility=0.50),
+                START_TS,
+                days=1,
+            )
+        row = result["rows"][0]
+        assert result["summary"]["volatility_modeled"] is True
+        assert row["target_jitter"] == 0.50
+        assert row["target"] == 15000
+        assert row["need"] == 5000
+        assert "volatility_not_modeled" not in warning_codes(result)
+
+    def test_models_gap_jitter_on_quota(self):
+        with patch(
+            "curator_views.core.forecast._sample_signed_jitter",
+            return_value=-0.50,
+        ):
+            result = forecast_days(
+                make_history(views=1000),
+                make_config(baseline_views=2000, volatility=0.50),
+                START_TS,
+                days=1,
+            )
+        row = result["rows"][0]
+        assert row["target"] == 2000
+        assert row["gross_need"] == 1000
+        assert row["gap_jitter"] == -0.50
+        assert row["boost_quota"] == 500
+        assert row["need"] == 500
+
+    def test_models_target_and_gap_jitter_together(self):
+        with patch(
+            "curator_views.core.forecast._sample_signed_jitter",
+            side_effect=[0.50, -0.50],
+        ):
+            result = forecast_days(
+                make_history(views=1000),
+                make_config(
+                    baseline_views=2000,
+                    target_volatility=0.50,
+                    volatility=0.50,
+                ),
+                START_TS,
+                days=1,
+            )
+        row = result["rows"][0]
+        assert row["target"] == 3000
+        assert row["target_jitter"] == 0.50
+        assert row["gross_need"] == 2000
+        assert row["gap_jitter"] == -0.50
+        assert row["boost_quota"] == 1000
+        assert row["need"] == 1000
 
     def test_range_respects_target_bounds(self):
         result = forecast_days(
@@ -388,11 +453,31 @@ class TestTargetVolatilityForecast:
             ),
             START_TS,
             days=1,
+            model_volatility=False,
         )
         row = result["rows"][0]
         assert row["target"] == 10000
         assert row["target_low"] == 6000
         assert row["target_high"] == 12000
+
+    def test_jittered_target_respects_bounds(self):
+        with patch(
+            "curator_views.core.forecast._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            result = forecast_days(
+                make_history(views=10000),
+                make_config(
+                    baseline_views=10000,
+                    target_volatility=0.50,
+                    target_max=12000,
+                ),
+                START_TS,
+                days=1,
+            )
+        row = result["rows"][0]
+        assert row["target"] == 12000
+        assert row["target_bound"] == "max"
 
     def test_zero_volatility_has_no_range_or_warning(self):
         result = forecast_days(
@@ -404,6 +489,8 @@ class TestTargetVolatilityForecast:
         row = result["rows"][0]
         assert row["target_low"] == row["target"]
         assert row["target_high"] == row["target"]
+        assert row["target_jitter"] == 0.0
+        assert row["gap_jitter"] == 0.0
         assert "volatility_not_modeled" not in warning_codes(result)
 
 
@@ -433,6 +520,79 @@ class TestForecastCli:
         assert "3 天" in out
         assert len(set(re.findall(r"\d{4}-\d{2}-\d{2}", out))) >= 3
         assert not (tmp_path / "views.db-wal").exists()
+
+    def test_cli_models_volatility_by_default(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_readonly_db(tmp_path)
+
+        with patch(
+            "curator_views.core.forecast._sample_signed_jitter",
+            return_value=0.50,
+        ):
+            code = cli.main(
+                [
+                    "forecast",
+                    "--config",
+                    str(config_path),
+                    "--set",
+                    f"db_path={db_path}",
+                    "--set",
+                    "baseline_views=10000",
+                    "--set",
+                    "target_volatility=0.50",
+                    "--days",
+                    "1",
+                    "--json",
+                ]
+            )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        row = payload["rows"][0]
+        assert payload["summary"]["volatility_modeled"] is True
+        assert payload["source"]["volatility_modeled"] is True
+        assert row["target_jitter"] == 0.50
+        assert row["target"] == 15000
+        assert "volatility_not_modeled" not in {
+            warning["code"] for warning in payload["warnings"]
+        }
+
+    def test_cli_no_volatility_outputs_baseline(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_readonly_db(tmp_path)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=10000",
+                "--set",
+                "target_volatility=0.50",
+                "--no-volatility",
+                "--days",
+                "1",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        row = payload["rows"][0]
+        assert payload["summary"]["volatility_modeled"] is False
+        assert payload["source"]["volatility_modeled"] is False
+        assert row["target"] == 10000
+        assert row["target_jitter"] == 0.0
+        assert row["target_low"] == 5000
+        assert row["target_high"] == 15000
+        assert "volatility_not_modeled" in {
+            warning["code"] for warning in payload["warnings"]
+        }
 
     def test_cli_today_uses_yesterday_natural(self, tmp_path, capsys):
         config_path = tmp_path / "config.yaml"
