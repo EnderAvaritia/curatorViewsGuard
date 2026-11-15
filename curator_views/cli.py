@@ -55,6 +55,7 @@ import yaml  # noqa: E402
 from curator_views.core import status  # noqa: E402
 from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
+from curator_views.core.chart import write_forecast_chart  # noqa: E402
 from curator_views.core.daemon import (  # noqa: E402
     Daemon, parse_daily_times, pick_run_marker,
 )
@@ -1483,6 +1484,8 @@ def _print_forecast_report(
         print("提示:")
         for warning in result["warnings"]:
             print(f"  - [{warning['code']}] {warning['message']}")
+    if source.get("chart_path"):
+        print(f"折线图: {source['chart_path']}")
 
 
 def cmd_forecast(args: argparse.Namespace) -> int:
@@ -1665,6 +1668,17 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "today_boosted": None if start_tomorrow else today_boosted,
         "volatility_modeled": bool(getattr(args, "model_volatility", True)),
     }
+    chart_arg = getattr(args, "chart", None)
+    if chart_arg:
+        chart_target = _resolve_path(cfg_dir, str(chart_arg))
+        try:
+            chart_path = write_forecast_chart(
+                chart_target, result, sched_cfg, source
+            )
+        except OSError as exc:
+            _print_error(f"生成折线图失败: {exc}")
+            return 1
+        source["chart_path"] = str(chart_path)
     if args.json:
         payload = {
             "rows": result["rows"],
@@ -1798,6 +1812,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="不把目标/缺口波动率纳入预测（输出未抖动基准）；默认纳入，"
              "每天独立抽样",
+    )
+    p_forecast.add_argument(
+        "--chart", nargs="?", const="forecast.html", default=None,
+        metavar="PATH",
+        help="生成 HTML 折线图（默认 forecast.html，相对路径基于配置文件目录）",
     )
     p_forecast.add_argument("--json", action="store_true",
                             help="输出完整 JSON（含 rows/warnings/summary/source）")

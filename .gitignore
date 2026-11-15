@@ -18,6 +18,7 @@ cookie.txt
 daemon_state.json
 views_history.json
 notify_queue.json
+forecast.html
 
 # 本地规划 / 工作文件目录
 .omo/
