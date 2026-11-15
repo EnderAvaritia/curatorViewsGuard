@@ -15,7 +15,14 @@ from datetime import datetime, timedelta
 import pytest
 
 from curator_views.core import status
-from curator_views.core.daemon import Daemon, _TZ, plan_next
+from curator_views.core.daemon import (
+    Daemon,
+    _TZ,
+    parse_daily_times,
+    pick_run_marker,
+    plan_next,
+    plan_slots,
+)
 
 
 def dt(hour: int, minute: int = 0, day: int = 1) -> datetime:
@@ -529,3 +536,294 @@ class TestKeyboardInterrupt:
         finally:
             signal.signal(signal.SIGINT, prev_int)
             signal.signal(signal.SIGTERM, prev_term)
+
+
+# ── 多时段：纯函数 ────────────────────────────────────────────────────────
+
+
+class TestParseDailyTimes:
+    def test_single_string(self):
+        assert parse_daily_times("10:00") == ["10:00"]
+
+    def test_comma_string_with_spaces(self):
+        # 逗号/空白混合分隔，且乱序 → 去重后升序
+        assert parse_daily_times("20:00, 10:00") == ["10:00", "20:00"]
+
+    def test_list_with_duplicates_unsorted(self):
+        assert (
+            parse_daily_times(["20:00", "10:00", "20:00"])
+            == ["10:00", "20:00"]
+        )
+
+    def test_partially_invalid_list_keeps_valid(self):
+        # 单个非法/越界时刻只忽略自身，不回退成 10:00
+        assert (
+            parse_daily_times(["10:00", "not-a-time", "25:00", "20:00"])
+            == ["10:00", "20:00"]
+        )
+
+    def test_empty_and_none_fall_back(self):
+        assert parse_daily_times(None) == ["10:00"]
+        assert parse_daily_times([]) == ["10:00"]
+        assert parse_daily_times("") == ["10:00"]
+
+
+class TestPickRunMarker:
+    def test_prefers_slot_marker_on_same_day(self):
+        # 同一天：时段标记更精确，优先采用
+        assert (
+            pick_run_marker("2026-01-01#10:00", "2026-01-01")
+            == "2026-01-01#10:00"
+        )
+
+    def test_newer_date_wins_over_stale_slot(self):
+        # 昨天留下的时段标记不能盖掉今天的手动 run 记录
+        assert (
+            pick_run_marker("2025-12-31#20:00", "2026-01-01") == "2026-01-01"
+        )
+
+    def test_falls_back_to_whichever_exists(self):
+        assert pick_run_marker("", "2026-01-01") == "2026-01-01"
+        assert pick_run_marker("2026-01-01#10:00", "") == "2026-01-01#10:00"
+        assert pick_run_marker("", "") == ""
+
+
+class TestPlanSlots:
+    TIMES = ["10:00", "20:00"]
+
+    def test_before_first_slot_waits(self):
+        should, wake, due = plan_slots(dt(8, 0), "", self.TIMES)
+        assert should is False
+        assert wake == dt(10, 0)
+        assert due == ""
+
+    def test_at_first_slot_runs_and_wakes_second(self):
+        should, wake, due = plan_slots(dt(10, 0), "", self.TIMES)
+        assert should is True
+        assert due == "2026-01-01#10:00"
+        assert wake == dt(20, 0)
+
+    def test_after_first_completed_runs_second_only(self):
+        # 10:00 已完成，等到 20:00 时才只执行第二时段
+        should, wake, due = plan_slots(
+            dt(20, 0), "2026-01-01#10:00", self.TIMES
+        )
+        assert should is True
+        assert due == "2026-01-01#20:00"
+        assert wake == dt(10, 0, day=2)
+
+    def test_midday_after_first_waits_for_second(self):
+        should, wake, due = plan_slots(
+            dt(15, 0), "2026-01-01#10:00", self.TIMES
+        )
+        assert should is False
+        assert due == ""
+        assert wake == dt(20, 0)
+
+    def test_after_second_completed_waits_tomorrow_first(self):
+        should, wake, due = plan_slots(
+            dt(21, 0), "2026-01-01#20:00", self.TIMES
+        )
+        assert should is False
+        assert due == ""
+        assert wake == dt(10, 0, day=2)
+
+    def test_yesterday_slot_runs_first_today(self):
+        should, wake, due = plan_slots(
+            dt(10, 0), "2025-12-31#20:00", self.TIMES
+        )
+        assert should is True
+        assert due == "2026-01-01#10:00"
+        assert wake == dt(20, 0)
+
+    def test_nothing_due_has_empty_slot_id(self):
+        # 今天两个时段都完成 → 无待执行，slot_id 为空
+        should, _wake, due = plan_slots(
+            dt(12, 0), "2026-01-01#20:00", self.TIMES
+        )
+        assert should is False
+        assert due == ""
+
+
+# ── 多时段：Daemon 循环 ───────────────────────────────────────────────────
+
+
+class TestMultiSlotDaemon:
+    def test_two_slots_run_same_day_with_gap(self):
+        clock = {"now": dt(9, 0)}
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        def execute():
+            calls.append(clock["now"])
+            if len(calls) == 2:
+                daemon.stop()
+
+        daemon = Daemon(
+            lambda: ["10:00", "20:00"], execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+        )
+        daemon.run_forever()
+
+        assert len(calls) == 2
+        assert calls[0].strftime("%H:%M") == "10:00"
+        assert calls[1].strftime("%H:%M") == "20:00"
+        assert calls[1] - calls[0] > timedelta(hours=5)
+
+    def test_restart_midday_runs_only_second_slot(self, tmp_path):
+        state_path = str(tmp_path / "daemon_state.json")
+        first_clock = {"now": dt(10, 0)}
+        first_calls = []
+        first_daemon = None
+
+        def first_sleeper(secs):
+            first_daemon.stop()
+
+        def first_execute():
+            first_calls.append(first_clock["now"])
+            first_daemon.stop()
+
+        first_daemon = Daemon(
+            lambda: ["10:00", "20:00"], first_execute,
+            sleeper=first_sleeper, install_handlers=False,
+            now_fn=lambda: first_clock["now"],
+            state_path=state_path,
+        )
+        first_daemon.run_forever()
+        assert first_calls == [dt(10, 0)]
+
+        # 同一天 19:00 重启：10:00 时段已完成，只补 20:00
+        clock = {"now": dt(19, 0)}
+        second_calls = []
+        second_daemon = None
+
+        def second_sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        def second_execute():
+            second_calls.append(clock["now"])
+            second_daemon.stop()
+
+        second_daemon = Daemon(
+            lambda: ["10:00", "20:00"], second_execute,
+            sleeper=second_sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            state_path=state_path,
+        )
+        second_daemon.run_forever()
+
+        assert len(second_calls) == 1
+        assert second_calls[0].strftime("%H:%M") == "20:00"
+
+    def test_date_only_provider_skips_first_keeps_second(self):
+        # 15:00 时 provider 返回今天的仅日期标记（手动 run 已执行）：
+        # 10:00 时段跳过，20:00 时段仍要执行补缺口
+        clock = {"now": dt(15, 0)}
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        def execute():
+            calls.append(clock["now"])
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: ["10:00", "20:00"], execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            last_run_date_provider=lambda: "2026-01-01",
+        )
+        daemon.run_forever()
+
+        assert len(calls) == 1
+        assert calls[0].strftime("%H:%M") == "20:00"
+
+    def test_failed_first_slot_does_not_block_second(self, tmp_path):
+        # 第一时段重试用尽（delay=0, max=0）后，第二时段仍要在同一天执行
+        state_path = str(tmp_path / "daemon_state.json")
+        clock = {"now": dt(10, 0)}
+        calls = []
+        daemon = None
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        def execute():
+            calls.append(clock["now"])
+            if len(calls) == 1:
+                raise RuntimeError("时段一失败")
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: ["10:00", "20:00"], execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            state_path=state_path,
+            retry_settings_provider=lambda: (0.0, 0),
+        )
+        daemon.run_forever()
+
+        assert len(calls) == 2
+        assert calls[1].strftime("%H:%M") == "20:00"
+        state = status.read_state(state_path)
+        assert state is not None
+        assert state["last_run_slot"] == "2026-01-01#20:00"
+        # 第二时段成功后重试计数归零
+        assert state["attempts_today"] == 0
+
+    def test_slot_writer_receives_slots_in_order(self):
+        clock = {"now": dt(10, 0)}
+        written = []
+        seen_clock = []
+        daemon = None
+
+        def sleeper(secs):
+            clock["now"] += timedelta(seconds=secs)
+
+        def slot_writer(slot):
+            written.append(slot)
+            seen_clock.append(clock["now"])
+            if len(written) == 2:
+                daemon.stop()
+
+        daemon = Daemon(
+            lambda: ["10:00", "20:00"], lambda: None,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            slot_writer=slot_writer,
+        )
+        daemon.run_forever()
+
+        assert written == ["2026-01-01#10:00", "2026-01-01#20:00"]
+        assert seen_clock[0].strftime("%H:%M") == "10:00"
+        assert seen_clock[1].strftime("%H:%M") == "20:00"
+
+    def test_state_records_last_run_slot_and_daily_times(self, tmp_path):
+        state_path = str(tmp_path / "daemon_state.json")
+        clock = {"now": dt(10, 0)}
+        daemon = None
+
+        def sleeper(secs):
+            daemon.stop()
+
+        def execute():
+            daemon.stop()
+
+        daemon = Daemon(
+            lambda: ["10:00", "20:00"], execute,
+            sleeper=sleeper, install_handlers=False,
+            now_fn=lambda: clock["now"],
+            state_path=state_path,
+        )
+        daemon.run_forever()
+
+        state = status.read_state(state_path)
+        assert state is not None
+        assert state["last_run_slot"] == "2026-01-01#10:00"
+        assert state["daily_times"] == ["10:00", "20:00"]

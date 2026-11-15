@@ -55,7 +55,9 @@ import yaml  # noqa: E402
 from curator_views.core import status  # noqa: E402
 from curator_views.core.boost_list import peek_next  # noqa: E402
 from curator_views.core.booster import Booster  # noqa: E402
-from curator_views.core.daemon import Daemon  # noqa: E402
+from curator_views.core.daemon import (  # noqa: E402
+    Daemon, parse_daily_times, pick_run_marker,
+)
 from curator_views.core.forecast import forecast_days  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
     CookieFileError,
@@ -138,10 +140,16 @@ boost_enabled: true
 
 # ── 守护进程模式参数 ──────────────────────────────────────────────────────
 
-# 每日执行时刻（Asia/Shanghai，格式 HH:MM）。
+# 每日执行时刻列表（可选，优先于 daily_time）。每个时刻都会完整执行一次每日流程：
+# 后一时段会按当日已刷自动补剩余缺口，所以一天分两段刷量时填这里。
+# 留空 [] 则使用下面的 daily_time 单时刻（行为与旧版本一致）。
+# 白话：想每天跑两次就填 ["10:00", "20:00"]，只跑一次就留空。
+daily_times: []
+
+# 每日执行时刻（Asia/Shanghai，格式 HH:MM）——daily_times 留空时的回退单时刻。
 # daemon 模式每天此时执行一次每日流程，且每次执行前都会重新加载
 # 本配置文件——修改此处或任意配置均无需重启进程。
-# 白话：每天几点跑，改这里就行，daemon 不用重启。
+# 白话：只用单时刻时填这里；想一天多次就改上面的 daily_times。
 daily_time: "10:00"
 
 # 执行失败后当天重试的间隔（分钟）与最多重试次数（不含首次执行）。
@@ -615,11 +623,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon(args: argparse.Namespace) -> int:
-    """守护进程模式：常驻运行，每天到点重载配置并执行每日流程。
+    """守护进程模式：常驻运行，每天到达配置时刻执行每日流程。
 
-    每次循环重新加载配置文件（改配置/执行时间无需重启）；
-    启动时若今天尚未执行且已过执行时刻，立即补跑一次；
-    单次执行失败不退出进程，等待下一天。
+    每次循环重新加载配置文件（改配置/执行时刻无需重启）；
+    支持一天多个执行时段（daily_times，如 ["10:00", "20:00"]），每个时段都
+    完整执行一次每日流程，后一时段按当日已刷自动补剩余缺口；
+    启动时若今天已过某个尚未执行的时段，立即补跑一次；
+    单个时段执行失败不退出进程，按间隔在该时段内重试，用尽后等下一时段或明天。
     """
     config_path = Path(args.config)
     cfg = _load_config(config_path)
@@ -628,30 +638,46 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     log_path = _setup_logging(config_path, db_path, console=True)
     logger.info("守护进程日志文件: %s", log_path)
 
-    def load_daily_time() -> str:
-        # 每次循环重载配置，取每日执行时刻
-        return str(_load_config(config_path).get("daily_time", "10:00"))
+    def load_daily_times() -> Any:
+        # 每次循环重载配置：优先 daily_times，留空则回退 daily_time 单时刻
+        cfg = _load_config(config_path)
+        return cfg.get("daily_times") or cfg.get("daily_time", "10:00")
 
-    def read_db_last_run_date() -> str:
-        """从数据库读取最近一次完成日期（手动 run 也会写这个键）。
+    def read_db_last_run_marker() -> str:
+        """从数据库读取最近一次完成标记（时段优先，其次日期）。
 
-        数据库或 kv_store 表不存在时返回空串，绝不因此阻塞守护进程启动。
+        daemon 成功执行后写 ``last_run_slot``（"YYYY-MM-DD#HH:MM"），
+        手动 ``run`` 只写 ``last_run_date``（"YYYY-MM-DD"）。两者都查，
+        优先返回更精确的时段标记。数据库或 kv_store 表不存在时返回空串，
+        绝不因此阻塞守护进程启动。
         """
         if not Path(db_path).is_file():
             return ""
         conn = None
         try:
             conn = sqlite3.connect(str(db_path))
-            row = conn.execute(
-                "SELECT value FROM kv_store WHERE key = ?", ("last_run_date",)
-            ).fetchone()
-            return str(row[0]) if row else ""
+            rows = conn.execute(
+                "SELECT key, value FROM kv_store "
+                "WHERE key IN ('last_run_slot', 'last_run_date')"
+            ).fetchall()
+            values = {str(key): str(value) for key, value in rows}
+            return pick_run_marker(
+                values.get("last_run_slot", ""),
+                values.get("last_run_date", ""),
+            )
         except sqlite3.Error:
-            logger.warning("读取数据库 last_run_date 失败", exc_info=True)
+            logger.warning("读取数据库 last_run 标记失败", exc_info=True)
             return ""
         finally:
             if conn is not None:
                 conn.close()
+
+    def mark_slot_done(slot: str) -> None:
+        """成功后把已完成的时段写入数据库，供重启/手动执行核对。"""
+        try:
+            Storage(str(db_path)).save_state("last_run_slot", slot)
+        except (OSError, sqlite3.Error):
+            logger.warning("写入数据库 last_run_slot 失败", exc_info=True)
 
     def execute_once() -> Dict[str, Any]:
         # 每次执行前重新加载配置，命令行 --boost/--no-boost 覆盖配置
@@ -683,10 +709,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
 
     state_path = status.default_state_path(db_path)
     daemon = Daemon(
-        load_daily_time,
+        load_daily_times,
         execute_once,
         state_path=state_path,
-        last_run_date_provider=read_db_last_run_date,
+        last_run_date_provider=read_db_last_run_marker,
+        slot_writer=mark_slot_done,
         retry_settings_provider=load_retry_settings,
     )
     try:
@@ -786,8 +813,12 @@ def _print_info_report(report: Dict[str, Any]) -> None:
             f"{config['target_max']:g}" if config.get("target_max") else "不设"
         )
         bounds_text = f"；目标上下界=[{floor_text}, {ceiling_text}]"
+    # 兼容手工构造的报告：缺失 daily_times 时回退到单个 daily_time
+    daily_times = config.get("daily_times") or [
+        config.get("daily_time", "10:00")
+    ]
     print(
-        f"配置: 每日执行 {config['daily_time']}；{boost_text}；"
+        f"配置: 每日执行 {', '.join(daily_times)}；{boost_text}；"
         f"boost_mode={config['boost_mode']}{bounds_text}"
     )
 
@@ -850,6 +881,9 @@ def cmd_info(args: argparse.Namespace) -> int:
         "daemon": daemon_info,
         "config": {
             "daily_time": str(cfg.get("daily_time", "10:00")),
+            "daily_times": parse_daily_times(
+                cfg.get("daily_times") or cfg.get("daily_time", "10:00")
+            ),
             "boost_enabled": bool(cfg.get("boost_enabled", True)),
             "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
             "target_min": float(cfg.get("target_min", 0) or 0),

@@ -199,3 +199,25 @@ class TestInfoHuman:
 
         assert code == 0
         assert "错误" not in capsys.readouterr().err
+
+
+class TestInfoDailyTimes:
+    def test_daily_times_list_is_reflected_in_config(self, tmp_path, capsys):
+        text = (
+            'clan_id: ""\n'
+            'cookie_file: "missing_cookie.txt"\n'
+            'db_path: "views.db"\n'
+            'daily_times: ["10:00", "20:00"]\n'
+            'daily_time: "10:00"\n'
+            'boost_enabled: false\n'
+            'boost_mode: stable\n'
+        )
+        config_path = write_config(tmp_path, text)
+
+        code = cli.main(["info", "--config", str(config_path), "--json"])
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["config"]["daily_times"] == ["10:00", "20:00"]
+        # 旧的 daily_time 字段保留不变
+        assert payload["config"]["daily_time"] == "10:00"
