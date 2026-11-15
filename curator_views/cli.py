@@ -92,6 +92,7 @@ __version__ = "1.0.0"
 DEFAULT_CONFIG = r"""# Steam 鉴赏家浏览量预测与受控提升系统配置文件
 # 使用方法：`python cli.py init-config` 生成本模板，或手动复制后修改。
 # 相对路径均相对于本文件所在目录解析。
+# 只需保留关心的键：没写的键自动使用模板默认值（clan_id 仍为必填）。
 
 # ── 基础配置 ──────────────────────────────────────────────────────────────
 
@@ -321,6 +322,27 @@ wait_max: 16.0
 max_retries: 3
 """
 
+# 配置默认值的单一来源：直接解析上面的 init-config 模板。
+# 用户配置文件里没写的键一律回退到这里的值，保证最小配置也能跑起来。
+# boost_distribution / executor_cmd 是模板未列出的可选高级键，单独补默认值。
+DEFAULT_CONFIG_VALUES: Dict[str, Any] = {
+    **(yaml.safe_load(DEFAULT_CONFIG) or {}),
+    "boost_distribution": "ratio",
+    "executor_cmd": "",
+}
+
+
+def _with_defaults(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """用模板默认值补齐配置里没写的键。
+
+    显式写 ``null`` 视为“没写”，回退默认值；显式空串 / 空列表 / 0 等
+    有效值原样保留（例如 ``cookie_file: ""`` 表示主动关闭 Cookie）。
+    """
+    merged = dict(DEFAULT_CONFIG_VALUES)
+    if cfg:
+        merged.update({k: v for k, v in cfg.items() if v is not None})
+    return merged
+
 
 def _print_error(message: str) -> None:
     """向 stderr 打印错误信息。"""
@@ -328,7 +350,11 @@ def _print_error(message: str) -> None:
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
-    """读取并解析 YAML 配置；文件缺失或解析失败时给出明确提示并退出。"""
+    """读取并解析 YAML 配置；没写的键回退到 init-config 模板默认值。
+
+    文件缺失或解析失败时给出明确提示并退出。配置文件只写关心的键即可，
+    其余键自动使用 ``DEFAULT_CONFIG_VALUES`` 中的默认值。
+    """
     if not config_path.is_file():
         _print_error(f"配置文件不存在: {config_path}")
         _print_error(
@@ -345,7 +371,7 @@ def _load_config(config_path: Path) -> Dict[str, Any]:
     except OSError as exc:
         _print_error(f"读取配置文件失败: {exc}")
         sys.exit(1)
-    return data if isinstance(data, dict) else {}
+    return _with_defaults(data if isinstance(data, dict) else {})
 
 
 def _resolve_path(cfg_dir: Path, value: str) -> str:
@@ -428,7 +454,7 @@ def _build_runtime(
     cfg_dir = config_path.resolve().parent
     clan_id = _require(cfg, "clan_id", "（Steam 鉴赏家组 ID）")
     cookie_file, boost_cookie_file = _resolve_cookie_paths(cfg, cfg_dir)
-    db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
+    db_path = _resolve_path(cfg_dir, str(cfg["db_path"]))
     proxy = cfg.get("proxy") or None
     return (
         cfg,
@@ -443,15 +469,14 @@ def _build_runtime(
 
 def _build_notifier(cfg: Dict[str, Any], db_path: str) -> Notifier:
     """按配置构造 Notifier；队列文件放在数据库同级目录。"""
+    cfg = _with_defaults(cfg)
     return Notifier(
-        ntfy_url=str(cfg.get("ntfy_url", "") or ""),
-        ntfy_topic=str(cfg.get("ntfy_topic", "") or ""),
-        enabled=bool(cfg.get("ntfy_enabled", True)),
-        min_level=str(
-            cfg.get("ntfy_min_level", "info") or "info"
-        ).strip().lower(),
-        daily_summary=bool(cfg.get("ntfy_daily_summary", True)),
-        quiet_hours=str(cfg.get("ntfy_quiet_hours", "") or ""),
+        ntfy_url=str(cfg["ntfy_url"] or ""),
+        ntfy_topic=str(cfg["ntfy_topic"] or ""),
+        enabled=bool(cfg["ntfy_enabled"]),
+        min_level=str(cfg["ntfy_min_level"] or "info").strip().lower(),
+        daily_summary=bool(cfg["ntfy_daily_summary"]),
+        quiet_hours=str(cfg["ntfy_quiet_hours"] or ""),
         queue_path=str(Path(db_path).parent / "notify_queue.json"),
     )
 
@@ -464,57 +489,60 @@ def _make_booster(
     storage: Storage,
 ) -> Booster:
     """按配置构造 Booster 实例。"""
+    cfg = _with_defaults(cfg)
     return Booster(
         clan_id=clan_id,
         cookie_file=cookie_file,
         proxy=proxy,
         storage=storage,
-        batch_size=int(cfg.get("batch_size", 50)),
-        single_cap=int(cfg.get("single_cap", 300)),
-        threads=int(cfg.get("threads", 1)),
-        wait_min=float(cfg.get("wait_min", 8.0)),
-        wait_max=float(cfg.get("wait_max", 16.0)),
-        max_retries=int(cfg.get("max_retries", 3)),
-        target_ratio=float(cfg.get("target_ratio", 0.95)),
-        distribution=str(cfg.get("boost_distribution", "ratio")).lower(),
+        batch_size=int(cfg["batch_size"]),
+        single_cap=int(cfg["single_cap"]),
+        threads=int(cfg["threads"]),
+        wait_min=float(cfg["wait_min"]),
+        wait_max=float(cfg["wait_max"]),
+        max_retries=int(cfg["max_retries"]),
+        target_ratio=float(cfg["target_ratio"]),
+        distribution=str(cfg["boost_distribution"]).lower(),
     )
 
 
 def _scheduler_config(
     cfg: Dict[str, Any], boost_enabled: bool, dry_run: bool, cfg_dir: Path
 ) -> Dict[str, Any]:
-    """把配置映射为调度器 run_daily 所需的 config 字典。"""
-    list_file = str(cfg.get("boost_list_file", "") or "").strip()
+    """把配置映射为调度器 run_daily 所需的 config 字典。
+
+    缺失键统一回退到 init-config 模板默认值（与配置文件同源）。
+    """
+    cfg = _with_defaults(cfg)
+    list_file = str(cfg["boost_list_file"] or "").strip()
     return {
-        "window_days": int(cfg.get("window_days", 14)),
-        "trend_cap": float(cfg.get("trend_cap", 0.15)),
-        "startup_factor": float(cfg.get("startup_factor", 0.9)),
-        "trend_min_points": int(cfg.get("trend_min_points", 5)),
-        "outlier_k": float(cfg.get("outlier_k", 0.30)),
-        "consecutive_days": int(cfg.get("consecutive_days", 2)),
-        "absorb_days": int(cfg.get("absorb_days", 3)),
-        "exclude_flagged": bool(cfg.get("exclude_flagged", True)),
-        "cooldown_days": int(cfg.get("cooldown_days", 7)),
-        "baseline_days": int(cfg.get("baseline_days", 60)),
-        "slope_days": int(cfg.get("slope_days", 14)),
-        "slope_threshold": float(cfg.get("slope_threshold", 0.02)),
-        "baseline_views": float(cfg.get("baseline_views", 0) or 0),
-        "boost_mode": str(cfg.get("boost_mode", "stable")).lower(),
-        "growth_factor": float(cfg.get("growth_factor", 1.0) or 1.0),
-        "growth_rate": float(cfg.get("growth_rate", 0) or 0),
-        "target_min": float(cfg.get("target_min", 0) or 0),
-        "target_max": float(cfg.get("target_max", 0) or 0),
-        "volatility": float(cfg.get("volatility", 0) or 0),
-        "boost_n": int(cfg.get("boost_n", 5)),
-        "single_cap": int(cfg.get("single_cap", 300)),
-        "batch_size": int(cfg.get("batch_size", 50)),
-        "target_ratio": float(cfg.get("target_ratio", 0.95)),
-        "boost_distribution": str(
-            cfg.get("boost_distribution", "ratio")
-        ).lower(),
-        "threads": int(cfg.get("threads", 1)),
-        "wait_min": float(cfg.get("wait_min", 8.0)),
-        "wait_max": float(cfg.get("wait_max", 16.0)),
+        "window_days": int(cfg["window_days"]),
+        "trend_cap": float(cfg["trend_cap"]),
+        "startup_factor": float(cfg["startup_factor"]),
+        "trend_min_points": int(cfg["trend_min_points"]),
+        "outlier_k": float(cfg["outlier_k"]),
+        "consecutive_days": int(cfg["consecutive_days"]),
+        "absorb_days": int(cfg["absorb_days"]),
+        "exclude_flagged": bool(cfg["exclude_flagged"]),
+        "cooldown_days": int(cfg["cooldown_days"]),
+        "baseline_days": int(cfg["baseline_days"]),
+        "slope_days": int(cfg["slope_days"]),
+        "slope_threshold": float(cfg["slope_threshold"]),
+        "baseline_views": float(cfg["baseline_views"] or 0),
+        "boost_mode": str(cfg["boost_mode"]).lower(),
+        "growth_factor": float(cfg["growth_factor"] or 1.0),
+        "growth_rate": float(cfg["growth_rate"] or 0),
+        "target_min": float(cfg["target_min"] or 0),
+        "target_max": float(cfg["target_max"] or 0),
+        "volatility": float(cfg["volatility"] or 0),
+        "boost_n": int(cfg["boost_n"]),
+        "single_cap": int(cfg["single_cap"]),
+        "batch_size": int(cfg["batch_size"]),
+        "target_ratio": float(cfg["target_ratio"]),
+        "boost_distribution": str(cfg["boost_distribution"]).lower(),
+        "threads": int(cfg["threads"]),
+        "wait_min": float(cfg["wait_min"]),
+        "wait_max": float(cfg["wait_max"]),
         "boost_enabled": bool(boost_enabled),
         "dry_run": bool(dry_run),
         "boost_list_file": _resolve_path(cfg_dir, list_file) if list_file else "",

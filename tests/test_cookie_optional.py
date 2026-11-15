@@ -146,7 +146,8 @@ class TestCliCookieCheck:
         assert cli._check_cookie_file(str(path)) is True
         assert capsys.readouterr().err == ""
 
-    def test_build_runtime_allows_missing_cookie_file_key(self, tmp_path):
+    def test_build_runtime_falls_back_to_default_cookie_file(self, tmp_path):
+        # 没写 cookie_file 时按模板默认值 cookie.txt 解析（相对配置文件目录）
         config = tmp_path / "config.yaml"
         config.write_text(
             'clan_id: "123"\ndb_path: "views.db"\n', encoding="utf-8"
@@ -155,7 +156,8 @@ class TestCliCookieCheck:
             config
         )
         assert clan_id == "123"
-        assert cookie_file == ""
+        assert Path(cookie_file) == tmp_path / "cookie.txt"
+        # boost_cookie_file 模板默认空串 → 刷量仍走游客模式
         assert boost_cookie == ""
 
 
