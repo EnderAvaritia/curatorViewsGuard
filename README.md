@@ -428,7 +428,7 @@ python curator_views/cli.py login --config config.yaml \
 python curator_views/cli.py login --config config.yaml \
   --cookie-file cookie_boost.txt --profile-dir .steam_profile_boost
 
-# 5. 只读巡检：抓取统计并预览预测，不产生提升请求
+# 5. 巡检：抓取统计并写入本地库，同时预览预测（不产生提升请求）
 python curator_views/cli.py check --config config.yaml
 
 # 6. 只读估算未来 7 天的目标与缺口
@@ -706,7 +706,7 @@ x = 日期序号（最近 N 天，N = window_days × 2，默认 28 天）
 | `run` | 每日完整流程（抓取 → 预测 → 检测 → 提升 → 通知） |
 | `daemon` | 常驻运行，每天到点执行每日流程（配置热重载） |
 | `info` | 查看守护进程状态与本地数据概况（离线只读） |
-| `check` | 只读检查：抓取统计并打印最近 7 天与预测摘要 |
+| `check` | 抓取统计并写入本地库，打印最近 7 天与预测摘要（`--no-write` 只读） |
 | `forecast` | 只读推算今天/明天起 N 天的目标 / 假设自然流量 / 缺口 |
 | `boost` | 手动执行一轮受控提升 |
 | `login` | 半自动登录 Steam，生成/校验 Cookie |
@@ -778,10 +778,19 @@ python curator_views/cli.py info --config config.yaml [--json]
 ### 8.4 check
 
 ```bash
-python curator_views/cli.py check --config config.yaml
+python curator_views/cli.py check --config config.yaml [--no-write]
 ```
 
-只读巡检：抓取统计数据，打印最近 7 天与预测摘要，不产生提升请求，也不写数据库。
+抓取统计数据并**写入本地数据库的 `daily_stats`**（与 `run` 的抓取入库一致），
+然后打印最近 7 天与预测摘要。不产生提升请求。
+
+- 只写 `daily_stats`：不写 `boost_log`，也不写 `program_start` / `last_run_date` /
+  `last_stats_date` / growth 锚点，因此不会被 daemon 当成“今天已执行”；
+- `--no-write`：只抓取并打印，不建库不写库，保持旧版纯只读行为；
+- 数据库打不开（路径不可写等）时报错并以 1 退出，其余情况下照常打印统计与预测。
+
+写库后可以直接用 `forecast` 看到最新一天，不必先跑一次完整 `run`；`check` 抓到的
+数据对次日 `run` 也是幂等覆盖（`daily_stats` 以 `date_ts` 为主键）。
 
 ### 8.5 forecast
 
@@ -1330,8 +1339,9 @@ python curator_views/cli.py info --config config.yaml
 
 ### 12.8 数据库被锁 / 并发读写
 
-Storage 使用 WAL 与线程锁，单进程内并发安全。不要让多个 `run` / `daemon` 同时
-写同一个数据库；`forecast` 使用只读 URI，不会加写锁。
+Storage 使用 WAL 与线程锁，单进程内并发安全。不要让多个 `run` / `daemon` / `check`
+同时写同一个数据库（`check` 默认会写 `daily_stats`，需要并发巡检时加
+`--no-write`）；`forecast` 使用只读 URI，不会加写锁。
 
 ### 12.9 手动修正某天的刷量记录
 
@@ -1394,6 +1404,18 @@ boost_list_file: "boost_plan.txt"
 - `boost_cookie_file` 的行为变化见 13.1；
 - `boost_distribution` / `executor_cmd` 未写入默认模板，可手动添加。
 
+### 13.6 check 改为写库
+
+`check` 现在会把抓取到的统计写入 `daily_stats`（默认行为），不再只是内存预览：
+
+- 只写统计表，不写 `boost_log` / `program_start` / `last_run_date` /
+  `last_stats_date` / growth 锚点，因此不影响 daemon 的同日去重；
+- 想保留旧的纯只读行为，用 `check --no-write`；
+- 写库失败（路径不可写、数据库损坏等）会报错并以 1 退出。
+
+排查“`forecast` 显示的数据比 `check` 旧”时，现在跑一次 `check` 即可对齐，不必等
+下一次 `run`。
+
 ---
 
 ## 14. 安全与合规
@@ -1416,7 +1438,7 @@ boost_list_file: "boost_plan.txt"
 python -m pytest tests/ -v
 ```
 
-当前测试共 **217** 个，覆盖：
+当前测试共 **222** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1427,6 +1449,7 @@ python -m pytest tests/ -v
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；
 - `forecast` 的逐日估算、默认含今天/自然口径、`--tomorrow`、警告、只读数据库行为、
   表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；
+- `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
 - daemon 的 plan_next、同日去重、状态与 info 输出。
 
 测试目录：
@@ -1436,6 +1459,7 @@ tests/
 ├── conftest.py
 ├── test_anti_cheat.py
 ├── test_booster.py
+├── test_cli_check.py
 ├── test_cli_info.py
 ├── test_cli_logging.py
 ├── test_convergence.py

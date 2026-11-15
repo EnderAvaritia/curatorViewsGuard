@@ -30,7 +30,8 @@
   子进程方式唤起执行器刷量（调度器崩了不影响执行器，执行器可被手动单独触发）；
 - 每日完整流程：抓取统计 -> 入库 -> 预测 -> 溢出检测 -> 计算缺口 -> 提升 -> 通知；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
-- 只读检查与数据导出：随时查看最近 7 天与预测摘要，或导出历史统计数据。
+- 巡检与数据导出：`check` 抓取统计并写入本地库，随时查看最近 7 天与预测摘要，
+  或导出历史统计数据。
 
 ## 安装
 
@@ -60,7 +61,7 @@ python curator_views/cli.py init-config
 #    Cookie 文件可用 login 命令半自动生成：
 python curator_views/cli.py login --config config.yaml
 
-# 3. 只读检查：抓取统计并预览预测（不会产生任何提升请求）
+# 3. 巡检：抓取统计并写入本地库，同时预览预测（不会产生任何提升请求）
 python curator_views/cli.py check --config config.yaml
 
 # 4. 执行每日完整流程（抓取-预测-检测-提升-通知）
@@ -173,11 +174,22 @@ boost_list_file: "boost_plan.txt"
 
 ### check
 
-只读检查：抓取统计数据，打印最近 7 天浏览量与预测摘要。不会产生任何写入
-（含网络写入），可放心用于日常巡检。
+抓取统计数据并**写入本地库的 `daily_stats`**，然后打印最近 7 天浏览量与预测摘要。
+不产生任何提升请求。
+
+- 只写 `daily_stats`；不写 `boost_log`，也不写 `program_start` / `last_run_date` /
+  `last_stats_date` / growth 锚点，daemon 的同日去重不受影响；
+- 抓取结果按 `date_ts` 幂等覆盖，重复执行不会产生重复行；
+- 数据库不可写时报错并以 1 退出。
 
 ```bash
 python curator_views/cli.py check --config config.yaml
+```
+
+想让 `check` 恢复纯只读（不建库、不写库），加 `--no-write`：
+
+```bash
+python curator_views/cli.py check --config config.yaml --no-write
 ```
 
 ### forecast

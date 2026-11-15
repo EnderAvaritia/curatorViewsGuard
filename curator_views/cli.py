@@ -6,7 +6,7 @@
   run          执行每日完整流程（抓取 -> 预测 -> 溢出检测 -> 受控提升 -> 通知）
   daemon       守护进程模式：常驻运行，每天到点重载配置并执行每日流程
   info         查看守护进程是否在运行（本地离线，不触网）
-  check        只读检查：抓取统计，打印最近 7 天与预测摘要（不提升）
+  check        抓取统计并写入本地库，打印最近 7 天与预测摘要（不提升）
   forecast     只读推算未来 N 天的目标 / 假设自然流量 / 刷量缺口
   boost        手动执行一轮受控提升
   login        半自动登录 Steam 并生成/校验 cookie.txt（需要 playwright）
@@ -837,6 +837,12 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    """抓取统计数据写入本地库，然后打印最近 7 天与预测摘要。
+
+    只写 ``daily_stats``（与 ``run`` 的抓取入库一致），不写 ``boost_log``、
+    ``program_start`` / ``last_run_date`` / growth 锚点，因此不会被 daemon
+    误判为“今天已执行”。``--no-write`` 可恢复旧的纯内存只读行为。
+    """
     (
         cfg, cfg_dir, clan_id, cookie_file,
         _boost_cookie_file, db_path, proxy,
@@ -848,6 +854,33 @@ def cmd_check(args: argparse.Namespace) -> int:
     history = sorted(history, key=lambda entry: entry["date_ts"])
 
     print(f"共获取到 {len(history)} 天的统计数据。")
+
+    if history:
+        latest = history[-1]
+        latest_date = datetime.fromtimestamp(
+            int(latest["date_ts"]), tz=_TZ
+        ).strftime("%Y-%m-%d")
+        written = (
+            f"（{len(history)} 天，最新 {latest_date} = "
+            f"{int(latest['num_views']):,} 次）"
+        )
+    else:
+        written = "（0 天）"
+
+    if getattr(args, "no_write", False):
+        print("只读模式: 未写入数据库（--no-write）。")
+    else:
+        try:
+            storage = Storage(db_path)
+            for entry in history:
+                storage.upsert_daily_stats(
+                    int(entry["date_ts"]), int(entry["num_views"])
+                )
+        except sqlite3.Error as exc:
+            _print_error(f"写入数据库失败: {exc}")
+            return 1
+        print(f"已写入数据库: {db_path}{written}")
+
     print("最近 7 天:")
     for entry in history[-7:]:
         print(f"  date_ts={entry['date_ts']}  num_views={entry['num_views']}")
@@ -1477,8 +1510,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="以 JSON 输出原始报告")
     p_info.set_defaults(func=cmd_info)
 
-    p_check = sub.add_parser("check", help="只读检查：抓取统计并打印最近 7 天与预测摘要")
+    p_check = sub.add_parser(
+        "check", help="抓取统计并写入本地库，打印最近 7 天与预测摘要"
+    )
     p_check.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
+    p_check.add_argument("--no-write", action="store_true",
+                         help="只抓取并打印，不写数据库（旧行为）")
     p_check.set_defaults(func=cmd_check)
 
     p_boost = sub.add_parser("boost", help="手动执行一轮受控提升")
