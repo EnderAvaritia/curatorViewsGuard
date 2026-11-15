@@ -585,12 +585,13 @@ boost_mode / growth_factor / growth_rate：
         配置错误，简报会标记为 warning。
 
     boost_list_fallback：
-        可选，默认 False，仅在"列表文件存在但已无有效行（empty）"时生效：
+        可选，默认 True，仅在"列表文件存在但已无有效行（empty）"时生效：
         为 True 时不再停刷，而是回退到基线/自动预测口径，沿用上面算出的
         need（已扣除恢复期、今日已刷与上限），相当于列表耗尽后自动继续按
         基线刷量；出现回退且当日确有缺口时，简报升级为 warning 提示已回退。
-        文件缺失（missing）或读取失败（error）属于配置/IO 错误，即使开启
-        该开关也不回退，仍按 0 处理并标记 warning，避免掩盖配置问题。
+        设为 False 则恢复"用完即停"。文件缺失（missing）或读取失败（error）
+        属于配置/IO 错误，即使开启该开关也不回退，仍按 0 处理并标记 warning，
+        避免掩盖配置问题。
     """
     # ── 读取配置（带默认值）──────────────────────────────────────────────
     window_days = int(config.get("window_days", 14))
@@ -626,7 +627,7 @@ boost_mode / growth_factor / growth_rate：
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
     boost_list_file = str(config.get("boost_list_file", "") or "").strip()
-    boost_list_fallback = bool(config.get("boost_list_fallback", False))
+    boost_list_fallback = bool(config.get("boost_list_fallback", True))
     threads = int(config.get("threads", getattr(booster, "threads", 1)))
     wait_min = float(config.get("wait_min", getattr(booster, "wait_min", 8.0)))
     wait_max = float(config.get("wait_max", getattr(booster, "wait_max", 16.0)))

@@ -25,8 +25,8 @@
   让今日目标随机（固定基线/缺口小时用）；`volatility_min` /
   `target_volatility_min` 给幅度设下限，抖动按天持久化、同日多时段复用；
 - 每日刷量列表：配置 `boost_list_file` 后按列表逐行刷量，一行一个数量，
-  每天消费首行并在成功后删除该行（刷完一行删一行）；`boost_list_fallback: true`
-  时列表耗尽后自动回退基线/自动预测继续刷；
+  每天消费首行并在成功后删除该行（刷完一行删一行）；默认 `boost_list_fallback: true`
+  （列表耗尽后自动回退基线/自动预测继续刷，设 false 为用完即停）；
 - 缺口按昨日自然流量计算：从 `boost_log` 台账扣除昨日自己刷的量，避免把昨天的
   补量当成今天已有的基础重复扣减（否则目标补不满、还会两天一摆）；
 - 调度器/执行器分离：默认同进程直调 Booster，也可配置 `executor_cmd` 以独立
@@ -196,10 +196,10 @@ boost_list_file: "boost_plan.txt"
 ```
 
 每天取第一条有效行覆盖计算出的缺口，成功提升后从文件中删除该行
-（原子写回，其余行与换行符保持不变）。列表用完时默认当天不刷量、不回退到
-自动预测；配置 `boost_list_fallback: true` 后，列表耗尽（文件存在但无有效行）
-会自动回退到基线/自动预测口径继续刷量（简报升级为 warning）。文件缺失/读取
-失败属于配置错误，即使开启回退也不回退。恢复期、`--dry-run`、
+（原子写回，其余行与换行符保持不变）。列表用完时**默认自动回退**到基线/自动
+预测口径继续刷量（`boost_list_fallback: true`，简报升级为 warning）；设
+`boost_list_fallback: false` 则用完即停、不回退。文件缺失/读取失败属于配置错误，
+即使开启回退也不回退。恢复期、`--dry-run`、
 `boost_enabled: false`、提升完全失败时均不消费列表行。列表数值仍受
 `single_cap` / `target_ratio` 等执行参数约束，需要精确刷满可配合
 `target_ratio: 1.0` 或 `boost_distribution: exact`。
@@ -396,7 +396,7 @@ python curator_views/cli.py version
 | `retry_max_times` | `3` | 每个时段最多重试次数（不含首次执行），用尽后放弃该时段 |
 | `executor_cmd` | （空） | 执行器子进程命令模板，支持 `{config}`/`{need}`/`{apps}` 占位符；留空则同进程直调 |
 | `boost_list_file` | （空） | 每日刷量列表文件路径；非空时一行一个刷量数，每天消费首行，成功刷完后删除该行 |
-| `boost_list_fallback` | `false` | 列表耗尽（文件存在但无有效行）时是否回退基线/自动预测；`false` = 用完即停 |
+| `boost_list_fallback` | `true` | 列表耗尽（文件存在但无有效行）时自动回退基线/自动预测；`false` = 用完即停 |
 | `window_days` | `14` | 中位数计算窗口（天数） |
 | `trend_cap` | `0.15` | 趋势斜率相对中位数的封顶比例 |
 | `startup_factor` | `0.9` | 启动阶段保守系数 |

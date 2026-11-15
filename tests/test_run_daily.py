@@ -948,7 +948,8 @@ class TestBoostList:
         assert "boost_list_consumed" not in summary
         assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"
 
-    def test_empty_list_skips_boost(self, tmp_path):
+    def test_empty_list_skips_boost_when_fallback_disabled(self, tmp_path):
+        # 显式关闭回退：列表为空时停刷（默认是回退，见下一个用例）
         list_path = self._write(tmp_path, "# 用完了\n\n")
         booster = FakeBooster()
         summary = run_with(
@@ -957,6 +958,7 @@ class TestBoostList:
             booster,
             baseline_views=200,
             boost_list_file=list_path,
+            boost_list_fallback=False,
         )
         assert summary["boost_list_status"] == "empty"
         assert summary["need"] == 0
