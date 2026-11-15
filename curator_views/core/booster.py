@@ -48,6 +48,10 @@ APP_PAGE_URL = "https://store.steampowered.com/app/{app_id}/?curator_clanid={cla
 
 REQUEST_TIMEOUT = 30  # 秒
 
+# 并发工作线程上限：threads 配得再大，实际也只开这么多线程。
+# 调大意味着同一时刻有更多请求打向 Steam，更接近机器行为，请自行评估风控风险。
+MAX_WORKERS = 8
+
 # 重试之间的退避等待区间（秒），与批次间的 wait_min/wait_max 相互独立
 RETRY_WAIT_MIN = 3.0
 RETRY_WAIT_MAX = 8.0
@@ -92,7 +96,8 @@ class Booster:
         storage: 数据存储实例，用于记录每次提升（log_boost）。
         batch_size: 每批处理的游戏数量。
         single_cap: 单个游戏单日成功次数上限。
-        threads: 并发线程数，<=1 为顺序执行（推荐，计数确定）；>1 使用线程池。
+        threads: 并发线程数，<=1 为顺序执行（推荐，计数确定）；>1 使用线程池，
+            实际并发不超过模块常量 ``MAX_WORKERS``。
         wait_min / wait_max: 两次请求之间的随机等待区间（秒）。
         max_retries: 连续请求失败多少次后中止整个任务。
         target_ratio: 累计成功达到目标值的该比例后提前停止（ratio 模式）。
@@ -315,7 +320,7 @@ class Booster:
 
     def _visit_many_parallel(self, app_ids: List[str]) -> Dict[str, bool]:
         """并发访问多个 App 页面，返回 {app_id: 是否成功}。"""
-        max_workers = max(1, min(self.threads, 2))
+        max_workers = max(1, min(self.threads, MAX_WORKERS))
         results: Dict[str, bool] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {

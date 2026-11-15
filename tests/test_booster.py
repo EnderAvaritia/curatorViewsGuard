@@ -5,9 +5,10 @@
 """
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from curator_views.core.booster import Booster
+from curator_views.core.booster import MAX_WORKERS, Booster
 
 
 class FakeStorage:
@@ -28,6 +29,7 @@ def make_booster(
     target_ratio: float = 0.95,
     single_cap: int = 300,
     batch_size: int = 50,
+    threads: int = 1,
 ) -> Booster:
     return Booster(
         clan_id="123",
@@ -36,7 +38,7 @@ def make_booster(
         storage=FakeStorage(),
         batch_size=batch_size,
         single_cap=single_cap,
-        threads=1,
+        threads=threads,
         wait_min=0.0,
         wait_max=0.0,
         max_retries=3,
@@ -140,3 +142,34 @@ class TestRatioDistribution:
         # 未显式传 distribution 时默认 ratio（向后兼容）
         booster = make_booster()
         assert booster.distribution == "ratio"
+
+
+class TestConcurrencyCap:
+    """线程池大小恒被 MAX_WORKERS 截断：配置再大也不会突破实现上限。"""
+
+    def _run_with_captured_workers(self, threads: int) -> int:
+        booster = make_booster(single_cap=1, threads=threads)
+        captured = {}
+
+        def fake_executor(max_workers):
+            captured["max_workers"] = max_workers
+            return ThreadPoolExecutor(max_workers=max_workers)
+
+        with patch("curator_views.core.booster.Fetcher") as mock_cls, patch.object(
+            booster, "_visit_app", return_value=True
+        ), patch(
+            "curator_views.core.booster.ThreadPoolExecutor",
+            side_effect=fake_executor,
+        ):
+            mock_cls.return_value.fetch_recent_recommendations.return_value = (
+                make_recommendations(3)
+            )
+            booster.run(3, n_recommendations=3)
+
+        return captured["max_workers"]
+
+    def test_threads_above_cap_clamped_to_max_workers(self):
+        assert self._run_with_captured_workers(64) == MAX_WORKERS
+
+    def test_threads_below_cap_kept_as_configured(self):
+        assert self._run_with_captured_workers(3) == 3

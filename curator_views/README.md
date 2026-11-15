@@ -242,7 +242,7 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
 首日缺口已按剩余量计算，同一天重跑前后看到的缺口就是还需补的量。
 「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`），
 在受线程/等待间隔限制时标 `吞吐不足`；单日容量 = `boost_n × single_cap`，
-单日吞吐上限 = `min(threads, 2, boost_n, batch_size) × 86400 /
+单日吞吐上限 = `min(threads, MAX_WORKERS, boost_n, batch_size) × 86400 /
 max(wait_min, wait_max)`（未计请求耗时），都会单独列在表格上方。缺口超过吞吐上限时
 给出 `throughput_capacity` 警告。
 
@@ -385,13 +385,14 @@ python curator_views/cli.py version
 | `batch_size` | `50` | 每批处理的游戏数量 |
 | `target_ratio` | `0.95` | 累计提升达到目标值的该比例后提前停止（仅 ratio 模式生效） |
 | `boost_distribution` | `"ratio"` | 提升分配方式：`ratio` 达到目标比例提前停（默认）；`exact` 按推荐条数精确分配配额，恰好刷满目标（如 500 / 30 条 → 前 20 条各 17 次 + 后 10 条各 16 次） |
-| `threads` | `1` | 并发线程数（建议保持 1） |
+| `threads` | `1` | 并发线程数（实际不超过 `MAX_WORKERS`，默认 8；建议保持 1） |
 | `wait_min` | `8.0` | 两次请求之间的最小等待秒数 |
 | `wait_max` | `16.0` | 两次请求之间的最大等待秒数 |
 | `max_retries` | `3` | 连续请求失败达到该次数后中止任务 |
 
-`threads` 实际并发上限为 2，且受 `boost_n` / `batch_size` 限制；单日吞吐上限 ≈
-`min(threads, 2, boost_n, batch_size) × 86400 / max(wait_min, wait_max)`
+`threads` 实际并发不超过 `MAX_WORKERS`（`booster.py` 模块常量，默认 8），且受
+`boost_n` / `batch_size` 限制；单日吞吐上限 ≈
+`min(threads, MAX_WORKERS, boost_n, batch_size) × 86400 / max(wait_min, wait_max)`
 （未计请求耗时）。`forecast` 会用 `throughput_capacity` 警告提示“一天跑不满”的
 配置，`run` 也会记录警告并在简报中提示。
 
