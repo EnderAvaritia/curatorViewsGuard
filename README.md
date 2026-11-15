@@ -155,6 +155,10 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 同一组目标/缺口抖动按「日期 + 波动配置签名」持久化：
 同一天重跑、daemon 多时段都复用同一值，后续时段只补「配额 − 今日已刷」。
 
+最终决策（目标、抖动、缺口、配额、恢复期/列表状态）同时写入 `daily_plan` 表：
+`forecast` 首日在配置签名一致时直接复用该定档值，不再重新抽样；未来日仍是
+独立抽样的预测。
+
 单条推荐上限 = single_cap
 单日总容量   = 最近推荐数 boost_n × single_cap
 ```
@@ -263,10 +267,13 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 - **无硬性上限**：`volatility` / `target_volatility` 不再限制 0.3 或 0.15；但抖动
   幅度会同步放大反作弊检测参照（`×(1 + target_volatility + volatility)`），
   配得越大，对真实外部刷量的检出越迟钝，需要自行权衡。
-- **forecast 默认纳入随机化**：每天独立抽样目标抖动与缺口抖动，按 `run` 的
-  口径估算目标/配额/缺口；`--no-volatility` 可关闭随机化、输出未抖动基准，
-  并给出 `volatility_not_modeled` 提示。`target_low` / `target_high` 始终给出
-  目标抖动区间。抽样不读写 `kv_store`，与 `run` 当天持久化值可能不同。
+- **forecast 首日复用定档**：`run` 会把当天最终决策写入 `daily_plan`；配置签名
+  一致时 `forecast` 首日直接读取该定档值（不再重新抽样），因此显示的缺口与
+  `run` 当天的执行口径一致。签名不一致时丢弃定档并重新抽样，同时给出
+  `plan_signature_mismatch` 提示。未来日仍按 `run` 的口径独立抽样目标/缺口抖动；
+  `--no-volatility` 可关闭随机化、输出未抖动基准（不读取定档），并给出
+  `volatility_not_modeled` 提示。`target_low` / `target_high` 始终给出目标抖动
+  区间。
 
 例 1（缺口抖动）：目标 1000、昨日自然 900、缺口 100、`volatility: 0.10`，
 今天配额 90 ~ 110，总量约 990 ~ 1010。
@@ -1029,12 +1036,17 @@ python curator_views/cli.py forecast --config config.yaml \
 首日基准取今天之前最近一个完整日；若本地库最新日期早于昨天，会给出
 `stale_history` 提示，建议加 `--fetch`。
 这是**估算不是精确预测**：未来自然流量只是外推；异常标记未持久化，因此
-`in_cooldown` 恒为 `false`，未来日也不做溢出扣减；自然口径同样不含恢复期与
-刷量列表，只复用 `run` 的缺口公式。波动率默认纳入估算：每天独立抽样
-`target_volatility` / `volatility`，表格的「目标」「缺口」是本次抽样结果，
-`target_low` / `target_high` 给出目标可能区间；加 `--no-volatility` 则输出
-未抖动基准，并给出 `volatility_not_modeled` 提示。抽样不读写 `kv_store`，
-因此同一天反复执行 `forecast` 结果会不同，也不保证复现 `run` 当天的持久化值。
+未来日的 `in_cooldown` 恒为 `false`，也不做溢出扣减；自然口径同样不含恢复期与
+刷量列表，只复用 `run` 的缺口公式。首日则会读取 `run` 写入 `daily_plan` 的定档
+决策：配置签名一致时「目标」「缺口」「配额」直接采用 `run` 当天的最终值，
+`rows[0].plan_source` 为 `persisted`，并显示「今日目标: 已定档 …」；签名不一致、
+没有定档或使用 `--no-volatility` 时退回抽样/基准预测（`plan_source` 为
+`predicted`）。未来日始终是独立抽样：每天独立抽样 `target_volatility` /
+`volatility`，`target_low` / `target_high` 给出目标可能区间。`--no-volatility`
+输出未抖动基准，并给出 `volatility_not_modeled` 提示。只有首日复用定档值，
+同一天反复执行 `forecast` 时未来日结果仍可能不同。`summary.first_plan_status`
+记录首日定档状态（`persisted` / `signature_mismatch` / `missing` /
+`ignored_no_volatility`），`summary.first_plan_updated_at` 为定档写入时间。
 
 forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run` 的检测参照是
 `base × max(1, multiplier) × (1 + target_volatility + volatility)`。当
@@ -1047,9 +1059,10 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 数据来源: 本地数据库 E:\...\views.db（18 天，最新 2026-11-13 = 5,449 次）
 自然口径: 基准日 2026-11-13 实际 5,449 - 刷量 0 = 自然 5,449；未来日假设自然不变
 今日已刷: 0 次（2026-11-14，来自 boost_log；首日缺口已按剩余量计算）
+今日目标: 已定档 7,094.2（run 于 2026-11-14T10:00:00 写入数据库；首日不再重新抽样）
 参数: boost_mode=growth factor=0.85 rate=-0.01
       基线=auto 自然模型=natural 缺口波动率=0.10（最小 0.00） 目标波动率=0.00（最小 0.00）
-波动率: 已纳入预测（每天独立抽样；与 run 当日持久化值可能不同）
+波动率: 已纳入预测（首日取数据库定档值；未来日独立抽样）
 单日容量: 1,500 次（boost_n=5 × single_cap=300）
 
 日期           基准  目标系数     目标  假设自然  今日已刷   缺口  备注
@@ -1096,6 +1109,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `over_capacity` | 某些天缺口超过 `boost_n × single_cap` 的单日容量 |
 | `throughput_capacity` | 某些天缺口超过按 `threads` / 等待间隔估算的单日吞吐上限（未计请求耗时） |
 | `stale_history` | 自然口径下本地库最新日期早于昨天，缺口可能基于旧数据 |
+| `plan_signature_mismatch` | 数据库里的首日定档是在不同波动率/基线配置下计算的，已丢弃并重新抽样（`run` 当天也会重新抽） |
 | `volatility_not_modeled` | 使用了 `--no-volatility` 且配置了波动率：表格为未抖动基准（`target_low` / `target_high` 仍给出目标区间） |
 
 ### 8.5.1 forecast 折线图（控制台 + HTML）
@@ -1505,13 +1519,18 @@ sudo systemctl enable --now curator-views.timer
 
 ### 11.1 SQLite 数据库
 
-默认 `views.db`，WAL 模式，包含三张表：
+默认 `views.db`，WAL 模式，包含四张表：
 
 | 表 | 内容 |
 | --- | --- |
 | `daily_stats` | 每日浏览量（`date_ts` 主键 → `num_views`） |
 | `boost_log` | 刷量台账（日期、数量、备注、创建时间） |
 | `kv_store` | 键值状态 |
+| `daily_plan` | 每日决策定档：`date` 主键 + `target` / `raw_target` / `target_jitter` / `gap_jitter` / `deduction` / `gross_need` / `boost_quota` / `need` / `today_boosted` / `target_bound` / `in_cooldown` / `list_status` / `list_amount` / `signature` / `updated_at`；供 `forecast` 首日复用 |
+
+`daily_plan` 每跑一次 `run` 覆盖当天一行（同一日多时段只更新 `need` /
+`today_boosted` / `updated_at`），`signature` 记录当时的波动率与基线配置；
+`forecast` 签名一致时才复用该定档值。`--dry-run` 不写此表。
 
 `kv_store` 常见键：
 
@@ -1822,6 +1841,17 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 
 `notify_queue.json` 位于数据库（`db_path`）同级目录，已被 `.gitignore` 忽略，
 无需手工维护；删除它只会丢弃尚未补发的积压通知。
+
+### 13.11 每日目标定档
+
+`run` 现在会把当天最终决策（目标、抖动、缺口、配额、恢复期/列表状态）写入
+`daily_plan` 表；`forecast` 首日在配置签名一致时直接复用该定档值，不再重新抽样，
+因此不会再出现「run 已经按某个目标开刷、forecast 却显示另一个目标和缺口」的
+矛盾。未来日仍按原逻辑独立抽样预测，`--no-volatility` 仍输出未抖动基准（不读取
+定档）。数据库升级完全自动：打开旧 `views.db` 时会自动补建 `daily_plan` 表，原有
+`daily_stats` / `boost_log` / `kv_store` 数据不受影响；`--dry-run` 不写入定档。
+如果当天没有跑过 `run`（或改了波动率/基线配置导致签名变化），`forecast` 会显示
+无定档记录或 `plan_signature_mismatch` 提示，并退回抽样预测。
 
 ---
 

@@ -151,6 +151,14 @@ class TestRenderForecastHtml:
             make_result(), make_config()
         )
 
+    def test_notes_persisted_first_day(self):
+        config = make_config(volatility=0.10)
+        result = forecast_days(make_history(), config, START_TS, days=2)
+        result["summary"]["first_plan_status"] = "persisted"
+
+        page = render_forecast_html(result, config)
+        assert "首日为定档值，其余为本次抽样" in page
+
     def test_write_creates_parent_directories(self, tmp_path):
         target = tmp_path / "nested" / "chart.html"
         written = write_forecast_chart(
@@ -197,6 +205,18 @@ class TestRenderForecastConsole:
 
         assert "已纳入随机波动" in text
         assert "重新运行可能不同" in text
+
+    def test_notes_persisted_first_day(self):
+        config = make_config(volatility=0.10)
+        result = forecast_days(make_history(), config, START_TS, days=2)
+        text = render_forecast_console(
+            result,
+            config,
+            {"today_plan_status": "persisted"},
+            width=72,
+        )
+
+        assert "首日为定档值，其余为本次抽样" in text
 
     def test_empty_rows_do_not_crash(self):
         text = render_forecast_console(

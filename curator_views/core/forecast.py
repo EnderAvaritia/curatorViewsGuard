@@ -10,6 +10,10 @@
 注意 ``run_daily`` 的检测参照是 ``base * max(1.0, multiplier)``，而刷量目标是
 ``base * multiplier``。``growth_factor < 1`` 时「目标」是托底值，检测参照仍是自然
 水平；本模块输出的是**托底目标**，避免用户误把它当成检测参照。
+
+首日（今天）可以复用 ``run`` 写入 ``daily_plan`` 的定档决策：配置签名一致时，
+目标与抖动不再重新抽样，而是直接采用 ``run`` 当天的最终值，避免 forecast 显示
+与 run 实际执行矛盾的缺口。未来日仍然只是独立抽样的预测。
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from .scheduler import (
     _daily_throughput_capacity,
     _effective_threads,
     _jitter_bounds,
+    _jitter_signature,
     _normalize_target_bounds,
     _sample_signed_jitter,
     _target_multiplier,
@@ -45,6 +50,7 @@ def forecast_days(
     first_natural: Optional[int] = None,
     first_day_boosted: int = 0,
     model_volatility: bool = True,
+    first_day_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """逐日推算未来 ``days`` 天的目标、假设自然流量与刷量缺口。
 
@@ -68,6 +74,11 @@ def forecast_days(
         model_volatility: 是否把 ``target_volatility`` / ``volatility`` 纳入
             预测。默认 True：每天独立抽样一次目标抖动与缺口抖动，按 ``run``
             的口径算目标与缺口；False：输出未抖动基准（用于确定性预览）。
+        first_day_plan: ``run_daily`` 写入 ``daily_plan`` 的当日定档字典。
+            ``model_volatility`` 为 True 且签名与日期一致时，首日直接复用定档的
+            ``target`` / 抖动 / 配额 / 恢复期 / 列表状态，不再抽样；签名不一致时
+            丢弃并重新抽样（warning ``plan_signature_mismatch``）；``None`` 时
+            保持旧行为。未来日始终是独立抽样预测。
 
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
@@ -85,6 +96,10 @@ def forecast_days(
           未抖动缺口；未来日不做溢出扣减；
         - ``boost_quota = round(gross_need × (1 + 缺口抖动))``（不低于 0）；
         - ``need = max(0, boost_quota - first_day_boosted)``，后续日不扣已刷；
+        - 首日若复用定档：``target`` / ``target_jitter`` / ``gap_jitter`` /
+          ``gross_need`` / ``boost_quota`` / ``in_cooldown`` / 列表状态直接取
+          ``first_day_plan``，不抽样；``need`` 在恢复期为 0，列表模式取列表
+          数值（已刷 > 0 时为 0），否则为 ``max(0, boost_quota - 已刷)``；
         - 把假设日按 ``num_views = assumed_natural + first_day_boosted + need``
           回填进 ``local_history``，使后续天的预测窗口包含前面已刷的量。
 
@@ -160,24 +175,78 @@ def forecast_days(
     rows: List[Dict[str, Any]] = []
     cumulative_boost = 0
 
+    # 与 run_daily 使用同一组归一化上下界与参数顺序，保证签名可比。
+    current_signature = _jitter_signature(
+        baseline_views,
+        boost_mode,
+        growth_factor,
+        growth_rate,
+        target_floor,
+        target_ceiling,
+        volatility,
+        volatility_min,
+        target_volatility,
+        target_volatility_min,
+    )
+    first_date_iso = _iso_date(int(start_ts))
+    plan = first_day_plan if isinstance(first_day_plan, dict) else None
+    first_plan_status = "missing"
+    first_plan_updated_at: Optional[str] = None
+    plan_warning: Optional[Dict[str, str]] = None
+    if plan is not None:
+        if not model_volatility:
+            # --no-volatility 的语义是“输出未抖动基准”，不是“读取定档值”。
+            first_plan_status = "ignored_no_volatility"
+        elif plan.get("signature") != current_signature:
+            first_plan_status = "signature_mismatch"
+            plan_warning = {
+                "code": "plan_signature_mismatch",
+                "message": (
+                    f"{first_date_iso} 的数据库定档记录是在不同的波动率/基线"
+                    "配置下计算的（配置签名不一致），已丢弃并重新抽样；"
+                    "run 当天也会按当前配置重新抽取抖动。"
+                ),
+            }
+        elif plan.get("date") != first_date_iso:
+            first_plan_status = "signature_mismatch"
+            plan_warning = {
+                "code": "plan_signature_mismatch",
+                "message": (
+                    "数据库定档记录的日期与预测首日不一致，已丢弃并重新抽样；"
+                    "查看当天定档请用默认的 --today 视角。"
+                ),
+            }
+        else:
+            first_plan_status = "persisted"
+            first_plan_updated_at = plan.get("updated_at")
+
     for index in range(max(0, int(days))):
         date_ts = int(start_ts) + 86400 * index
+        use_plan = index == 0 and first_plan_status == "persisted"
         base = baseline_views if baseline_views > 0 else prediction
         multiplier = _target_multiplier(factor, growth_rate, drift_start, date_ts)
         raw_target = base * multiplier
-        target_jitter = 0.0
-        if model_volatility and target_jitter_high > 0:
-            target_jitter = _sample_signed_jitter(
-                target_jitter_high, target_jitter_low
-            )
+        if use_plan:
+            # 复用 run 已经抽好的目标抖动，不再消耗随机数。
+            target_jitter = float(plan.get("target_jitter") or 0.0)
+        else:
+            target_jitter = 0.0
+            if model_volatility and target_jitter_high > 0:
+                target_jitter = _sample_signed_jitter(
+                    target_jitter_high, target_jitter_low
+                )
         jittered_target = raw_target
         if target_jitter:
             jittered_target = max(
                 0.0, raw_target * (1.0 + target_jitter)
             )
-        target, target_bound = _clamp_target(
-            jittered_target, target_floor, target_ceiling
-        )
+        if use_plan:
+            target = float(plan.get("target", raw_target))
+            target_bound = str(plan.get("target_bound") or "")
+        else:
+            target, target_bound = _clamp_target(
+                jittered_target, target_floor, target_ceiling
+            )
         # 目标抖动区间（预览用）：不随本次抽样变化，始终展示可能范围。
         target_low, _ = _clamp_target(
             max(0.0, raw_target * (1.0 - target_jitter_high)),
@@ -204,41 +273,58 @@ def forecast_days(
         already_boosted = (
             max(0, int(first_day_boosted)) if index == 0 else 0
         )
-        gross_need = max(0, int(round(target - assumed_natural)))
-        gap_jitter = 0.0
-        if model_volatility and gap_jitter_high > 0:
-            gap_jitter = _sample_signed_jitter(
-                gap_jitter_high, gap_jitter_low
-            )
-        boost_quota = gross_need
-        if gap_jitter:
-            boost_quota = max(
-                0, int(round(gross_need * (1.0 + gap_jitter)))
-            )
-        need = max(0, boost_quota - already_boosted)
+        if use_plan:
+            gross_need = int(plan.get("gross_need", 0))
+            gap_jitter = float(plan.get("gap_jitter") or 0.0)
+            boost_quota = int(plan.get("boost_quota", gross_need))
+            in_cooldown = bool(plan.get("in_cooldown"))
+            list_status = plan.get("list_status")
+            list_amount = plan.get("list_amount")
+            if in_cooldown:
+                need = 0
+            elif list_status == "active" and list_amount is not None:
+                need = 0 if already_boosted > 0 else int(list_amount)
+            else:
+                need = max(0, boost_quota - already_boosted)
+        else:
+            gross_need = max(0, int(round(target - assumed_natural)))
+            gap_jitter = 0.0
+            if model_volatility and gap_jitter_high > 0:
+                gap_jitter = _sample_signed_jitter(
+                    gap_jitter_high, gap_jitter_low
+                )
+            boost_quota = gross_need
+            if gap_jitter:
+                boost_quota = max(
+                    0, int(round(gross_need * (1.0 + gap_jitter)))
+                )
+            in_cooldown = False
+            need = max(0, boost_quota - already_boosted)
         cumulative_boost += need
-        rows.append(
-            {
-                "date": _iso_date(date_ts),
-                "date_ts": date_ts,
-                "base": round(float(base), 1),
-                "multiplier": round(float(multiplier), 4),
-                "raw_target": round(float(raw_target), 1),
-                "target": round(float(target), 1),
-                "target_low": round(float(target_low), 1),
-                "target_high": round(float(target_high), 1),
-                "target_jitter": round(float(target_jitter), 6),
-                "target_bound": target_bound,
-                "assumed_natural": assumed_natural,
-                "already_boosted": already_boosted,
-                "gross_need": gross_need,
-                "gap_jitter": round(float(gap_jitter), 6),
-                "boost_quota": boost_quota,
-                "need": need,
-                "cumulative_boost": cumulative_boost,
-                "in_cooldown": False,
-            }
-        )
+        row = {
+            "date": _iso_date(date_ts),
+            "date_ts": date_ts,
+            "base": round(float(base), 1),
+            "multiplier": round(float(multiplier), 4),
+            "raw_target": round(float(raw_target), 1),
+            "target": round(float(target), 1),
+            "target_low": round(float(target_low), 1),
+            "target_high": round(float(target_high), 1),
+            "target_jitter": round(float(target_jitter), 6),
+            "target_bound": target_bound,
+            "assumed_natural": assumed_natural,
+            "already_boosted": already_boosted,
+            "gross_need": gross_need,
+            "gap_jitter": round(float(gap_jitter), 6),
+            "boost_quota": boost_quota,
+            "need": need,
+            "cumulative_boost": cumulative_boost,
+            "in_cooldown": in_cooldown,
+            "plan_source": "persisted" if use_plan else "predicted",
+        }
+        if use_plan:
+            row["plan_updated_at"] = plan.get("updated_at")
+        rows.append(row)
         # 回填假设日：自然流量 + 今天已刷 + 当天缺口，供后续天预测窗口使用
         local_history.append(
             {
@@ -256,6 +342,8 @@ def forecast_days(
         history, rows, growth_rate, boost_n, single_cap,
         threads, wait_min, wait_max, batch_size,
     )
+    if plan_warning is not None:
+        warnings.append(plan_warning)
     if (target_jitter_high > 0 or gap_jitter_high > 0) and not model_volatility:
         parts: List[str] = []
         if target_jitter_high > 0:
@@ -279,6 +367,8 @@ def forecast_days(
             }
         )
     summary = _build_summary(rows)
+    summary["first_plan_status"] = first_plan_status
+    summary["first_plan_updated_at"] = first_plan_updated_at
     summary["throughput_capacity"] = throughput_capacity
     summary["effective_threads"] = _effective_threads(
         threads, boost_n, batch_size

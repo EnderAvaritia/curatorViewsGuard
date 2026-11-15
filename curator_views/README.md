@@ -282,12 +282,18 @@ growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错
 未来自然流量只是外推，所以结果是**估算不是精确预测**。forecast 输出的是托底目标
 `base × 目标系数（multiplier）`；`run_daily` 的检测参照是
 `base × max(1, multiplier) × (1 + target_volatility + volatility)`，
-`growth_factor < 1` 或配置波动率时二者不同。异常标记未持久化，`in_cooldown`
-恒为 false；自然口径也不含恢复期与刷量列表。波动率默认纳入估算：每天独立
-抽样目标/缺口抖动，表格「目标」「缺口」是本次抽样结果，`target_low` /
-`target_high` 给出目标区间；`--no-volatility` 则输出未抖动基准并提示
-`volatility_not_modeled`。抽样不读写 `kv_store`，同日重复执行结果会不同，
-也不保证复现 `run` 当天的持久化值。
+`growth_factor < 1` 或配置波动率时二者不同。未来日的 `in_cooldown` 恒为 false；
+自然口径也不含恢复期与刷量列表。
+
+首日（今天）会复用 `run` 写入 `daily_plan` 表的定档决策：配置签名一致时，
+「目标」「缺口」「配额」直接采用 `run` 当天的最终值（`rows[0].plan_source` 为
+`persisted`），不再重新抽样，并在表格上方显示「今日目标: 已定档 …」；签名不一致
+时丢弃定档、重新抽样并给出 `plan_signature_mismatch` 提示，没有定档时显示
+「数据库无定档记录」。未来日仍然是独立抽样：表格「目标」「缺口」是本次抽样结果，
+`target_low` / `target_high` 给出目标区间；`--no-volatility` 则输出未抖动基准
+（忽略定档）并提示 `volatility_not_modeled`。只有首日复用定档值，同日重复执行
+forecast 时未来日结果仍可能不同。`summary.first_plan_status` / `first_plan_updated_at`
+记录首日定档状态与写入时间。
 
 `--chart` 直接在控制台输出两张点状字符图：目标 vs 假设自然流量、当日配额 vs
 实际待刷，并在图上方标注模式、基线、波动率与目标上下界；`--chart PATH` 则改为

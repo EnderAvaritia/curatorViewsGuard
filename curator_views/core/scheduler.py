@@ -808,21 +808,23 @@ boost_mode / growth_factor / growth_rate：
     )
     today_expected_raw = base_expected * today_multiplier
     # 目标层抖动：按当日配置签名抽取并持久化，同一天重跑/多时段复用同一值。
+    # 签名与 forecast 首日复用共用同一口径（归一化后的上下界）。
+    jitter_signature = _jitter_signature(
+        baseline_views,
+        boost_mode,
+        growth_factor,
+        growth_rate,
+        target_floor,
+        target_ceiling,
+        volatility,
+        volatility_min,
+        target_volatility,
+        target_volatility_min,
+    )
     target_jitter, gap_jitter = _resolve_daily_jitters(
         storage,
         today_iso,
-        _jitter_signature(
-            baseline_views,
-            boost_mode,
-            growth_factor,
-            growth_rate,
-            target_floor,
-            target_ceiling,
-            volatility,
-            volatility_min,
-            target_volatility,
-            target_volatility_min,
-        ),
+        jitter_signature,
         target_jitter_high,
         target_jitter_low,
         gap_high,
@@ -978,6 +980,34 @@ boost_mode / growth_factor / growth_rate：
                     list_amount, list_remaining, need,
                 )
                 need = list_amount
+
+    # 6.55 定档：把今日最终决策写入 daily_plan，供 forecast 首日复用，
+    #      避免 forecast 重新抽取 target/gap 抖动、显示与 run 矛盾的缺口。
+    #      同一天重跑/多时段会覆盖同一行；dry_run 不写，保持无副作用。
+    if not dry_run:
+        storage.save_daily_plan(
+            {
+                "date": today_iso,
+                "date_ts": today_ts,
+                "base": base_expected,
+                "multiplier": today_multiplier,
+                "raw_target": today_expected_raw,
+                "target": today_expected,
+                "target_jitter": target_jitter,
+                "gap_jitter": gap_jitter,
+                "deduction": today_deduction,
+                "gross_need": gross_need,
+                "boost_quota": boost_quota,
+                "need": need,
+                "today_boosted": today_boosted,
+                "target_bound": target_bound,
+                "in_cooldown": in_cooldown,
+                "list_status": list_status,
+                "list_amount": list_amount,
+                "signature": jitter_signature,
+                "updated_at": datetime.now(_TZ).isoformat(timespec="seconds"),
+            }
+        )
 
     # 6.6 吞吐能力检查：threads 与等待间隔共同决定一天最多能发多少请求。
     #     这是乐观上限（未计请求耗时）；缺口超过它时一天肯定跑不满。

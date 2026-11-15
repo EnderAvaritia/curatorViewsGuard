@@ -367,6 +367,9 @@ def render_forecast_console(
     gap_vol = _config_float(config, "volatility")
     gap_vol_min = _config_float(config, "volatility_min")
     vol_text = "已纳入随机波动" if modeled else "未纳入随机波动"
+    if modeled and source.get("today_plan_status") == "persisted":
+        # 首日取数据库定档值，其余日才是本次抽样，避免图注与表格口径矛盾
+        vol_text = "已纳入随机波动（首日为定档值，其余为本次抽样）"
     vol_detail = (
         f"目标 ±{target_vol:.0%}（最小 {target_vol_min:.0%}） · "
         f"缺口 ±{gap_vol:.0%}（最小 {gap_vol_min:.0%}）"
@@ -490,6 +493,8 @@ def render_forecast_html(
 
     if modeled:
         vol_text = "已纳入随机波动（本图为一次独立抽样）"
+        if summary.get("first_plan_status") == "persisted":
+            vol_text = "已纳入随机波动（首日为定档值，其余为本次抽样）"
     else:
         vol_text = "未纳入随机波动（--no-volatility，未抖动基准）"
     vol_detail = (

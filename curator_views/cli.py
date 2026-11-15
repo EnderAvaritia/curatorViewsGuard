@@ -1256,11 +1256,13 @@ def _apply_overrides(cfg: Dict[str, Any], items: list[str]) -> None:
 
 def _read_forecast_db(
     db_path: str,
-) -> tuple[list[dict], Dict[str, str], Dict[str, int]]:
-    """以只读 URI 打开数据库，返回 (daily_stats, kv_store, boost_totals)。
+) -> tuple[list[dict], Dict[str, str], Dict[str, int], Dict[str, Dict]]:
+    """以只读 URI 打开数据库，返回 (daily_stats, kv_store, boost_totals, plans)。
 
     ``boost_totals`` 按日期（YYYY-MM-DD）汇总 boost_log，供默认自然口径
     扣除基准日自己刷的量；旧库没有 boost_log 时返回空字典。
+    ``plans`` 以日期（YYYY-MM-DD）为键存放 daily_plan 定档行，供首日复用；
+    旧库没有 daily_plan 表时返回空字典。
 
     绝不执行建表/写入，也不启用 WAL；数据库文件内容与 mtime 保持不变。
     """
@@ -1291,9 +1293,19 @@ def _read_forecast_db(
                 boost_totals[str(date)] = int(total)
         except sqlite3.OperationalError:
             pass
+        plans: Dict[str, Dict] = {}
+        try:
+            cursor = conn.execute("SELECT * FROM daily_plan")
+            columns = [desc[0] for desc in cursor.description]
+            for row in cursor.fetchall():
+                plan = dict(zip(columns, row))
+                plans[str(plan["date"])] = plan
+        except sqlite3.OperationalError:
+            # 旧库没有 daily_plan 表：按“无定档”处理，不视为错误。
+            plans = {}
     finally:
         conn.close()
-    return history, kv, boost_totals
+    return history, kv, boost_totals, plans
 
 
 def _forecast_start_epoch() -> int:
@@ -1380,6 +1392,28 @@ def _print_forecast_report(
             f"（{summary['first_date']}，来自 boost_log；"
             "首日缺口已按剩余量计算）"
         )
+        plan_status = source.get("today_plan_status", "missing")
+        if plan_status == "persisted":
+            print(
+                f"今日目标: 已定档 {rows[0]['target']:,.1f}"
+                f"（run 于 {source.get('today_plan_updated_at')} 写入数据库；"
+                "首日不再重新抽样）"
+            )
+        elif plan_status == "signature_mismatch":
+            print(
+                "今日目标: 配置已变更，数据库里的定档目标已失效，"
+                "本次重新抽样（run 也会重新抽）"
+            )
+        elif plan_status == "ignored_no_volatility":
+            print(
+                "今日目标: --no-volatility 生效，忽略数据库定档值，"
+                "输出未抖动基准"
+            )
+        else:
+            print(
+                "今日目标: 数据库无定档记录（今天还没跑过 run），"
+                "本次为抽样预测"
+            )
     baseline = float(config.get("baseline_views", 0) or 0)
     baseline_text = "auto" if baseline <= 0 else f"{baseline:g}"
     print(
@@ -1399,14 +1433,15 @@ def _print_forecast_report(
     gap_vol = float(config.get("volatility", 0) or 0)
     modeled = bool(summary.get("volatility_modeled", True))
     if target_vol > 0 or gap_vol > 0:
-        print(
-            "波动率: "
-            + (
+        if modeled and source.get("today_plan_status") == "persisted":
+            volatility_text = "已纳入预测（首日取数据库定档值；未来日独立抽样）"
+        elif modeled:
+            volatility_text = (
                 "已纳入预测（每天独立抽样；与 run 当日持久化值可能不同）"
-                if modeled
-                else "未纳入预测（--no-volatility，输出未抖动基准）"
             )
-        )
+        else:
+            volatility_text = "未纳入预测（--no-volatility，输出未抖动基准）"
+        print("波动率: " + volatility_text)
     if target_vol > 0:
         print(
             "目标抖动区间: 表中「目标」±"
@@ -1559,7 +1594,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        history, kv, boost_totals = _read_forecast_db(db_path)
+        history, kv, boost_totals, plans = _read_forecast_db(db_path)
     except sqlite3.Error as exc:
         _print_error(f"读取数据库失败: {exc}")
         return 1
@@ -1683,6 +1718,9 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         first_natural=first_natural,
         first_day_boosted=today_boosted,
         model_volatility=bool(getattr(args, "model_volatility", True)),
+        first_day_plan=(
+            plans.get(today_iso) if not start_tomorrow else None
+        ),
     )
     if stale_warning:
         result["warnings"].append(
@@ -1710,6 +1748,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "yesterday_natural": first_natural,
         "today_boosted": None if start_tomorrow else today_boosted,
         "volatility_modeled": bool(getattr(args, "model_volatility", True)),
+        "today_plan_status": result["summary"].get(
+            "first_plan_status", "missing"
+        ),
+        "today_plan_updated_at": result["summary"].get(
+            "first_plan_updated_at"
+        ),
         "day_step": day_step,
     }
     if day_step > 1:

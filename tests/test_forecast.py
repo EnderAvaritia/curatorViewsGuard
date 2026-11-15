@@ -13,7 +13,13 @@ from unittest.mock import patch
 
 from curator_views import cli
 from curator_views.core.forecast import forecast_days
-from curator_views.core.scheduler import _TZ, _date_to_epoch, _today_epoch
+from curator_views.core.scheduler import (
+    _TZ,
+    _date_to_epoch,
+    _jitter_signature,
+    _normalize_target_bounds,
+    _today_epoch,
+)
 
 DAY = 86400
 START_TS = _date_to_epoch("2026-11-14")
@@ -363,6 +369,74 @@ def make_today_db(
     conn.commit()
     conn.close()
     return db_path
+
+
+def plan_signature_for(config_path):
+    """按 CLI 实际使用的调度配置计算 daily_plan 签名。"""
+    cfg = cli._load_config(config_path)
+    sched = cli._scheduler_config(
+        cfg, bool(cfg.get("boost_enabled", True)), True,
+        config_path.resolve().parent,
+    )
+    low, high = _normalize_target_bounds(
+        float(sched["target_min"]), float(sched["target_max"])
+    )
+    return _jitter_signature(
+        float(sched["baseline_views"]),
+        str(sched["boost_mode"]).lower(),
+        float(sched["growth_factor"]),
+        float(sched["growth_rate"]),
+        low,
+        high,
+        float(sched["volatility"]),
+        float(sched["volatility_min"]),
+        float(sched["target_volatility"]),
+        float(sched["target_volatility_min"]),
+    )
+
+
+def insert_daily_plan(db_path, signature, **overrides):
+    """向测试数据库插入一条今日定档记录。"""
+    plan = {
+        "date": _iso(_today_epoch()),
+        "date_ts": _today_epoch(),
+        "base": 1000.0,
+        "multiplier": 1.0,
+        "raw_target": 1234.5,
+        "target": 1234.5,
+        "target_jitter": 0.0,
+        "gap_jitter": 0.0,
+        "deduction": 0.0,
+        "gross_need": 234,
+        "boost_quota": 234,
+        "need": 234,
+        "today_boosted": 0,
+        "target_bound": "",
+        "in_cooldown": 0,
+        "list_status": "disabled",
+        "list_amount": None,
+        "signature": signature,
+        "updated_at": "2026-11-15T10:00:00",
+    }
+    plan.update(overrides)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS daily_plan ("
+        "date TEXT PRIMARY KEY, date_ts INTEGER, base REAL, multiplier REAL, "
+        "raw_target REAL, target REAL, target_jitter REAL, gap_jitter REAL, "
+        "deduction REAL, gross_need INTEGER, boost_quota INTEGER, need INTEGER, "
+        "today_boosted INTEGER, target_bound TEXT, in_cooldown INTEGER, "
+        "list_status TEXT, list_amount INTEGER, signature TEXT, updated_at TEXT)"
+    )
+    columns = ", ".join(plan)
+    placeholders = ", ".join("?" for _ in plan)
+    conn.execute(
+        f"INSERT OR REPLACE INTO daily_plan ({columns}) "
+        f"VALUES ({placeholders})",
+        tuple(plan.values()),
+    )
+    conn.commit()
+    conn.close()
 
 
 class TestTargetVolatilityForecast:
@@ -811,6 +885,52 @@ class TestForecastCli:
         out = capsys.readouterr().out
         assert "单日吞吐上限" in out
         assert "吞吐不足" in out
+
+    def test_cli_reports_persisted_plan(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path)
+        insert_daily_plan(
+            db_path, plan_signature_for(config_path), target=1234.5
+        )
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--days",
+                "1",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "今日目标: 已定档 1,234.5" in out
+
+    def test_cli_reports_missing_plan(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--days",
+                "1",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "今日目标: 数据库无定档记录" in out
+
 
 class TestTargetBounds:
     """forecast 的目标上下界必须与 run_daily 一致。"""

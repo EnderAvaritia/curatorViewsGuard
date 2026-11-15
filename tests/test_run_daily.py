@@ -29,9 +29,13 @@ class FakeStorage:
         self.written_stats = []
         self.saved = {}
         self.boost_totals = boost_totals or {}
+        self.daily_plans = {}
 
     def upsert_daily_stats(self, date_ts: int, num_views: int) -> None:
         self.written_stats.append((date_ts, num_views))
+
+    def save_daily_plan(self, plan: dict) -> None:
+        self.daily_plans[plan["date"]] = dict(plan)
 
     def save_state(self, key: str, value: str) -> None:
         self.saved[key] = value

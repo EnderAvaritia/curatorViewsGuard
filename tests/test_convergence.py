@@ -20,9 +20,13 @@ class LoopStorage:
         self._program_start = program_start
         self.boost_totals: dict[str, int] = {}
         self.saved: dict[str, str] = {}
+        self.daily_plans: dict[str, dict] = {}
 
     def upsert_daily_stats(self, date_ts: int, num_views: int) -> None:
         pass
+
+    def save_daily_plan(self, plan: dict) -> None:
+        self.daily_plans[plan["date"]] = dict(plan)
 
     def save_state(self, key: str, value: str) -> None:
         self.saved[key] = value
