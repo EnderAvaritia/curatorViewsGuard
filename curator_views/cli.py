@@ -1222,6 +1222,12 @@ def _print_forecast_report(
             f"{source['yesterday_boosted']:,} "
             f"= 自然 {source['yesterday_natural']:,}；未来日假设自然不变"
         )
+    if source.get("today_boosted") is not None:
+        print(
+            f"今日已刷: {source['today_boosted']:,} 次"
+            f"（{summary['first_date']}，来自 boost_log；"
+            "首日缺口已按剩余量计算）"
+        )
     baseline = float(config.get("baseline_views", 0) or 0)
     baseline_text = "auto" if baseline <= 0 else f"{baseline:g}"
     print(
@@ -1268,8 +1274,12 @@ def _print_forecast_report(
         )
     print()
 
-    header = ["日期", "基准", "目标系数", "目标", "假设自然", "缺口", "备注"]
-    aligns = ["left", "right", "right", "right", "right", "right", "left"]
+    header = [
+        "日期", "基准", "目标系数", "目标", "假设自然", "今日已刷", "缺口", "备注",
+    ]
+    aligns = [
+        "left", "right", "right", "right", "right", "right", "right", "left",
+    ]
     body: list[list[str]] = []
     for row in rows:
         if row["need"] <= 0:
@@ -1290,6 +1300,12 @@ def _print_forecast_report(
                 f"{row['multiplier']:.3f}",
                 f"{row['target']:,.1f}",
                 f"{row['assumed_natural']:,}",
+                (
+                    f"{row['already_boosted']:,}"
+                    if row["date"] == summary["first_date"]
+                    and source.get("today_boosted") is not None
+                    else "-"
+                ),
                 f"{row['need']:,}",
                 note,
             ]
@@ -1320,7 +1336,8 @@ def _print_forecast_report(
     )
     if natural_basis == "natural":
         print(
-            "说明: 自然口径复用 run 的缺口公式；不含反作弊溢出扣减、恢复期、"
+            "说明: 自然口径复用 run 的缺口公式（缺口 = 目标 - 假设自然 - 今日已刷，"
+            "仅首日扣已刷）；不含反作弊溢出扣减、恢复期、"
             "波动率与刷量列表。"
         )
     if result["warnings"]:
@@ -1451,6 +1468,13 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         history = prior
     # start_tomorrow 保留完整历史：明天视角的基准可以包含今天已入库的数据
 
+    # 今日已刷：只影响首日缺口，重跑/中断后按剩余量续刷。
+    # 明天视角不需要它（明天会从“昨日自然流量”里自动扣掉今天刷的量）。
+    today_iso = datetime.fromtimestamp(today_ts, tz=_TZ).strftime("%Y-%m-%d")
+    today_boosted = (
+        0 if start_tomorrow else max(0, int(boost_totals.get(today_iso, 0)))
+    )
+
     # growth 锚点只读：速率一致且起点可解析才沿用，否则按预测首日重新起算
     growth_start_ts = 0
     try:
@@ -1471,6 +1495,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         growth_start_ts=growth_start_ts,
         natural_mode=natural_mode_arg or "trend",
         first_natural=first_natural,
+        first_day_boosted=today_boosted,
     )
     if stale_warning:
         result["warnings"].append(
@@ -1496,6 +1521,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "yesterday_actual": yesterday_actual,
         "yesterday_boosted": yesterday_boosted,
         "yesterday_natural": first_natural,
+        "today_boosted": None if start_tomorrow else today_boosted,
     }
     if args.json:
         payload = {

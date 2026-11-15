@@ -91,6 +91,11 @@ def program_start_str(start_offset_days: int = 30) -> str:
     return datetime.fromtimestamp(start_ts, tz=_TZ).strftime("%Y-%m-%d")
 
 
+def today_str() -> str:
+    """run_daily 眼中的“今天”（Asia/Shanghai）。"""
+    return datetime.fromtimestamp(_today_epoch(), tz=_TZ).strftime("%Y-%m-%d")
+
+
 def yesterday_str() -> str:
     """make_stats 最后一条统计的日期（即 run_daily 眼中的"昨日"）。"""
     return datetime.fromtimestamp(
@@ -216,6 +221,47 @@ class TestBoostCompensation:
         )
         assert summary["today_expected"] == 300
         assert summary["need"] == 240
+
+
+class TestTodayBoosted:
+    """当日已刷：同一天重跑按剩余缺口续刷，不重复刷整份。"""
+
+    def test_need_subtracts_today_boost(self):
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            boost_totals={today_str(): 30},
+            baseline_views=200,
+        )
+        assert summary["today_boosted"] == 30
+        assert summary["gross_need"] == 100
+        assert summary["need"] == 70
+        assert summary["boosted"] == 70
+
+    def test_already_boosted_enough_skips_run(self):
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            boost_totals={today_str(): 100},
+            baseline_views=200,
+        )
+        assert summary["today_boosted"] == 100
+        assert summary["need"] == 0
+        assert booster.calls == []
+
+    def test_today_boost_is_clamped_at_zero(self):
+        # 台账多于缺口（多进程/手动补过）时不产生负数缺口
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            boost_totals={today_str(): 500},
+            baseline_views=200,
+        )
+        assert summary["need"] == 0
 
 
 class TestVolatility:
@@ -702,6 +748,23 @@ class TestBoostList:
         assert summary["need"] == 0
         assert booster.last_target is None
 
+    def test_already_boosted_today_keeps_line(self, tmp_path):
+        # 今日已刷过：列表模式不续刷，也不消费下一行
+        list_path = self._write(tmp_path, "500\n200\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            boost_totals={today_str(): 30},
+            baseline_views=200,
+            boost_list_file=list_path,
+        )
+        assert summary["boost_list_status"] == "already_boosted"
+        assert summary["need"] == 0
+        assert booster.calls == []
+        assert Path(list_path).read_text(encoding="utf-8") == "500\n200\n"
+
     def test_cooldown_keeps_line(self, tmp_path):
         # 25 天 100 + 连续 2 天被刷到 250 → 进入恢复期；列表行保留到恢复期结束
         list_path = self._write(tmp_path, "500\n200\n")
@@ -738,6 +801,23 @@ class TestThroughputCapacity:
         assert summary["throughput_capacity"] == 5400
         assert "5,900" in summary["capacity_warning"]
         assert "5,400" in summary["capacity_warning"]
+
+    def test_warns_when_need_exceeds_single_run_capacity(self):
+        # 吞吐够但 boost_n × single_cap=1,500 < 缺口 5,900：提示本轮跑不满
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            FakeBooster(),
+            baseline_views=6000,
+            boost_n=5,
+            single_cap=300,
+            threads=2,
+            wait_min=1.0,
+            wait_max=2.0,
+        )
+        assert summary["need"] == 5900
+        assert "单轮容量" in summary["capacity_warning"]
+        assert "续刷" in summary["capacity_warning"]
 
     def test_no_warning_when_two_threads_cover_need(self):
         stats = make_stats([100] * 30)

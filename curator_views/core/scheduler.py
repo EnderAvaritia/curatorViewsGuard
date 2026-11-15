@@ -210,6 +210,7 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
         f"昨日实际浏览量: {summary['yesterday_actual']}",
         f"昨日刷量: {summary.get('yesterday_boosted', 0)}",
         f"昨日自然流量: {summary.get('yesterday_natural', summary['yesterday_actual'])}",
+        f"今日已刷: {summary.get('today_boosted', 0)}",
         f"今日缺口: {summary['need']}",
         f"溢出扣减: {summary['deduction']:.1f}",
         f"溢出异常天数: {summary['overflow_flag_count']}",
@@ -226,6 +227,7 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
             "error": "读取失败",
             "cooldown": "恢复期暂停",
             "consume_error": "消费失败",
+            "already_boosted": "今日已刷",
         }
         lines.append(
             f"刷量列表: {labels.get(list_status, list_status)}"
@@ -650,12 +652,23 @@ boost_mode / growth_factor / growth_rate：
     deductions = compute_deductions(flagged_days, absorb_days)
     today_deduction = float(deductions.get(today_ts, 0.0))
 
-    # 6. 今日缺口 = 期望 - 昨日自然流量 - 溢出扣减。
+    # 6. 今日缺口 = 期望 - 昨日自然流量 - 溢出扣减 - 今日已刷。
     #    自然流量已剔除昨日自己刷的量，补多少就只补"自然流量与目标之间"
     #    的真实差额，不会把昨天的补量当成今天已有的基础重复扣减。
+    #    今日已刷（boost_log 里今天的累计）同样要扣：中断、容量不足或手动重跑
+    #    时按剩余缺口续刷，而不是把整份缺口再刷一遍。
     #    恢复期（最近存在被标记的恶意刷量日）内强制不刷，等待曲线自然回落；
     #    波动率 > 0 时在缺口附近注入随机抖动，使曲线围绕基线上下波动。
-    need = max(0, round(today_expected - yesterday_natural - today_deduction))
+    gross_need = max(
+        0, round(today_expected - yesterday_natural - today_deduction)
+    )
+    today_boosted = max(0, int(storage.get_boost_total(today_iso)))
+    need = max(0, gross_need - today_boosted)
+    if today_boosted > 0:
+        logger.info(
+            "今日已刷 %d 次，缺口 %d → %d（按剩余量继续）。",
+            today_boosted, gross_need, need,
+        )
     in_cooldown = False
     days_since_flagged = -1
     if flagged_ts_first:
@@ -722,6 +735,16 @@ boost_mode / growth_factor / growth_rate：
                     "恢复期内不刷量，列表首行 %d 保留到明天。", list_amount,
                 )
                 need = 0
+            elif today_boosted > 0:
+                # 列表一行代表“当天总量”，重跑时不按剩余量续刷：
+                # 否则成功后会误消费下一行，把明天的配额提前用掉。
+                list_status = "already_boosted"
+                logger.info(
+                    "今日已刷 %d 次，列表首行 %d 保留到明天"
+                    "（列表模式不续刷，避免误消费下一行）。",
+                    today_boosted, list_amount,
+                )
+                need = 0
             else:
                 list_status = "active"
                 logger.info(
@@ -752,6 +775,20 @@ boost_mode / growth_factor / growth_rate：
             "否则一天跑不满。", capacity_warning,
         )
 
+    # 单轮容量（boost_n × single_cap）限制：缺口更大时本轮必然刷不满，
+    # 稍后再次 run 会按“今日已刷”扣减后继续补剩余部分。
+    run_capacity = max(0, boost_n) * max(0, int(booster.single_cap))
+    if boost_enabled and need > run_capacity:
+        message = (
+            f"今日缺口 {need:,} 超过单轮容量 {run_capacity:,}"
+            f"（boost_n={boost_n} × single_cap={booster.single_cap}），"
+            "本轮跑不满；稍后再次 run 会按剩余缺口续刷。"
+        )
+        capacity_warning = (
+            f"{capacity_warning}；{message}" if capacity_warning else message
+        )
+        logger.warning(message)
+
     # 7. 汇总字典
     summary: Dict[str, Any] = {
         "date": today_iso,
@@ -764,6 +801,8 @@ boost_mode / growth_factor / growth_rate：
         "yesterday_actual": yesterday_actual,
         "yesterday_boosted": yesterday_boosted,
         "yesterday_natural": yesterday_natural,
+        "today_boosted": today_boosted,
+        "gross_need": gross_need,
         "need": need,
         "deduction": today_deduction,
         "overflow_flag_count": len(flagged_days),

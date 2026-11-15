@@ -29,6 +29,7 @@
 - 调度器/执行器分离：默认同进程直调 Booster，也可配置 `executor_cmd` 以独立
   子进程方式唤起执行器刷量（调度器崩了不影响执行器，执行器可被手动单独触发）；
 - 每日完整流程：抓取统计 -> 入库 -> 预测 -> 溢出检测 -> 计算缺口 -> 提升 -> 通知；
+- 当日已刷续刷：缺口扣除 `boost_log` 里今天的累计，同一天重跑只补剩余量；
 - 失败当天重试：daemon 执行失败不标记当天完成，按间隔重试；统计 Cookie 失效会
   单独告警，重新登录后下一次重试自动生效，无需重启进程；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
@@ -137,8 +138,8 @@ daemon 重启后同一天不会重复执行。
 
 执行每日完整流程：抓取 Steam 统计并入库，逐日预测期望浏览量，检测异常溢出，
 计算今日缺口，启用提升时调用 Booster 执行受控提升，最后发送每日简报。
-成功后以 JSON 打印汇总（含今日预期、昨日实际、缺口、溢出天数、实际提升数等），
-并在数据库同级目录写入 `curator_views.log` 日志。
+成功后以 JSON 打印汇总（含今日预期、昨日实际、今日已刷、缺口、溢出天数、
+实际提升数等），并在数据库同级目录写入 `curator_views.log` 日志。
 
 ```bash
 python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no-boost]
@@ -147,6 +148,9 @@ python curator_views/cli.py run --config config.yaml [--dry-run] [--boost | --no
 - `--dry-run`：演练模式，计算一切但实际不发送提升请求，也不发简报、不写库
   （统计 / 状态 / `last_run_date` / growth 锚点），不会把当天标记为已执行；
 - `--boost`：强制启用提升；`--no-boost`：强制关闭提升（优先于配置）。
+
+当天可以安全重跑：缺口会先减去 `boost_log` 里今天的累计（`today_boosted`），
+中断、容量/吞吐截断或手动补跑都只补剩余部分，不会把整份缺口再刷一遍。
 
 统计 Cookie 失效（重定向到公开页 / 401 / 403）时，`run` 会推送一条可操作的告警
 并以 1 退出；`check` / `forecast --fetch` 会提示重新登录命令。重新登录方式见主
@@ -220,9 +224,13 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
   “今天该刷多少”）；显式指定时改用旧模型：`trend` 按实际趋势延续，
   `target` 最终收敛到目标；
 - `--set KEY=VALUE`：可重复，覆盖配置做 what-if（也能覆盖 `db_path`）；
-- `--json`：输出 rows / warnings / summary / source 完整结构。
+- `--json`：输出 rows / warnings / summary / source 完整结构；
+  `source.today_boosted` 为今天的已刷量（`--tomorrow` 时为 `null`），
+  `rows[0].already_boosted` 为首日扣除量。
 
-表格的「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`），
+表格的「今日已刷」列只在首日（今天）显示 `boost_log` 当日累计，未来日为 `-`；
+首日缺口已按剩余量计算，同一天重跑前后看到的缺口就是还需补的量。
+「备注」列会在缺口超过单日容量时标 `容量不足`（容量为 0 时标 `无容量`），
 在受线程/等待间隔限制时标 `吞吐不足`；单日容量 = `boost_n × single_cap`，
 单日吞吐上限 = `min(threads, 2, boost_n, batch_size) × 86400 /
 max(wait_min, wait_max)`（未计请求耗时），都会单独列在表格上方。缺口超过吞吐上限时

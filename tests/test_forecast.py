@@ -318,7 +318,9 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=_TZ).strftime("%Y-%m-%d")
 
 
-def make_today_db(tmp_path, boost: int = 100, end_offset: int = 1):
+def make_today_db(
+    tmp_path, boost: int = 100, end_offset: int = 1, today_boost: int = 0
+):
     """相对“今天”建库：最后一条是 end_offset 天前（默认昨天）。
 
     额外写入 boost_log，用于验证 --today 会从昨日实际里扣掉昨日刷量。
@@ -349,6 +351,12 @@ def make_today_db(tmp_path, boost: int = 100, end_offset: int = 1):
         "VALUES (?, ?, '', '')",
         (_iso(end_ts), boost),
     )
+    if today_boost:
+        conn.execute(
+            "INSERT INTO boost_log (date, count, note, created_at) "
+            "VALUES (?, ?, '', '')",
+            (_iso(_today_epoch()), today_boost),
+        )
     conn.commit()
     conn.close()
     return db_path
@@ -696,3 +704,104 @@ class TestTargetBounds:
         assert result["rows"][100]["multiplier"] == 0.0
         assert result["rows"][100]["target"] == 1000.0
         assert "multiplier_zero" not in warning_codes(result)
+
+
+class TestTodayBoosted:
+    """当日已刷：只扣首日缺口，重跑按剩余量续刷。"""
+
+    def test_first_day_boosted_only_subtracts_first_row(self):
+        result = forecast_days(
+            make_history(days=10, views=1000),
+            make_config(baseline_views=2000.0),
+            START_TS,
+            days=3,
+            first_natural=1000,
+            first_day_boosted=400,
+        )
+        rows = result["rows"]
+        assert rows[0]["already_boosted"] == 400
+        assert rows[0]["need"] == 600
+        assert rows[1]["already_boosted"] == 0
+        assert rows[1]["need"] == 1000
+        assert rows[2]["need"] == 1000
+
+    def test_cli_subtracts_today_boost_from_first_gap(
+        self, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0, today_boost=400)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=2000",
+                "--days",
+                "2",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["today_boosted"] == 400
+        assert payload["rows"][0]["already_boosted"] == 400
+        assert payload["rows"][0]["need"] == 600
+        assert payload["rows"][1]["already_boosted"] == 0
+        assert payload["rows"][1]["need"] == 1000
+
+    def test_cli_table_shows_today_boosted_column(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0, today_boost=400)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=2000",
+                "--days",
+                "2",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "今日已刷" in out
+        assert "今日已刷: 400 次" in out
+
+    def test_tomorrow_ignores_today_boost(self, tmp_path, capsys):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(CLI_CONFIG, encoding="utf-8")
+        db_path = make_today_db(tmp_path, boost=0, today_boost=400)
+
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                f"db_path={db_path}",
+                "--set",
+                "baseline_views=2000",
+                "--tomorrow",
+                "--days",
+                "2",
+                "--json",
+            ]
+        )
+
+        assert code == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["source"]["today_boosted"] is None
+        assert payload["rows"][0]["already_boosted"] == 0
+        assert payload["rows"][0]["need"] == 1000

@@ -41,6 +41,7 @@ def forecast_days(
     growth_start_ts: int = 0,
     natural_mode: str = "trend",
     first_natural: Optional[int] = None,
+    first_day_boosted: int = 0,
 ) -> Dict[str, Any]:
     """逐日推算未来 ``days`` 天的目标、假设自然流量与刷量缺口。
 
@@ -58,6 +59,9 @@ def forecast_days(
             此时忽略 ``natural_mode``；刷量只抬高实际浏览量，不会抬高自然流量，
             因此每一天的缺口都会重新按 ``target - first_natural`` 计算，与
             ``run_daily`` 的每日补缺口口径一致。
+        first_day_boosted: 首日（今天）已经刷出的量；只从首日缺口里扣减，
+            后续日期不受影响（明天的“昨日自然流量”已经把它扣过），与
+            ``run_daily`` 的“今日已刷”续刷口径一致。
 
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
@@ -69,8 +73,9 @@ def forecast_days(
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
         - ``need = max(0, round(target - assumed_natural))``，未来日不做溢出扣减；
-        - 把假设日按 ``num_views = assumed_natural + need`` 回填进 ``local_history``，
-          使后续天的预测窗口包含前面已刷的量。
+        - 首日再减去 ``first_day_boosted``（今天已刷的量），重跑时按剩余缺口续刷；
+        - 把假设日按 ``num_views = assumed_natural + first_day_boosted + need``
+          回填进 ``local_history``，使后续天的预测窗口包含前面已刷的量。
 
     异常标记未持久化，``in_cooldown`` 恒为 False，本函数不读取数据库，也不做恢复期推算。
 
@@ -146,8 +151,14 @@ def forecast_days(
             assumed_natural = int(round(previous_target))
         assumed_natural = max(0, assumed_natural)
 
-        # 未来日没有已被标记的溢出量，因此不做任何扣减
-        need = max(0, int(round(target - assumed_natural)))
+        # 未来日没有已被标记的溢出量，因此不做任何扣减；
+        # 只有首日扣“今天已经刷过的量”，重跑时按剩余缺口续刷。
+        already_boosted = (
+            max(0, int(first_day_boosted)) if index == 0 else 0
+        )
+        need = max(
+            0, int(round(target - assumed_natural - already_boosted))
+        )
         cumulative_boost += need
         rows.append(
             {
@@ -159,14 +170,18 @@ def forecast_days(
                 "target": round(float(target), 1),
                 "target_bound": target_bound,
                 "assumed_natural": assumed_natural,
+                "already_boosted": already_boosted,
                 "need": need,
                 "cumulative_boost": cumulative_boost,
                 "in_cooldown": False,
             }
         )
-        # 回填假设日：自然流量 + 当天缺口，供后续天预测窗口使用
+        # 回填假设日：自然流量 + 今天已刷 + 当天缺口，供后续天预测窗口使用
         local_history.append(
-            {"date_ts": date_ts, "num_views": assumed_natural + need}
+            {
+                "date_ts": date_ts,
+                "num_views": assumed_natural + already_boosted + need,
+            }
         )
         previous_target = target
         prediction = predict()
