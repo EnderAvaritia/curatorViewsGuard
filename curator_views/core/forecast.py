@@ -14,6 +14,10 @@
 首日（今天）可以复用 ``run`` 写入 ``daily_plan`` 的定档决策：配置签名一致时，
 目标与抖动不再重新抽样，而是直接采用 ``run`` 当天的最终值，避免 forecast 显示
 与 run 实际执行矛盾的缺口。未来日仍然只是独立抽样的预测。
+
+每一行的刷量都会按 ``[target_min − 假设自然, target_max − 假设自然]`` 夹取
+（``_bound_boost``），确保 ``假设自然 + need`` 不越过目标窗口；上限是绝对硬
+限制，下限只在 ``need > 0`` 时生效，恢复期 / 列表不刷等状态不会被强行托底。
 """
 
 from __future__ import annotations
@@ -24,9 +28,12 @@ from typing import Any, Dict, List, Optional
 from .predictor import predict_expected
 from .scheduler import (
     _TZ,
+    _bound_boost,
+    _ceiling_boost,
     _clamp_target,
     _daily_throughput_capacity,
     _effective_threads,
+    _floor_boost,
     _jitter_bounds,
     _jitter_signature,
     _normalize_target_bounds,
@@ -94,12 +101,16 @@ def forecast_days(
           ``natural_mode`` 推算；
         - ``gross_need = max(0, round(target - assumed_natural))``，
           未抖动缺口；未来日不做溢出扣减；
-        - ``boost_quota = round(gross_need × (1 + 缺口抖动))``（不低于 0）；
+        - ``boost_quota = round(gross_need × (1 + 缺口抖动))``（不低于 0），
+          再按 ``[target_min − 自然, target_max − 自然]`` 夹取（``_bound_boost``）；
         - ``need = max(0, boost_quota - first_day_boosted)``，后续日不扣已刷；
         - 首日若复用定档：``target`` / ``target_jitter`` / ``gap_jitter`` /
           ``gross_need`` / ``boost_quota`` / ``in_cooldown`` / 列表状态直接取
-          ``first_day_plan``，不抽样；``need`` 在恢复期为 0，列表模式取列表
+          ``first_day_plan``，不抽样；定档配额与最终 ``need`` 会再次按边界夹取
+          （旧版定档或列表数值可能越界），``need`` 在恢复期为 0，列表模式取列表
           数值（已刷 > 0 时为 0），否则为 ``max(0, boost_quota - 已刷)``；
+        - 每一行都带 ``bound_hit``（``""`` / ``"min"`` / ``"max"``）；只在实际
+          改变了缺口时汇总成 ``target_bound_hit`` 警告；
         - 把假设日按 ``num_views = assumed_natural + first_day_boosted + need``
           回填进 ``local_history``，使后续天的预测窗口包含前面已刷的量。
 
@@ -174,6 +185,8 @@ def forecast_days(
     previous_target = prediction
     rows: List[Dict[str, Any]] = []
     cumulative_boost = 0
+    bound_counts = {"min": 0, "max": 0}
+    bound_changes: List[Dict[str, Any]] = []
 
     # 与 run_daily 使用同一组归一化上下界与参数顺序，保证签名可比。
     current_signature = _jitter_signature(
@@ -276,16 +289,54 @@ def forecast_days(
         if use_plan:
             gross_need = int(plan.get("gross_need", 0))
             gap_jitter = float(plan.get("gap_jitter") or 0.0)
-            boost_quota = int(plan.get("boost_quota", gross_need))
+            boost_quota_raw = int(plan.get("boost_quota", gross_need))
             in_cooldown = bool(plan.get("in_cooldown"))
             list_status = plan.get("list_status")
             list_amount = plan.get("list_amount")
+            bound_before = 0
+            bound_hit = ""
             if in_cooldown:
+                # 恢复期是“不刷”状态：即使定档配额越界也不托底、不计数。
+                boost_quota = boost_quota_raw
                 need = 0
             elif list_status == "active" and list_amount is not None:
-                need = 0 if already_boosted > 0 else int(list_amount)
+                # 列表数值是当天总量，直接按边界夹取（0 行保持 0）。
+                bound_before = 0 if already_boosted > 0 else int(list_amount)
+                if bound_before > 0:
+                    need, bound_hit = _bound_boost(
+                        bound_before,
+                        assumed_natural,
+                        target_floor,
+                        target_ceiling,
+                    )
+                else:
+                    need = 0
+                boost_quota = boost_quota_raw
+            elif list_status in ("missing", "error", "empty", "already_boosted"):
+                # 这些列表状态本身表示“今日不刷”，不得用配额重新补出来。
+                boost_quota = boost_quota_raw
+                need = 0
             else:
+                boost_quota, quota_bound = _bound_boost(
+                    boost_quota_raw,
+                    assumed_natural,
+                    target_floor,
+                    target_ceiling,
+                )
+                bound_before = max(0, boost_quota_raw - already_boosted)
                 need = max(0, boost_quota - already_boosted)
+                # 再次夹取 need：定档可能写于旧版本（越界）。已刷部分计入
+                # 自然基准，避免把“已刷 + 剩余”重复托底。
+                if need > 0:
+                    need, need_bound = _bound_boost(
+                        need,
+                        assumed_natural + already_boosted,
+                        target_floor,
+                        target_ceiling,
+                    )
+                else:
+                    need_bound = ""
+                bound_hit = need_bound or quota_bound
         else:
             gross_need = max(0, int(round(target - assumed_natural)))
             gap_jitter = 0.0
@@ -299,7 +350,30 @@ def forecast_days(
                     0, int(round(gross_need * (1.0 + gap_jitter)))
                 )
             in_cooldown = False
+            bound_before = max(0, boost_quota - already_boosted)
+            boost_quota, bound_hit = _bound_boost(
+                boost_quota, assumed_natural, target_floor, target_ceiling
+            )
             need = max(0, boost_quota - already_boosted)
+            if need > 0:
+                need, need_bound = _bound_boost(
+                    need,
+                    assumed_natural + already_boosted,
+                    target_floor,
+                    target_ceiling,
+                )
+                bound_hit = need_bound or bound_hit
+        if bound_hit:
+            bound_counts[bound_hit] += 1
+            if need != bound_before:
+                bound_changes.append(
+                    {
+                        "date": _iso_date(date_ts),
+                        "bound": bound_hit,
+                        "before": bound_before,
+                        "after": need,
+                    }
+                )
         cumulative_boost += need
         row = {
             "date": _iso_date(date_ts),
@@ -318,6 +392,7 @@ def forecast_days(
             "gap_jitter": round(float(gap_jitter), 6),
             "boost_quota": boost_quota,
             "need": need,
+            "bound_hit": bound_hit,
             "cumulative_boost": cumulative_boost,
             "in_cooldown": in_cooldown,
             "plan_source": "persisted" if use_plan else "predicted",
@@ -366,6 +441,30 @@ def forecast_days(
                 ),
             }
         )
+    if bound_changes:
+        labels = {"min": "下限", "max": "上限"}
+        shown = bound_changes[:5]
+        parts = [
+            f"{item['date']} {labels[item['bound']]} "
+            f"{item['before']:,}→{item['after']:,}"
+            for item in shown
+        ]
+        extra = ""
+        remaining = len(bound_changes) - len(shown)
+        if remaining > 0:
+            extra = f"；…等 {remaining} 天"
+        warnings.append(
+            {
+                "code": "target_bound_hit",
+                "message": (
+                    "以下日期的缺口被 target_min / target_max 夹取"
+                    f"（下限命中 {bound_counts['min']} 天，"
+                    f"上限命中 {bound_counts['max']} 天）："
+                    + "；".join(parts)
+                    + extra
+                ),
+            }
+        )
     summary = _build_summary(rows)
     summary["first_plan_status"] = first_plan_status
     summary["first_plan_updated_at"] = first_plan_updated_at
@@ -376,6 +475,20 @@ def forecast_days(
     summary["target_volatility"] = target_volatility
     summary["volatility"] = volatility
     summary["volatility_modeled"] = bool(model_volatility)
+    summary["bound_hits"] = dict(bound_counts)
+    # 边界对应的可刷量：仅在调用方给出 first_natural（今日视角）时计算，
+    # 否则自然流量随预测逐日变化，统一汇总没有意义，返回 None。
+    if first_natural is not None:
+        natural_for_bounds = max(0, int(first_natural))
+        summary["target_floor_boost"] = _floor_boost(
+            natural_for_bounds, target_floor
+        )
+        summary["target_ceiling_boost"] = _ceiling_boost(
+            natural_for_bounds, target_ceiling
+        )
+    else:
+        summary["target_floor_boost"] = None
+        summary["target_ceiling_boost"] = None
     return {"rows": rows, "warnings": warnings, "summary": summary}
 
 

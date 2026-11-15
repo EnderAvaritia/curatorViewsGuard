@@ -16,6 +16,18 @@ from curator_views.core.scheduler import _TZ, _date_to_epoch, _today_epoch
 DAY = 86400
 START_TS = _date_to_epoch("2026-11-14")
 
+
+def day_iso(offset=0):
+    """返回相对“今天”偏移 offset 天的 YYYY-MM-DD（避免测试随日历失效）。"""
+    return datetime.fromtimestamp(
+        _today_epoch() + DAY * offset, tz=_TZ
+    ).strftime("%Y-%m-%d")
+
+
+def day_mmdd(offset=0):
+    """返回相对“今天”偏移 offset 天的 MM-DD。"""
+    return day_iso(offset)[5:]
+
 CLI_CONFIG = """\
 clan_id: ""
 cookie_file: "missing_cookie.txt"
@@ -269,9 +281,9 @@ class TestForecastChartCli:
 
         captured = capsys.readouterr()
         assert code == 0
-        assert "11-15" in captured.out
-        assert "11-17" in captured.out
-        assert "11-16" not in captured.out
+        assert day_mmdd(0) in captured.out
+        assert day_mmdd(2) in captured.out
+        assert day_mmdd(1) not in captured.out
 
     def test_day_step_samples_table(self, tmp_path, capsys):
         code = self._run(tmp_path, ["--day-step", "2"])
@@ -279,9 +291,9 @@ class TestForecastChartCli:
         captured = capsys.readouterr()
         assert code == 0
         assert "输出间隔: 每 2 天" in captured.out
-        assert "11-15" in captured.out
-        assert "11-17" in captured.out
-        assert "11-16" not in captured.out
+        assert day_iso(0) in captured.out
+        assert day_iso(2) in captured.out
+        assert f"\n{day_iso(1)} " not in captured.out
 
     def test_day_step_samples_json_rows(self, tmp_path, capsys):
         code = self._run(tmp_path, ["--day-step", "2", "--json"])
@@ -289,8 +301,8 @@ class TestForecastChartCli:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert [row["date"] for row in payload["rows"]] == [
-            "2026-11-15",
-            "2026-11-17",
+            day_iso(0),
+            day_iso(2),
         ]
         assert payload["summary"]["days"] == 3
         assert payload["source"]["day_step"] == 2
@@ -330,9 +342,9 @@ class TestForecastChartCli:
         assert code == 0
         payload = json.loads(capsys.readouterr().out)
         assert [row["date"] for row in payload["rows"]] == [
-            "2026-11-15",
-            "2026-11-18",
-            "2026-11-19",
+            day_iso(0),
+            day_iso(3),
+            day_iso(4),
         ]
 
     def test_day_step_rejects_zero(self, tmp_path, capsys):
@@ -384,9 +396,9 @@ class TestForecastChartCli:
 
         assert code == 0
         page = chart_path.read_text(encoding="utf-8")
-        assert "2026-11-15" in page
-        assert "2026-11-17" in page
-        assert "2026-11-16" not in page
+        assert day_iso(0) in page
+        assert day_iso(2) in page
+        assert day_iso(1) not in page
 
     def test_no_chart_by_default(self, tmp_path, capsys):
         code = self._run(tmp_path, [])

@@ -1203,7 +1203,8 @@ class TestTargetBounds:
         assert summary["in_cooldown"] is False
 
     def test_volatility_cannot_exceed_upper_bound(self):
-        # 缺口 1400 经 +30% 抖动变成 1820，但实际执行仍不得超过上限 1500
+        # 缺口 1400 经 +30% 抖动变成 1820，但刷量硬上限是
+        # target_max − 昨日自然 = 1500 − 100 = 1400，实际执行不得超过 1400
         stats = make_stats([100] * 30)
         booster = FakeBooster()
         with patch(
@@ -1221,8 +1222,9 @@ class TestTargetBounds:
                 volatility=0.30,
             )
         assert summary["today_expected"] == 1500
-        assert summary["need"] == 1500
-        assert booster.last_target == 1500
+        assert summary["need"] == 1400
+        assert summary["need_bound"] == "max"
+        assert booster.last_target == 1400
 
     def test_upper_bound_caps_growth_after_long_run(self):
         # 速率已生效 30 天：原始目标 1000×1.5×(1+0.05×30)=3750，

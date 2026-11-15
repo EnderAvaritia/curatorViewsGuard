@@ -15,11 +15,14 @@
 - 模式切换：`boost_mode: stable` 维持稳定 / `growth` 用 `growth_factor` 调台阶
   （>1 刷高、<1 压低），`growth_rate` 按天线性推进（正数上涨、负数下滑）；
   两者相乘，检测参照不会把自己刷的量误判为恶意刷量；
-- 目标上下界：`target_min` / `target_max` 夹取今日目标（0 表示该方向不设界），
-  上限防止 growth 目标无限上涨，下限托底防止目标持续下滑；`run` / `daemon`
-  按夹取后的目标实际刷量，`forecast` 只是预览；下限同时抬高短期/长期检测
-  参照，托底刷量不会被误判；上限也是波动后的最终刷量硬上限，只限制补量、
-  不会压低自然流量；刷量列表模式不受影响；
+- 目标上下界：`target_min` / `target_max` 是每日总量的绝对硬边界
+  （自然流量 + 刷量，0 表示该方向不设界）；所有实际下发的刷量都会被夹进
+  `[target_min − 昨日自然, target_max − 昨日自然]`，抖动、刷量列表与手动
+  `boost` 都不得突破上限；`run` / `daemon` 与 `forecast` 使用同一口径。下限
+  只在今天确实要刷量时托底，恢复期 / `boost_enabled: false` / 列表 0 等不刷
+  状态不会被强行补量；下限同时抬高短期/长期检测参照，托底刷量不会被误判。
+  下限约束的是“决定下发的刷量”，提升失败或被容量/吞吐/`target_ratio` 截断时，
+  实际总量仍可能低于下限；
 - 受控提升：分批、限速、单 App 上限、按目标比例提前停止，尽量模拟自然流量；
   两级波动率：`volatility` 让当日缺口配额随机（缺口大时用），`target_volatility`
   让今日目标随机（固定基线/缺口小时用）；`volatility_min` /
@@ -201,8 +204,10 @@ boost_list_file: "boost_plan.txt"
 `boost_list_fallback: false` 则用完即停、不回退。文件缺失/读取失败属于配置错误，
 即使开启回退也不回退。恢复期、`--dry-run`、
 `boost_enabled: false`、提升完全失败时均不消费列表行。列表数值仍受
-`single_cap` / `target_ratio` 等执行参数约束，需要精确刷满可配合
-`target_ratio: 1.0` 或 `boost_distribution: exact`。
+`target_min` / `target_max` 绝对边界约束（超上限夹到上限、低于下限按下限并
+记录 warning，列表行 `0` 保持不刷），同时受 `single_cap` / `target_ratio` 等
+执行参数约束；需要精确刷满可配合 `target_ratio: 1.0` 或
+`boost_distribution: exact`。
 
 ### check
 
@@ -309,12 +314,14 @@ forecast 时未来日结果仍可能不同。`summary.first_plan_status` / `firs
 python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--dry-run]
 ```
 
-- `--target N`：本轮目标提升次数（必填）；
+- `--target N`：本轮目标提升次数（必填）；超过 `target_max` 时按上限执行，
+  stderr 给出 warning，JSON 里 `target` 为夹取后的值、`requested_target` 为原始值、
+  `clamped` 标记是否夹取；
 - `--apps M`：使用的最近推荐数量（默认取配置中的 `boost_n`）；
 - `--dry-run`：仅记录提升计划，不发送任何请求。
 
-手动 `boost` 是显式覆盖，与刷量列表一样不受 `target_min` / `target_max`
-约束。
+手动 `boost` 没有昨日自然流量上下文，无法校验 `target_min`（不会强行托底），
+但 `target_max` 是绝对硬上限，始终生效。
 
 ### login
 
@@ -419,8 +426,8 @@ python curator_views/cli.py version
 | `boost_mode` | `stable` | 模式切换：`stable` 维持稳定 / `growth` 刷量（目标=基准×目标系数） |
 | `growth_factor` | `1.5` | growth 模式目标系数的起始值（如 1.5 = 比基准高 50%；小于 1 表示压低台阶，如 0.85） |
 | `growth_rate` | `0` | growth 模式下目标系数每天的线性变化率（0.01 = 每天 +1%，-0.01 = 每天 -1%）；与 `growth_factor` 相乘，可同时使用；修改速率会从当天重新起算 |
-| `target_min` | `0` | 今日目标下限（次）；> 0 时目标跌破下限按下限补量，`0` 不设界 |
-| `target_max` | `0` | 今日目标上限（次）；> 0 时目标超出上限按上限补量，`0` 不设界 |
+| `target_min` | `0` | 当日总量下限（自然+刷量）；> 0 且今天要刷量时至少补到该值，`0` 不设界 |
+| `target_max` | `0` | 当日总量上限（自然+刷量）；> 0 时刷量不得让总量超过该值（抖动/列表/手动 boost 均受约束），`0` 不设界 |
 | `volatility` | `0.10` | 缺口波动率：当日配额 = 缺口 × (1 ± 波动率)；`0` 关闭 |
 | `volatility_min` | `0` | 缺口抖动的最小幅度；`0` 不设下限 |
 | `target_volatility` | `0` | 目标波动率：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |

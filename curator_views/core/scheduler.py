@@ -6,6 +6,8 @@
 3. 逐日预测期望浏览量，检测异常溢出并计算后续扣减；
 4. 计算今日缺口 = 今日期望 - 昨日自然流量 - 溢出扣减
    （昨日自然流量 = 昨日实际 - 昨日刷量，避免把昨天的补量当成今天的基础）；
+   再按目标上下界把“今日总刷量配额”夹进
+   [target_min - 昨日自然, target_max - 昨日自然]（absolute hard limits）；
 5. 如启用提升且缺口 > 0，调用 Booster 执行受控提升
    （或通过 executor_cmd 唤起独立执行器子进程，见 run_daily）；
 6. 通过 Notifier 发送每日简报（有溢出或提升中止时升级为 warning）。
@@ -269,6 +271,69 @@ def _clamp_target(
     if high > 0 and target > high:
         return high, "max"
     return target, ""
+
+
+def _floor_boost(natural: float, target_min: float) -> int:
+    """返回达到 ``target_min`` 所需的最少刷量；``target_min`` 为 0 时返回 0。
+
+    ``floor_boost = max(0, target_min - natural)``：自然流量本身已达标时为 0，
+    不会额外刷量。``target_min <= 0`` 表示该方向不设界。
+    """
+    if target_min <= 0:
+        return 0
+    return max(0, int(round(target_min - natural)))
+
+
+def _ceiling_boost(natural: float, target_max: float) -> int:
+    """返回 ``target_max`` 允许的最大刷量；``target_max`` 为 0 时返回 0。
+
+    ``ceiling_boost = max(0, target_max - natural)``：自然流量已超过上限时为 0，
+    此时只能不刷，自然流量本身无法被压低。``target_max <= 0`` 表示该方向不设界。
+    """
+    if target_max <= 0:
+        return 0
+    return max(0, int(round(target_max - natural)))
+
+
+def _bound_boost(
+    need: int, natural: float, floor: float, ceiling: float
+) -> tuple[int, str]:
+    """把“实际刷量”夹进 ``[floor-natural, ceiling-natural]``，返回 (need, 命中边界)。
+
+    - 先夹上限、再夹下限；``bound_hit`` 为 ``""`` / ``"min"`` / ``"max"``；
+    - 下限只在传入的 ``need > 0`` 时生效，避免把“今天不刷”的空状态强行托底；
+    - 上限为 0（不设界）时不夹上限；下限同理；
+    - 若夹取后出现 ``floor_boost > ceiling_boost``（配置矛盾），以安全方向
+      的上限为准并记录警告。
+    """
+    original = max(0, int(round(need)))
+    if original <= 0:
+        return 0, ""
+
+    floor_boost = _floor_boost(natural, floor)
+    ceiling_boost = _ceiling_boost(natural, ceiling)
+    bounded = original
+    bound_hit = ""
+
+    if ceiling > 0 and bounded > ceiling_boost:
+        bounded = ceiling_boost
+        bound_hit = "max"
+
+    # 上限已把刷量夹到 0 时不再托底：自然流量已越过上限，压低无从谈起。
+    if bounded > 0 and floor > 0 and bounded < floor_boost:
+        if ceiling > 0 and floor_boost > ceiling_boost:
+            logger.warning(
+                "配置矛盾：target_min=%g 对应的刷量 %d 超过 target_max=%g "
+                "对应的刷量 %d，已按上限执行（安全方向）。",
+                floor, floor_boost, ceiling, ceiling_boost,
+            )
+            bounded = ceiling_boost
+            bound_hit = "max"
+        else:
+            bounded = floor_boost
+            bound_hit = "min"
+
+    return int(bounded), bound_hit
 
 
 def _effective_threads(
@@ -886,12 +951,8 @@ boost_mode / growth_factor / growth_rate：
             "缺口抖动 %+.2f%%（最小幅度 %.2f%%）: 缺口 %d → 当日配额 %d",
             gap_jitter * 100.0, gap_low * 100.0, gross_need, boost_quota,
         )
-    need = max(0, boost_quota - today_boosted)
-    if today_boosted > 0:
-        logger.info(
-            "今日已刷 %d 次，配额 %d → %d（按剩余量继续）。",
-            today_boosted, boost_quota, need,
-        )
+
+    # 6.3 恢复期判定放在边界夹取之前：恢复期内不刷量，不应对配额做下限托底。
     in_cooldown = False
     days_since_flagged = -1
     if flagged_ts_first:
@@ -904,24 +965,51 @@ boost_mode / growth_factor / growth_rate：
             "今日强制不刷量。",
             days_since_flagged, cooldown_days,
         )
-        need = 0
 
-    # 6.4 上限同时作为实际刷量的硬上限：波动率可能把缺口从目标值再抬高
-    #     （自然流量越接近 0 越明显），这里再夹一次，保证 run / daemon
-    #     实际下发的刷量不会突破 target_max。下限只作用于目标浏览量，
-    #     不在缺口上强制最小值（自然流量已达标时不制造额外刷量）。
-    if need > 0 and target_ceiling > 0 and need > target_ceiling:
-        clamped_need = int(round(target_ceiling))
-        logger.info(
-            "波动后刷量目标 %d 超过上限 %g，按上限 %d 执行。",
-            need, target_ceiling, clamped_need,
+    # 6.35 目标上下界是刷量的绝对硬边界：把“今日总刷量配额”夹进
+    #      [target_min − 昨日自然, target_max − 昨日自然]。
+    #      - 先夹配额再减“今日已刷”，保证同日续刷时“已刷 + 剩余”仍不越界；
+    #      - 无缺口（无提升状态）时不托底，避免凭空制造刷量；
+    #      - 恢复期 / boost_enabled=False 只夹上限，不做下限托底。
+    floor_boost = _floor_boost(yesterday_natural, target_floor)
+    ceiling_boost = _ceiling_boost(yesterday_natural, target_ceiling)
+    can_boost = boost_enabled and not in_cooldown
+    floor_for_bound = target_floor if can_boost else 0.0
+    need_bound = ""
+    if gross_need > 0:
+        bounded_quota, quota_bound = _bound_boost(
+            boost_quota, yesterday_natural, floor_for_bound, target_ceiling
         )
-        need = clamped_need
+        if quota_bound:
+            bound_label = "下限" if quota_bound == "min" else "上限"
+            logger.info(
+                "波动后配额 %d 命中目标%s对应的刷量边界，按 %d 执行"
+                "（昨日自然 %d，target_min=%g，target_max=%g）。",
+                boost_quota, bound_label, bounded_quota,
+                yesterday_natural, target_floor, target_ceiling,
+            )
+        boost_quota = bounded_quota
+        need_bound = quota_bound
+    if target_ceiling > 0 and yesterday_natural > target_ceiling:
+        logger.warning(
+            "昨日自然流量 %d 已超过 target_max=%g，自然流量无法被压低，"
+            "今日刷量强制为 0；当日总量仍会突破上限（超出部分是自然流量本身）。",
+            yesterday_natural, target_ceiling,
+        )
+    need = max(0, boost_quota - today_boosted)
+    if today_boosted > 0:
+        logger.info(
+            "今日已刷 %d 次，配额 %d → %d（按剩余量继续）。",
+            today_boosted, boost_quota, need,
+        )
+    if in_cooldown:
+        need = 0
+        need_bound = ""
 
     # 6.5 每日刷量列表模式：以列表首行数量覆盖上面算出的缺口。
-    #     - 列表为空：boost_list_fallback=False（默认）→ 今日不刷，且不回退
-    #       到自动预测（避免绕过列表）；=True → 回退基线/自动预测，沿用上面
-    #       算出的 need（视为列表已耗尽、开始按基线继续）；
+    #     - 列表为空：boost_list_fallback=False → 今日不刷，且不回退
+    #       到自动预测（避免绕过列表）；=True（默认）→ 回退基线/自动预测，
+    #       沿用上面算出的 need（视为列表已耗尽、开始按基线继续）；
     #     - 文件缺失/读取失败属于配置/IO 错误，始终不刷并记 warning，即使
     #       开启 boost_list_fallback 也不回退（避免掩盖配置问题）；
     #     - 恢复期（刚被恶意刷量）优先于列表，列表行保留到明天；
@@ -939,15 +1027,17 @@ boost_mode / growth_factor / growth_rate：
                 boost_list_file,
             )
             need = 0
+            need_bound = ""
         except OSError as exc:
             list_status = "error"
             logger.error("读取刷量列表失败: %s，今日不刷量。", exc)
             need = 0
+            need_bound = ""
         else:
             if list_amount is None:
                 if boost_list_fallback:
                     # 列表耗尽（empty）才回退；保留第 6 步已算好的自动缺口
-                    # （已扣除恢复期、今日已刷与上限），相当于切回基线模式。
+                    # （已扣除恢复期、今日已刷与上下界），相当于切回基线模式。
                     list_status = "fallback"
                     logger.warning(
                         "刷量列表已用完，已回退基线模式（今日按自动缺口 %d 执行）。",
@@ -957,12 +1047,14 @@ boost_mode / growth_factor / growth_rate：
                     list_status = "empty"
                     logger.info("刷量列表已用完（无有效行），今日不刷量。")
                     need = 0
+                    need_bound = ""
             elif in_cooldown:
                 list_status = "cooldown"
                 logger.info(
                     "恢复期内不刷量，列表首行 %d 保留到明天。", list_amount,
                 )
                 need = 0
+                need_bound = ""
             elif today_boosted > 0:
                 # 列表一行代表“当天总量”，重跑时不按剩余量续刷：
                 # 否则成功后会误消费下一行，把明天的配额提前用掉。
@@ -973,13 +1065,28 @@ boost_mode / growth_factor / growth_rate：
                     today_boosted, list_amount,
                 )
                 need = 0
+                need_bound = ""
             else:
                 list_status = "active"
                 logger.info(
                     "列表模式: 今日目标 %d（剩余 %d 行，原缺口 %d）",
                     list_amount, list_remaining, need,
                 )
-                need = list_amount
+                original_list_amount = list_amount
+                need, need_bound = _bound_boost(
+                    list_amount,
+                    yesterday_natural,
+                    floor_for_bound,
+                    target_ceiling,
+                )
+                if need_bound:
+                    bound_label = "下限" if need_bound == "min" else "上限"
+                    logger.warning(
+                        "刷量列表首行 %d 超出目标%s对应的刷量边界，"
+                        "按 %d 执行（昨日自然 %d，target_min=%g，target_max=%g）。",
+                        original_list_amount, bound_label, need,
+                        yesterday_natural, target_floor, target_ceiling,
+                    )
 
     # 6.55 定档：把今日最终决策写入 daily_plan，供 forecast 首日复用，
     #      避免 forecast 重新抽取 target/gap 抖动、显示与 run 矛盾的缺口。
@@ -1062,6 +1169,9 @@ boost_mode / growth_factor / growth_rate：
         "gross_need": gross_need,
         "boost_quota": boost_quota,
         "need": need,
+        "need_bound": need_bound,
+        "target_floor_boost": floor_boost,
+        "target_ceiling_boost": ceiling_boost,
         "deduction": today_deduction,
         "overflow_flag_count": len(flagged_days),
         "stats_days": len(stats),

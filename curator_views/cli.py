@@ -260,13 +260,15 @@ growth_factor: 1.5
 growth_rate: 0.0
 
 # 今日目标浏览量的上下界（单位：次；0 表示该方向不设界）。
-# 只夹取“今日目标”（基准 × 目标系数），刷量缺口仍 = 目标 − 昨日自然流量：
-# - target_max > 0：目标超过上限时按上限补量，防止 growth 模式目标随天
-#   无限上涨（增长不收敛）；
-# - target_min > 0：目标跌破下限时按下限补量，避免浏览量一路下滑（托底）。
-# 两者都为 0 时不设界（默认）。刷量列表与手动 boost 的显式数值不受限。
-# run / daemon 实际执行时按夹取后的目标下发刷量，forecast 只是用同一口径
-# 预览；target_max 同时是最终刷量的硬上限，波动率也不会突破它。
+# 当日总量 = 昨日自然流量 + 今日实际刷量，最终刷量会被夹进
+# [target_min − 昨日自然, target_max − 昨日自然]：
+# - target_max > 0：刷量后总量不得超过上限（绝对硬上限，抖动、刷量列表、
+#   手动 boost 都不得突破；自然流量本身已超上限时只能不刷，总量仍会超出）；
+# - target_min > 0：只要今天确实要刷量，就至少补到下限；自然流量已达标或
+#   处于不刷状态（恢复期、boost_enabled=false、列表 0 等）时不会强行托底。
+# 两者都为 0 时不设界（默认）。下限约束的是“决定下发的刷量”，不是平台最终
+# 实际送达量：提升失败、容量/吞吐或 target_ratio 截断时，总量仍可能低于下限。
+# run / daemon 实际执行与 forecast 预览使用同一口径。
 # 白话：想给每天刷到的浏览量封顶就填 target_max；怕一路跌就填 target_min
 # 托底；填 0 表示不管。
 target_min: 0
@@ -1085,10 +1087,26 @@ def cmd_boost(args: argparse.Namespace) -> int:
         cfg, clan_id, boost_cookie_file, proxy, storage
     )
     apps = args.apps if args.apps is not None else int(cfg.get("boost_n", 5))
-    boosted = booster.run(args.target, apps, args.dry_run)
+    # 手动 boost 没有昨日自然流量上下文，无法校验 target_min 下限；
+    # 但 target_max 是刷量的绝对上限，这里必须夹住，避免手动请求突破窗口。
+    target_max = float(cfg.get("target_max", 0) or 0)
+    target = args.target
+    clamped = False
+    if target_max > 0 and target > target_max:
+        target = int(target_max)
+        clamped = True
+        print(
+            f"警告: --target {args.target} 超过 target_max={target_max:g}，"
+            f"已按 {target} 执行（上限是刷量绝对上限；target_min 需结合"
+            "昨日自然流量，手动 boost 无法校验）。",
+            file=sys.stderr,
+        )
+    boosted = booster.run(target, apps, args.dry_run)
 
     summary = {
-        "target": args.target,
+        "target": target,
+        "requested_target": args.target,
+        "clamped": clamped,
         "apps": apps,
         "dry_run": bool(args.dry_run),
         "boosted": boosted,
@@ -1460,8 +1478,17 @@ def _print_forecast_report(
         ceiling_text = f"{target_max:g}" if target_max > 0 else "不设"
         print(
             f"目标上下界: 下限={floor_text} 上限={ceiling_text}"
-            "（0=不设界；超出时按边界刷）"
+            "（0=不设界；当日总量=自然+刷量，超出时按边界夹取）"
         )
+        bound_hits = summary.get("bound_hits") or {}
+        min_hits = int(bound_hits.get("min", 0) or 0)
+        max_hits = int(bound_hits.get("max", 0) or 0)
+        if min_hits or max_hits:
+            print(
+                f"目标边界: 已按 target_min/target_max 夹取"
+                f"（下限命中 {min_hits} 天，上限命中 {max_hits} 天；"
+                "上限=自然流量+刷量）"
+            )
     print(
         f"单日容量: {capacity:,} 次"
         f"（boost_n={boost_n} × single_cap={single_cap}）"
@@ -1867,7 +1894,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_boost = sub.add_parser("boost", help="手动执行一轮受控提升")
     p_boost.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")
     p_boost.add_argument("--target", type=int, required=True,
-                         help="本轮目标提升次数（必填）")
+                         help="本轮目标提升次数（必填）；超过 target_max 时按上限执行，"
+                              "target_min 需结合昨日自然流量，手动 boost 无法校验")
     p_boost.add_argument("--apps", type=int, default=None,
                          help="使用的最近推荐数量（默认取配置中的 boost_n）")
     p_boost.add_argument("--dry-run", action="store_true",
