@@ -248,7 +248,10 @@ class TestRunDailyPersistsPlan:
 
         plan = storage.get_daily_plan(summary["date"])
         assert plan is not None
-        assert len(storage.get_daily_plans()) == 1
+        # 只写首日（今天）一行：不预写未来日期，也不重写历史
+        assert [item["date"] for item in storage.get_daily_plans()] == [
+            summary["date"]
+        ]
         assert plan["target"] == 1000.0
         assert plan["gross_need"] == 1000
         assert plan["boost_quota"] == 1000
