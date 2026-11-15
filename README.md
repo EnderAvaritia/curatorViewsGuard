@@ -367,16 +367,20 @@ CuratorViewsGuard/
 ├── tests/                   # pytest 测试
 └── curator_views/
     ├── cli.py               # 命令行入口与命令实现
+    ├── config.yaml          # 示例配置（与 init-config 模板一致）
     ├── README.md            # 子系统速查
+    ├── requirements.txt     # 依赖清单副本（与根目录一致）
     └── core/
         ├── fetcher.py       # 抓取 g_StatsAppViews 与推荐列表
         ├── login.py         # Playwright 半自动登录，导出/校验 Cookie
         ├── predictor.py     # 中位数 + 封顶趋势预测
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣 + 斜率检测
         ├── forecast.py      # 今天/明天起 N 天只读估算（纯函数，无 I/O）
+        ├── boost_list.py    # 每日刷量列表解析与原子消费
         ├── booster.py       # 受控刷量执行器
         ├── scheduler.py     # 每日闭环编排 + 子进程执行器
         ├── daemon.py        # 常驻调度循环
+        ├── status.py        # 守护进程状态文件与 PID/心跳判断
         ├── notifier.py      # ntfy 推送
         └── storage.py       # SQLite 存储
 ```
@@ -1596,8 +1600,10 @@ python -m pytest tests/ -v
 
 ```
 tests/
+├── __init__.py
 ├── conftest.py
 ├── test_anti_cheat.py
+├── test_boost_list.py
 ├── test_booster.py
 ├── test_cli_check.py
 ├── test_cli_cookie.py
