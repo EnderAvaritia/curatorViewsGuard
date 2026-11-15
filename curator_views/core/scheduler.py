@@ -365,6 +365,7 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
             "cooldown": "恢复期暂停",
             "consume_error": "消费失败",
             "already_boosted": "今日已刷",
+            "fallback": "已回退基线",
         }
         lines.append(
             f"刷量列表: {labels.get(list_status, list_status)}"
@@ -491,7 +492,7 @@ def run_daily(
         cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool),
-        boost_list_file (str)
+        boost_list_file (str), boost_list_fallback (bool)
     其中 single_cap / batch_size / target_ratio / boost_distribution 会应用到
     传入的 Booster 实例（以 config 为准），其余作为预测/检测参数直接传入。
 
@@ -579,9 +580,17 @@ boost_mode / growth_factor / growth_rate：
         每天取第一条有效行作为当日提升目标，覆盖按预测/基线算出的缺口。
         成功提升（boosted > 0）后把该行从文件删除，实现"刷完一行删一行"。
         以下情况不消费列表行：dry_run、boost_enabled=False、恢复期
-        （cooldown）、缺口为 0、提升完全失败。列表为空或文件缺失时今日
-        不刷量（不会回退到自动预测，避免列表模式被悄悄绕过）；文件缺失
-        属于配置错误，简报会标记为 warning。
+        （cooldown）、缺口为 0、提升完全失败。列表为空时今日默认不刷量
+        （不会回退到自动预测，避免列表模式被悄悄绕过）；文件缺失属于
+        配置错误，简报会标记为 warning。
+
+    boost_list_fallback：
+        可选，默认 False，仅在"列表文件存在但已无有效行（empty）"时生效：
+        为 True 时不再停刷，而是回退到基线/自动预测口径，沿用上面算出的
+        need（已扣除恢复期、今日已刷与上限），相当于列表耗尽后自动继续按
+        基线刷量；出现回退且当日确有缺口时，简报升级为 warning 提示已回退。
+        文件缺失（missing）或读取失败（error）属于配置/IO 错误，即使开启
+        该开关也不回退，仍按 0 处理并标记 warning，避免掩盖配置问题。
     """
     # ── 读取配置（带默认值）──────────────────────────────────────────────
     window_days = int(config.get("window_days", 14))
@@ -617,6 +626,7 @@ boost_mode / growth_factor / growth_rate：
     boost_enabled = bool(config.get("boost_enabled", False))
     dry_run = bool(config.get("dry_run", False))
     boost_list_file = str(config.get("boost_list_file", "") or "").strip()
+    boost_list_fallback = bool(config.get("boost_list_fallback", False))
     threads = int(config.get("threads", getattr(booster, "threads", 1)))
     wait_min = float(config.get("wait_min", getattr(booster, "wait_min", 8.0)))
     wait_max = float(config.get("wait_max", getattr(booster, "wait_max", 16.0)))
@@ -906,7 +916,11 @@ boost_mode / growth_factor / growth_rate：
         need = clamped_need
 
     # 6.5 每日刷量列表模式：以列表首行数量覆盖上面算出的缺口。
-    #     - 列表为空/文件缺失 → 今日不刷（不回退到自动预测，避免绕过列表）；
+    #     - 列表为空：boost_list_fallback=False（默认）→ 今日不刷，且不回退
+    #       到自动预测（避免绕过列表）；=True → 回退基线/自动预测，沿用上面
+    #       算出的 need（视为列表已耗尽、开始按基线继续）；
+    #     - 文件缺失/读取失败属于配置/IO 错误，始终不刷并记 warning，即使
+    #       开启 boost_list_fallback 也不回退（避免掩盖配置问题）；
     #     - 恢复期（刚被恶意刷量）优先于列表，列表行保留到明天；
     #     - 波动率只作用于自动缺口，列表数值视为明确要求，不做随机抖动。
     list_amount: Optional[int] = None
@@ -928,9 +942,18 @@ boost_mode / growth_factor / growth_rate：
             need = 0
         else:
             if list_amount is None:
-                list_status = "empty"
-                logger.info("刷量列表已用完（无有效行），今日不刷量。")
-                need = 0
+                if boost_list_fallback:
+                    # 列表耗尽（empty）才回退；保留第 6 步已算好的自动缺口
+                    # （已扣除恢复期、今日已刷与上限），相当于切回基线模式。
+                    list_status = "fallback"
+                    logger.warning(
+                        "刷量列表已用完，已回退基线模式（今日按自动缺口 %d 执行）。",
+                        need,
+                    )
+                else:
+                    list_status = "empty"
+                    logger.info("刷量列表已用完（无有效行），今日不刷量。")
+                    need = 0
             elif in_cooldown:
                 list_status = "cooldown"
                 logger.info(
@@ -1095,6 +1118,11 @@ boost_mode / growth_factor / growth_rate：
         or getattr(booster, "aborted", False)
         or "executor_error" in summary
         or summary["boost_list_status"] in ("missing", "error", "consume_error")
+        # 列表耗尽已回退基线，且当日确有缺口 → 提示"已自动切回基线模式"
+        or (
+            summary["boost_list_status"] == "fallback"
+            and summary["need"] > 0
+        )
     )
     level = "warning" if warning else "info"
     if dry_run:

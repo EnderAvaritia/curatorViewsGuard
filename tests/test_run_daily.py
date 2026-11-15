@@ -962,6 +962,56 @@ class TestBoostList:
         assert summary["need"] == 0
         assert booster.last_target is None
 
+    def test_empty_list_falls_back_to_baseline_when_enabled(self, tmp_path):
+        # 列表为空 + 开启回退 → 不再停刷，按基线自动缺口执行
+        list_path = self._write(tmp_path, "# 用完了\n\n")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+            boost_list_fallback=True,
+        )
+        assert summary["boost_list_status"] == "fallback"
+        assert summary["need"] == 100          # 200 - 100
+        assert booster.last_target == 100
+        # 回退不消费列表，空文件保持原样
+        assert Path(list_path).read_text(encoding="utf-8") == "# 用完了\n\n"
+
+    def test_empty_list_fallback_skips_when_no_gap(self, tmp_path):
+        # 列表为空 + 回退，但自然流量已达目标 → need=0，不刷
+        list_path = self._write(tmp_path, "")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=100,
+            boost_list_file=list_path,
+            boost_list_fallback=True,
+        )
+        assert summary["boost_list_status"] == "fallback"
+        assert summary["need"] == 0
+        assert booster.calls == []
+
+    def test_missing_file_does_not_fallback_even_when_enabled(self, tmp_path):
+        # 文件缺失属配置错误：即使开启回退也不回退
+        list_path = str(tmp_path / "missing.txt")
+        booster = FakeBooster()
+        summary = run_with(
+            make_stats([100] * 30),
+            program_start_str(),
+            booster,
+            baseline_views=200,
+            boost_list_file=list_path,
+            boost_list_fallback=True,
+        )
+        assert summary["boost_list_status"] == "missing"
+        assert summary["need"] == 0
+        assert booster.calls == []
+
     def test_missing_file_skips_boost(self, tmp_path):
         list_path = str(tmp_path / "missing.txt")
         booster = FakeBooster()

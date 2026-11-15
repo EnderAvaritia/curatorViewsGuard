@@ -306,6 +306,12 @@ target_volatility_min: 0.0
 # 程序每天用掉最上面一行、用完删掉一行。
 boost_list_file: ""
 
+# 刷量列表用完后是否自动回退到基线/自动预测（默认 false = 用完即停）。
+# 仅在“列表文件存在但已无有效行”时生效；文件缺失/读取失败属于配置错误，
+# 即使开启也不会回退（仍会记为 warning）。
+# 白话：想让列表刷完后继续按预测/基线自动刷，就设为 true。
+boost_list_fallback: false
+
 # ── 受控提升参数 ──────────────────────────────────────────────────────────
 
 # 每日提升使用的最近推荐数量
@@ -569,6 +575,7 @@ def _scheduler_config(
         "boost_enabled": bool(boost_enabled),
         "dry_run": bool(dry_run),
         "boost_list_file": _resolve_path(cfg_dir, list_file) if list_file else "",
+        "boost_list_fallback": bool(cfg["boost_list_fallback"]),
     }
 
 
@@ -917,6 +924,11 @@ def _print_info_report(report: Dict[str, Any]) -> None:
             "error": "读取失败",
         }
         label = labels.get(config.get("boost_list_status", ""), "未知")
+        if (
+            config.get("boost_list_status") == "empty"
+            and config.get("boost_list_fallback")
+        ):
+            label += "，已启用回退基线"
         remaining = config.get("boost_list_remaining")
         suffix = f"，剩余 {remaining} 行" if remaining is not None else ""
         print(
@@ -979,6 +991,7 @@ def cmd_info(args: argparse.Namespace) -> int:
             "boost_list_file": list_path,
             "boost_list_remaining": list_remaining,
             "boost_list_status": list_status,
+            "boost_list_fallback": bool(cfg.get("boost_list_fallback", False)),
         },
         "data": _collect_info_data(db_path),
     }

@@ -31,6 +31,7 @@ class TestLoadConfigDefaults:
         assert cfg["daily_time"] == "10:00"
         assert cfg["boost_distribution"] == "ratio"
         assert cfg["executor_cmd"] == ""
+        assert cfg["boost_list_fallback"] is False
 
     def test_user_values_override_defaults(self, tmp_path):
         cfg = cli._load_config(
@@ -96,3 +97,13 @@ class TestDefaultSources:
         assert sched["target_volatility_min"] == 0.0
         assert sched["boost_distribution"] == "ratio"
         assert sched["threads"] == 1
+        assert sched["boost_list_fallback"] is False
+
+    def test_scheduler_config_passes_boost_list_fallback(self, tmp_path):
+        sched = cli._scheduler_config(
+            {"boost_list_fallback": True},
+            boost_enabled=False,
+            dry_run=True,
+            cfg_dir=tmp_path,
+        )
+        assert sched["boost_list_fallback"] is True

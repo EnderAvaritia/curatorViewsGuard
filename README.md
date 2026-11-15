@@ -298,8 +298,10 @@ boost_list_file: "boost_plan.txt"
   采用临时文件 + `os.replace` 原子写回，中途失败不会写坏列表。
 - 以下情况**不消费**列表行：`--dry-run`、`boost_enabled: false`、恢复期、
   缺口为 0、提升完全失败（`boosted = 0`）。
-- 列表为空或文件缺失时当天**不刷量**，不会回退到自动预测；文件缺失会在每日
-  简报中标记为 warning。
+- 列表为空时默认当天**不刷量**，不会回退到自动预测；若配置
+  `boost_list_fallback: true`，则列表耗尽后自动回退到基线/自动预测口径继续刷量
+  （简报会升为 warning 提示“已回退基线”）。文件缺失/读取失败属于配置错误，
+  即使开启回退也不回退，仍会在每日简报中标记为 warning。
 - 列表数值仍受 `single_cap`、`target_ratio` 等执行参数约束。需要精确刷满列表
   数量时，可把 `target_ratio` 设为 `1.0` 或使用 `boost_distribution: exact`。
 
@@ -719,6 +721,7 @@ python curator_views/cli.py daemon --config config.yaml
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `boost_list_file` | （空） | 每日刷量列表文件路径；非空启用列表模式 |
+| `boost_list_fallback` | `false` | 列表耗尽（文件存在但无有效行）时是否回退基线/自动预测；`false` = 用完即停 |
 
 列表格式与消费规则见 [3.7](#37-每日刷量列表boost_list_file)。
 
@@ -811,6 +814,7 @@ target_volatility: 0.0
 target_volatility_min: 0.0
 
 boost_list_file: ""
+boost_list_fallback: false
 
 boost_n: 5
 single_cap: 300
@@ -1281,7 +1285,8 @@ boost_list_file: "boost_plan.txt"
 ```
 
 列表文件一行一个数量，每天消费第一行，成功刷完后删除。适合有明确投放计划的
-场景；列表用完即停，不会回退到自动预测。
+场景。列表用完默认即停、不回退自动预测；想让列表刷完后继续按基线/预测刷量，
+再加 `boost_list_fallback: true`（文件缺失/读取失败仍不回退）。
 
 ### 9.5 统计与刷量使用不同账号
 
@@ -1711,8 +1716,9 @@ boost_cookie_file: "cookie.txt"    # 刷量：想共用同一个号就显式写�
 boost_list_file: "boost_plan.txt"
 ```
 
-列表模式会覆盖预测缺口；列表用完即停。若只是临时排期，用完记得清空该配置，
-否则系统不会再自动按预测刷量。
+列表模式会覆盖预测缺口；列表用完默认即停。若只是临时排期，用完想自动回到预测
+刷量，有两种做法：设 `boost_list_fallback: true`（列表耗尽后自动回退，文件缺失/
+读取失败仍不回退），或直接清空 `boost_list_file` 配置。
 
 ### 13.3 forecast 默认包含今天并改用自然缺口口径
 
