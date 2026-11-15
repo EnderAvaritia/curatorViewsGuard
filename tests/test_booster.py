@@ -8,7 +8,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from curator_views.core.booster import MAX_WORKERS, Booster
+from curator_views.core.booster import Booster
 
 
 class FakeStorage:
@@ -144,8 +144,8 @@ class TestRatioDistribution:
         assert booster.distribution == "ratio"
 
 
-class TestConcurrencyCap:
-    """线程池大小恒被 MAX_WORKERS 截断：配置再大也不会突破实现上限。"""
+class TestThreadPoolSize:
+    """线程池大小直接取配置的 threads，没有内置上限。"""
 
     def _run_with_captured_workers(self, threads: int) -> int:
         booster = make_booster(single_cap=1, threads=threads)
@@ -168,8 +168,8 @@ class TestConcurrencyCap:
 
         return captured["max_workers"]
 
-    def test_threads_above_cap_clamped_to_max_workers(self):
-        assert self._run_with_captured_workers(64) == MAX_WORKERS
+    def test_large_threads_passed_through_uncapped(self):
+        assert self._run_with_captured_workers(64) == 64
 
     def test_threads_below_cap_kept_as_configured(self):
         assert self._run_with_captured_workers(3) == 3

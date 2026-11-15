@@ -30,7 +30,7 @@ from .anti_cheat import (
     detect_overflow,
 )
 from .boost_list import consume_next, peek_next
-from .booster import MAX_WORKERS, Booster
+from .booster import Booster
 from .fetcher import Fetcher
 from .notifier import Notifier
 from .predictor import predict_expected
@@ -155,10 +155,11 @@ def _effective_threads(
 ) -> int:
     """返回 Booster 实际可同时访问的 App 数。
 
-    受实现上限（``MAX_WORKERS``）、推荐数（boost_n）与批次大小（batch_size）
-    共同限制；并行批次里只有 ``len(active)`` 个任务，线程再多也不会超过这个数。
+    ``threads`` 没有内置上限，但并发数不会超过推荐数（boost_n）与批次大小
+    （batch_size）；并行批次里只有 ``len(active)`` 个任务，线程再多也不会超过
+    这个数。
     """
-    limit = max(1, min(int(threads), MAX_WORKERS))
+    limit = max(1, int(threads))
     if app_count is not None:
         limit = min(limit, max(1, int(app_count)))
     if batch_size is not None:
@@ -771,8 +772,8 @@ boost_mode / growth_factor / growth_rate：
             f"最大间隔={max(wait_min, wait_max):g}s，未计请求耗时）"
         )
         logger.warning(
-            "%s；建议提高 threads（实现上限 %d）或降低 wait_min/wait_max，"
-            "否则一天跑不满。", capacity_warning, MAX_WORKERS,
+            "%s；建议提高 threads 或降低 wait_min/wait_max，"
+            "否则一天跑不满。", capacity_warning,
         )
 
     # 单轮容量（boost_n × single_cap）限制：缺口更大时本轮必然刷不满，

@@ -207,7 +207,7 @@ class TestForecastDays:
         assert "throughput_capacity" in warning_codes(result)
         assert result["summary"]["throughput_capacity"] == 5400
 
-    def test_throughput_capacity_caps_threads_at_max_workers(self):
+    def test_throughput_capacity_uses_configured_threads(self):
         result = forecast_days(
             make_history(),
             make_config(
@@ -223,8 +223,8 @@ class TestForecastDays:
             START_TS,
             days=1,
         )
-        # threads=10 被 MAX_WORKERS 截到 8：8 × 86400 / 16 = 43,200
-        assert result["summary"]["throughput_capacity"] == 43200
+        # threads 无内置上限：10 × 86400 / 16 = 54,000
+        assert result["summary"]["throughput_capacity"] == 54000
         assert "throughput_capacity" not in warning_codes(result)
 
     def test_single_recommendation_limits_concurrency(self):
