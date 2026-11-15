@@ -55,8 +55,17 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.sent = []
 
-    def send(self, title: str, body: str, level: str = "info") -> None:
+    def send(
+        self,
+        title: str,
+        body: str,
+        level: str = "info",
+        category: str = "alert",
+    ) -> None:
         self.sent.append((title, body, level))
+
+    def flush_pending(self) -> int:
+        return 0
 
 
 class FakeBooster:

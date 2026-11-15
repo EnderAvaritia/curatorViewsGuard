@@ -34,7 +34,9 @@
   已刷自动补剩余缺口；
 - 失败重试：daemon 执行失败不标记该时段完成，按间隔重试；统计 Cookie 失效会
   单独告警，重新登录后下一次重试自动生效，无需重启进程；
-- 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；
+- 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；可配置总开关、最低推送级别、
+  关闭例行简报（异常仍推）与静默时段（静默期排队到 `notify_queue.json`，离开静默后
+  自动补发）；
 - 巡检与数据导出：`check` 抓取统计并写入本地库，随时查看最近 7 天与预测摘要，
   或导出历史统计数据。
 
@@ -348,6 +350,10 @@ python curator_views/cli.py version
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
+| `ntfy_enabled` | `true` | 推送总开关；`false` 时所有通知只写日志，不排队也不补发 |
+| `ntfy_min_level` | `"info"` | 最低推送级别 `info` / `warning` / `error`；低于该级别只写日志 |
+| `ntfy_daily_summary` | `true` | `false` 时只抑制例行（`info` 级）每日简报；warning/error 级简报与告警照常推送 |
+| `ntfy_quiet_hours` | `""` | 静默时段，如 `"23:00-08:00"` 或 `"12:00-13:00,23:00-08:00"`；留空不启用 |
 | `boost_enabled` | `true` | 是否启用每日受控提升 |
 | `daily_times` | `[]` | 每日执行时刻列表（如 `["10:00", "20:00"]`）；非空时优先于 `daily_time`，每个时段执行一次完整流程，后一时段按当日已刷补剩余缺口 |
 | `daily_time` | `"10:00"` | 单时刻回退配置，`daily_times` 为空时生效（Asia/Shanghai，HH:MM） |

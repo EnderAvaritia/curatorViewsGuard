@@ -21,8 +21,11 @@ class FakeNotifier:
         self.sent = []
         FakeNotifier.instances.append(self)
 
-    def send(self, title, message, level="info"):
+    def send(self, title, message, level="info", category="alert"):
         self.sent.append((title, message, level))
+
+    def flush_pending(self) -> int:
+        return 0
 
 
 def test_run_notifies_and_exits_on_auth_error(tmp_path, monkeypatch, capsys):

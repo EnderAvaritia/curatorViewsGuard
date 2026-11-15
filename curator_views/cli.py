@@ -134,6 +134,18 @@ ntfy_url: ""
 # 白话：推送频道名，手机 App 要订阅同名频道才收得到。
 ntfy_topic: ""
 
+# 是否启用 ntfy 推送（false 时所有通知只写日志，不排队也不补发）
+ntfy_enabled: true
+
+# 最低推送级别：info / warning / error；低于该级别的通知只写日志
+ntfy_min_level: "info"
+
+# 成功简报是否推送；false 时仅 warning/error 级别的简报照常推送
+ntfy_daily_summary: true
+
+# 静默时段，如 "23:00-08:00" 或 "12:00-13:00,23:00-08:00"；留空不启用
+ntfy_quiet_hours: ""
+
 # 是否启用每日受控提升；命令行 --no-boost 可临时关闭
 # 白话：刷量总开关，false 就是只统计不刷，适合先观察几天。
 boost_enabled: true
@@ -428,6 +440,21 @@ def _build_runtime(
     )
 
 
+def _build_notifier(cfg: Dict[str, Any], db_path: str) -> Notifier:
+    """按配置构造 Notifier；队列文件放在数据库同级目录。"""
+    return Notifier(
+        ntfy_url=str(cfg.get("ntfy_url", "") or ""),
+        ntfy_topic=str(cfg.get("ntfy_topic", "") or ""),
+        enabled=bool(cfg.get("ntfy_enabled", True)),
+        min_level=str(
+            cfg.get("ntfy_min_level", "info") or "info"
+        ).strip().lower(),
+        daily_summary=bool(cfg.get("ntfy_daily_summary", True)),
+        quiet_hours=str(cfg.get("ntfy_quiet_hours", "") or ""),
+        queue_path=str(Path(db_path).parent / "notify_queue.json"),
+    )
+
+
 def _make_booster(
     cfg: Dict[str, Any],
     clan_id: str,
@@ -535,16 +562,16 @@ def _execute_daily(
 
     storage = Storage(db_path)
     fetcher = Fetcher(clan_id, cookie_file, proxy)
-    notifier = Notifier(
-        ntfy_url=str(cfg.get("ntfy_url", "") or ""),
-        ntfy_topic=str(cfg.get("ntfy_topic", "") or ""),
-    )
+    notifier = _build_notifier(cfg, db_path)
     booster = _make_booster(
         cfg, clan_id, boost_cookie_file, proxy, storage
     )
 
     sched_cfg = _scheduler_config(cfg, boost_enabled, dry_run, cfg_dir)
     executor_cmd = str(cfg.get("executor_cmd", "") or "")
+    # 单次 run 也补发静默期 backlog；dry-run 不发送，flush_pending 自身绝不抛异常。
+    if not dry_run:
+        notifier.flush_pending()
     try:
         return run_daily(
             storage,
@@ -707,6 +734,13 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             max_times = 3
         return max(0.0, delay_minutes * 60.0), max(0, max_times)
 
+    def flush_notifications() -> None:
+        """daemon 每轮/心跳时补发静默期排队的通知（dry-run 不发送）。"""
+        if args.dry_run:
+            return
+        cfg = _load_config(config_path)
+        _build_notifier(cfg, db_path).flush_pending()
+
     state_path = status.default_state_path(db_path)
     daemon = Daemon(
         load_daily_times,
@@ -715,6 +749,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         last_run_date_provider=read_db_last_run_marker,
         slot_writer=mark_slot_done,
         retry_settings_provider=load_retry_settings,
+        pending_flusher=flush_notifications,
     )
     try:
         daemon.run_forever()

@@ -40,9 +40,14 @@ def default_state_path(db_path: str) -> str:
     return str(Path(db_path).parent / "daemon_state.json")
 
 
+def now() -> datetime:
+    """返回 Asia/Shanghai 当前时间（带时区）。"""
+    return datetime.now(_TZ)
+
+
 def now_iso() -> str:
     """返回 Asia/Shanghai 当前时间（ISO-8601，秒级精度）。"""
-    return datetime.now(_TZ).isoformat(timespec="seconds")
+    return now().isoformat(timespec="seconds")
 
 
 def parse_timestamp(value: Any) -> Optional[datetime]:

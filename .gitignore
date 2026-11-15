@@ -17,6 +17,7 @@ cookie.txt
 *.log
 daemon_state.json
 views_history.json
+notify_queue.json
 
 # 系统
 .DS_Store

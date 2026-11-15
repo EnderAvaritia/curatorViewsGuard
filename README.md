@@ -502,10 +502,24 @@ python curator_views/cli.py daemon --config config.yaml
 | --- | --- | --- |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名，如 `steam-curator-views` |
+| `ntfy_enabled` | `true` | 推送总开关；`false` 时所有通知只写日志，不排队也不补发 |
+| `ntfy_min_level` | `"info"` | 最低推送级别 `info` / `warning` / `error`；低于该级别只写日志 |
+| `ntfy_daily_summary` | `true` | `false` 时只抑制例行（`info` 级）每日简报；warning/error 级简报与告警照常推送 |
+| `ntfy_quiet_hours` | `""` | 静默时段，如 `"23:00-08:00"` 或 `"12:00-13:00,23:00-08:00"`；留空不启用 |
 
-两者都配置才启用 ntfy 推送；否则只写日志。每日简报在以下情况升级为 warning：
+两者都配置且 `ntfy_enabled` 为 `true` 时才启用 ntfy 推送；否则只写日志。
+每日简报在以下情况升级为 warning：
 存在溢出标记、处于恢复期、Booster 中止、执行器报错、刷量列表文件缺失/读取失败/
 消费失败。
+
+静默时段（`ntfy_quiet_hours`）支持多个 `HH:MM-HH:MM` 区间，用逗号、分号或空白
+分隔；开始时刻含、结束时刻不含，开始晚于结束表示跨午夜（如 `23:00-08:00`）。
+静默期内命中推送条件的通知不会立即发送，而是写入数据库同级的
+`notify_queue.json`（队列上限 50 条，超出丢弃最旧并记录 warning）；级别过滤与
+简报开关在入队前生效，被过滤的通知不会进入队列。daemon 在每次主循环与睡眠期间的
+30 秒心跳里尝试补发，`run` 在开始执行时补发（非 dry-run），因此离开静默后一般很快
+送达；补发中途某条失败会保留该条及其后所有条目，等下个周期重试。`--dry-run`
+不发送也不补发，只写日志。
 
 ### 7.3 守护进程配置
 
@@ -646,6 +660,14 @@ db_path: "views.db"
 
 ntfy_url: ""
 ntfy_topic: ""
+# 是否启用 ntfy 推送（false 时所有通知只写日志，不排队也不补发）
+ntfy_enabled: true
+# 最低推送级别：info / warning / error；低于该级别的通知只写日志
+ntfy_min_level: "info"
+# 成功简报是否推送；false 时仅 warning/error 级别的简报照常推送
+ntfy_daily_summary: true
+# 静默时段，如 "23:00-08:00" 或 "12:00-13:00,23:00-08:00"；留空不启用
+ntfy_quiet_hours: ""
 boost_enabled: true
 
 daily_times: []
@@ -1311,6 +1333,8 @@ sudo systemctl enable --now curator-views.timer
 - 文件日志：数据库所在目录的 `curator_views.log`；
 - `daemon` 前台运行时同时输出控制台；
 - 日志包含每日简报、提升批次、异常检测、执行器错误等。
+- 静默期排队的通知写入数据库同级的 `notify_queue.json`，离开静默时段后自动补发；
+  队列文件无需手工维护，删除它只会丢弃尚未补发的积压通知。
 
 ### 11.3 守护进程状态
 
@@ -1554,6 +1578,21 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
   `daemon_state.json` 的 `last_run_date` 是今天但没有 `last_run_slot`，daemon
   视为今天已全部完成，避免启动后立刻重复执行。
 
+### 13.10 通知级别过滤与静默时段
+
+新增四个可选的推送控制键，均有默认值，旧配置无需修改，行为与升级前一致：
+
+- 只收异常：`ntfy_min_level: "warning"` 让 `info` 级通知只写日志，再配合
+  `ntfy_daily_summary: false` 抑制例行成功简报；warning/error 级简报与告警照常推送；
+- 夜间免打扰：`ntfy_quiet_hours: "23:00-08:00"`（可写多个区间，如
+  `"12:00-13:00,23:00-08:00"`）。静默期命中推送条件的通知排入数据库同级的
+  `notify_queue.json`，离开静默后自动补发，队列最多 50 条，超出丢弃最旧；
+- 彻底关闭推送：`ntfy_enabled: false`，或清空 `ntfy_url` / `ntfy_topic`。此时所有
+  通知只写日志，不排队也不补发。
+
+`notify_queue.json` 位于数据库（`db_path`）同级目录，已被 `.gitignore` 忽略，
+无需手工维护；删除它只会丢弃尚未补发的积压通知。
+
 ---
 
 ## 14. 安全与合规
@@ -1576,7 +1615,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **264** 个，覆盖：
+当前测试共 **306** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -1592,7 +1631,9 @@ python -m pytest tests/ -v
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`
   的重新登录提示、Cookie 失效告警；
 - daemon 的 plan_next、同日去重、失败当天重试与重试用尽、旧状态纠正、状态与 info 输出；
-- daemon 多时段调度（时段解析、时段级去重、跨重启、手动 run 标记、时段级重试）。
+- daemon 多时段调度（时段解析、时段级去重、跨重启、手动 run 标记、时段级重试）；
+- 通知的级别过滤、每日简报开关、静默时段区间解析（含跨午夜）与队列补发（FIFO、
+  失败保留、上限裁剪）、daemon 补发回调与 dry-run 不补发。
 
 测试目录：
 
@@ -1607,12 +1648,15 @@ tests/
 ├── test_cli_cookie.py
 ├── test_cli_info.py
 ├── test_cli_logging.py
+├── test_cli_notify_config.py
 ├── test_convergence.py
 ├── test_cookie_optional.py
 ├── test_daemon.py
+├── test_daemon_notify.py
 ├── test_fetcher.py
 ├── test_forecast.py
 ├── test_login.py
+├── test_notifier.py
 ├── test_predictor.py
 ├── test_run_daily.py
 ├── test_scheduler.py

@@ -892,7 +892,10 @@ boost_mode / growth_factor / growth_rate：
         logger.info("dry_run 模式：跳过每日简报发送。")
     else:
         notifier.send(
-            "每日简报", _format_summary(summary, dry_run), level=level
+            "每日简报",
+            _format_summary(summary, dry_run),
+            level=level,
+            category="daily_summary",
         )
 
     # 10. 记录当日已执行：daemon 重启后据此避免重复执行同一天；

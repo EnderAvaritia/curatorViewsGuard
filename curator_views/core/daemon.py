@@ -278,10 +278,12 @@ class Daemon:
             Callable[[], tuple[float, int]]
         ] = None,
         slot_writer: Optional[Callable[[str], None]] = None,
+        pending_flusher: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._load_daily_times = load_daily_times
         self._execute = execute
         self._slot_writer = slot_writer
+        self._flush_pending = pending_flusher
         # 可中断的等待：stop() 会立即唤醒，避免等满一个 SLEEP_STEP（30 秒）
         self._wake = threading.Event()
         self._sleep = sleeper or self._wait
@@ -366,6 +368,15 @@ class Daemon:
         """默认等待实现：可被 stop() 立即唤醒的阻塞等待。"""
         self._wake.wait(timeout)
 
+    def _flush_pending_safe(self) -> None:
+        """补发静默期排队的通知；失败只记警告，绝不影响主循环。"""
+        if self._flush_pending is None:
+            return
+        try:
+            self._flush_pending()
+        except Exception:  # noqa: BLE001 - 补发失败不影响调度
+            logger.warning("补发延迟通知失败", exc_info=True)
+
     def stop(self) -> None:
         """请求优雅退出：设置停止标志，并立即唤醒正在睡眠的循环。"""
         self._stop = True
@@ -423,6 +434,7 @@ class Daemon:
         try:
             while not self._stop:
                 now = self._now()
+                self._flush_pending_safe()
                 today_iso = now.strftime("%Y-%m-%d")
 
                 # 每轮先同步外部记录（数据库）：daemon 等待期间手动 run 过当天，
@@ -623,16 +635,22 @@ class Daemon:
 
                 if self._stop:
                     break
-                self._sleep_until(
-                    next_wake,
-                    sleep_step,
-                    heartbeat=lambda: self._write_state(
+
+                def heartbeat() -> None:
+                    """睡眠期间刷新心跳，并补发静默期排队的通知。"""
+                    self._write_state(
                         phase="waiting",
                         daily_times=daily_times,
                         next_wake=next_wake_iso,
                         last_run_date=last_run_date,
                         last_run_slot=last_slot,
-                    ),
+                    )
+                    self._flush_pending_safe()
+
+                self._sleep_until(
+                    next_wake,
+                    sleep_step,
+                    heartbeat=heartbeat,
                 )
 
         finally:
