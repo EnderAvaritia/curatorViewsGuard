@@ -595,6 +595,9 @@ python curator_views/cli.py daemon --config config.yaml
 | `boost_cookie_file` | （空） | 刷量专用 Cookie 路径；与 `cookie_file` 完全独立 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`；留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库路径 |
+| `cookie_refresh_enabled` | `true` | 用 `steamRefresh_steam` 自动续期统计 Cookie；关闭后只读 `cookie.txt` |
+| `cookie_refresh_before_hours` | `12` | 距 `steamLoginSecure` 过期少于该小时数时主动续期；`0` 表示有 refresh token 就续期 |
+| `cookie_refresh_min_interval_hours` | `6` | 两次实际续期的最小间隔（小时），避免失败时空转；`0` 关闭限流 |
 
 **Cookie 规则：**
 
@@ -608,6 +611,31 @@ python curator_views/cli.py daemon --config config.yaml
   路径，而不是留空。
 - 自定义 Cookie 文件名不在 `.gitignore` 的 `cookie.txt` 规则内，务必自行加入
   `.gitignore`，避免提交敏感信息。
+
+**Cookie 自动续期：**
+
+Steam 的 `steamLoginSecure`（访问凭证）约 24 小时过期，`steamRefresh_steam`
+（域 `login.steampowered.com`）约 200 天有效，可以静默换取一份新的 store 访问
+Cookie。系统会在每次 `run` / `daemon` 执行前，用 refresh token 重放 Steam 自己的
+两跳刷新：先 `POST https://login.steampowered.com/jwt/finalizelogin`，再调用
+store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settoken。
+全程走普通 HTTP，不需要浏览器或 Playwright。刷新后如 refresh token 轮换，会把
+新值写回 sidecar 文件 `<cookie_file>.session.json`（如
+`cookie.txt.session.json`），并以原子方式改写 Cookie 文件。
+
+- 只有距 `steamLoginSecure` 过期不足 `cookie_refresh_before_hours` 小时时才主动
+  续期；`0` 表示只要有 refresh token 就续期。
+- `cookie_refresh_min_interval_hours` 限制两次实际续期的最小间隔（`0` 关闭限流）。
+  `run` / `daemon` 遇到 `StatsAuthError` 时还会绕过该间隔立即刷新一次，重试一次
+  抓取，仍失败才回落到原有的“告警 + 下个时段重试”。
+- sidecar 里的 refresh token 也是凭据，和 `cookie.txt` 一样需要保护并加入
+  `.gitignore`。
+- refresh token 只能来自同一台机器、同一出口 IP 上至少一次成功的交互式 `login`。
+  旧 Cookie 文件若不含 `steamRefresh_steam`，先跑一次 `login` 完成引导。
+- 修改密码、登出该会话、撤销所有设备、Steam Guard 变更、出口 IP 或 ASN 变化都会
+  让 refresh token 失效（token 带 IP 绑定），此时仍必须重新交互式 `login`。
+  `AccessDenied`(15) / `NotLoggedOn`(21) / `Revoked`(26) / `Expired`(27) 属于
+  终止性失败，不再自动重试。
 
 ### 7.2 通知配置
 
@@ -806,6 +834,12 @@ cookie_file: "cookie.txt"
 boost_cookie_file: ""
 proxy: ""
 db_path: "views.db"
+# 用 steamRefresh_steam 自动续期统计 Cookie（关闭后只读 cookie.txt）
+cookie_refresh_enabled: true
+# 距 steamLoginSecure 过期少于该小时数时主动续期
+cookie_refresh_before_hours: 12
+# 两次实际续期的最小间隔（小时），避免失败时空转
+cookie_refresh_min_interval_hours: 6
 
 ntfy_url: ""
 ntfy_topic: ""
@@ -912,6 +946,7 @@ x = 日期序号（最近 N 天，N = window_days × 2，默认 28 天）
 | `forecast` | 只读推算今天/明天起 N 天的目标 / 假设自然流量 / 缺口 |
 | `boost` | 手动执行一轮受控提升 |
 | `login` | 半自动登录 Steam，生成/校验 Cookie |
+| `refresh-cookie` | 用 `steamRefresh_steam` 手动续期统计 Cookie |
 | `export` | 从本地数据库导出每日统计（JSON / CSV） |
 | `init-config` | 生成默认配置文件模板 |
 | `version` | 打印版本号 |
@@ -963,8 +998,9 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
   之后的时段仍会执行以补足缺口；
 - 时段串行执行：上一时段的提升还没结束时，下一时段会等它结束后再开始（不并发），
   所以不要把时段安排得太密；
-- 统计 Cookie 失效会单独告警（ntfy 或日志），重新 `login` 覆盖 Cookie 文件后，
-  下一次重试会自动读取新文件，**不需要重启 daemon**；
+- 统计 Cookie 失效会先用 `steamRefresh_steam` 自动续期并重试一次；续期失败才
+  单独告警（ntfy 或日志）。重新 `login` 覆盖 Cookie 文件后，下一次重试会自动
+  读取新文件，**不需要重启 daemon**；
 - 同一时段不重复执行：`last_run_slot` 写入 `daemon_state.json`，`last_run_date`
   同时写入数据库与状态文件（`--dry-run` 不写数据库侧，因此不会顶掉当天正式执行）；
 - Ctrl+C（SIGINT）立即中断当前执行并退出；SIGTERM 优雅收尾后退出；
@@ -1258,6 +1294,32 @@ python curator_views/cli.py login --config config.yaml \
 {"mode": "login", "cookie_file": "cookie.txt", "clan_id": "45519015",
  "valid": true, "reason": "Cookie 有效", "cookie_count": 12}
 ```
+
+### 8.7.1 refresh-cookie
+
+```bash
+python curator_views/cli.py refresh-cookie --config config.yaml \
+  [--cookie-file PATH] [--force] [--timeout SECONDS]
+```
+
+手动续期统计 Cookie。读取 Cookie 文件，从 sidecar（`<cookie_file>.session.json`）
+或 Cookie 头里取出 `steamRefresh_steam`，换取新的 store 访问令牌，原子改写 Cookie
+文件并更新 sidecar。普通 `run` / `daemon` 会按配置自动做同样的续期，这个命令
+用于排障或手动补一次刷新。
+
+- `--cookie-file PATH`：要续期的 Cookie 文件，默认取配置 `cookie_file`；
+- `--force`：忽略 `cookie_refresh_min_interval_hours` 限流，立即续期；
+- `--timeout SECONDS`：单次 HTTP 超时。
+
+成功时打印 JSON 摘要（不含 Cookie 内容），失败退出码 1：
+
+```json
+{"mode": "refresh", "cookie_file": "cookie.txt", "clan_id": "45519015",
+ "refreshed": true, "reason": "Cookie 有效", "expires_at": "..."}
+```
+
+自动续期只处理正常过期；改密码、登出、撤销设备、Steam Guard 变更或出口 IP/ASN
+变化后仍需交互式 `login`（见 [12.2](#122-cookie-失效--抓取报未找到-g_statsappviews)）。
 
 ### 8.8 export
 
@@ -1633,11 +1695,16 @@ CLI 只警告不退出。统计后台通常需要登录，因此 `run` / `check`
 `daemon` 的处理方式：
 
 - 把这类错误与普通网络/解析错误区分开（`StatsAuthError`），**不把当天标记为已完成**；
-- 推送一条 `error` 级通知（未配置 ntfy 时写入日志），正文直接给出重新登录命令；
+- 先尝试用 `steamRefresh_steam` 自动续期（绕过最小续期间隔刷新一次），成功则
+  重新抓取一次，当天照常执行；
+- 自动续期失败说明 refresh token 本身已失效，或与当前出口 IP 不匹配（见
+  [7.1](#71-基础配置)），此时推送一条 `error` 级通知（未配置 ntfy 时写入日志），
+  正文直接给出重新登录命令；
 - 按 `retry_delay_minutes` 在当天重试。你重新 `login` 覆盖 Cookie 文件后，
   下一次重试会自动读取新文件，无需重启 daemon。
 
-解决：
+解决：**在 daemon 所在的机器和出口 IP 上**交互式重新登录（自动续期不会跨 IP
+生效）：
 
 ```bash
 python curator_views/cli.py login --config config.yaml --validate-only
@@ -1899,6 +1966,21 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 如果当天没有跑过 `run`（或改了波动率/基线配置导致签名变化），`forecast` 会显示
 无定档记录或 `plan_signature_mismatch` 提示，并退回抽样预测。
 
+### 13.12 Cookie 自动续期
+
+升级后新增基于 `steamRefresh_steam` 的统计 Cookie 自动续期，`run` / `daemon`
+会在访问令牌临近过期时自动刷新，不再需要每天手动 `login`。升级时注意：
+
+- 旧 `cookie.txt` 若不含 `steamRefresh_steam`，需要先在 daemon 所在机器和出口 IP
+  上跑一次交互式 `login` 做引导，之后日常刷新自动进行；
+- 刷新成功后会在 Cookie 文件旁生成 `<cookie_file>.session.json`，保存 refresh
+  token，请按凭据保护并加入 `.gitignore`；
+- 自动续期只处理正常过期。修改密码、登出、撤销所有设备、Steam Guard 变更或出口
+  IP/ASN 变化后 refresh token 会失效，仍需重新 `login`（见
+  [12.2](#122-cookie-失效--抓取报未找到-g_statsappviews)）；
+- 三个新配置键 `cookie_refresh_enabled` / `cookie_refresh_before_hours` /
+  `cookie_refresh_min_interval_hours` 都有默认值，旧配置无需修改。
+
 ---
 
 ## 14. 安全与合规
@@ -1909,6 +1991,9 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
   `daemon_state.json`。自定义 Cookie 文件名（如 `cookie_stats.txt`）不在默认
   规则内，请自行加入 `.gitignore`。
 - `config.yaml` 可能包含 `clan_id` 等本地信息，提交前请检查。
+- 自动续期会在 Cookie 文件旁生成 `<cookie_file>.session.json`（如
+  `cookie*.session.json`），其中保存 `steamRefresh_steam` refresh token，和
+  `cookie.txt` 一样是登录凭据。请一并保护并加入 `.gitignore`，不要提交或分享。
 - 登录过程不会触碰密码，也不会打印 Cookie 内容；但浏览器持久化目录
   `.steam_profile*` 含登录态，请按敏感目录保护。
 - 本工具仅用于自己运营的 Steam 鉴赏家组；请遵守 Steam 订阅者协议与当地法律。

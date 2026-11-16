@@ -40,6 +40,9 @@
   已刷自动补剩余缺口；
 - 失败重试：daemon 执行失败不标记该时段完成，按间隔重试；统计 Cookie 失效会
   单独告警，重新登录后下一次重试自动生效，无需重启进程；
+- Cookie 自动续期：用 `steamRefresh_steam` 在访问令牌临近过期时自动刷新统计
+  Cookie，原子改写 Cookie 文件并更新 sidecar `<cookie_file>.session.json`；
+  保留“失效告警 + 重新登录”兜底，也可用 `refresh-cookie` 手动触发；
 - 通知推送：可选 ntfy 推送（未配置时退化为日志记录）；可配置总开关、最低推送级别、
   关闭例行简报（异常仍推）与静默时段（静默期排队到 `notify_queue.json`，离开静默后
   自动补发）；
@@ -119,8 +122,9 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
   重启后当天只补跑尚未完成的时段；手动 `run` 只写日期级 `last_run_date`，daemon
   视为此刻之前的时段已完成，之后的时段仍会执行补足缺口（细节见主 README 的
   13.9 与 12.10）；
-- 统计 Cookie 失效（重定向到公开页 / 401 / 403）会推送 `error` 级告警；
-  重新 `login` 覆盖 Cookie 文件后，下一次重试自动读取新文件，无需重启 daemon；
+- 统计 Cookie 失效（重定向到公开页 / 401 / 403）会先用 `steamRefresh_steam`
+  自动续期并重试一次；续期失败才推送 `error` 级告警。重新 `login` 覆盖 Cookie
+  文件后，下一次重试自动读取新文件，无需重启 daemon；
 - 同一时段不重复执行：`last_run_slot` 与 `last_run_date` 都会写入状态文件，
   daemon 每轮核对，因此手动 `run` 与 daemon 不会把同一时段刷两遍；
 - 前台运行时 INFO 日志同时输出到控制台（启动即打印日志路径与下次执行时间），
@@ -352,6 +356,10 @@ python curator_views/cli.py login --config config.yaml --validate-only
 登录态保存在持久化目录 `.steam_profile/` 中，第二次运行通常已登录，无需再输密码。
 输出为 JSON 汇总（不含 Cookie 内容）：成功退出码 0，校验失败/文件缺失 1。
 
+首次登录成功后，Cookie 文件旁会生成 `<cookie_file>.session.json` 保存
+`steamRefresh_steam` refresh token；后续 `run` / `daemon` 可用它自动续期，不再
+需要每天手动登录。该文件是登录凭据，请和 Cookie 文件一起保护并加入 `.gitignore`。
+
 统计与刷量需要不同账号时，配置 `boost_cookie_file` 并在登录时指定目标文件
 （不同账号需用不同 `--profile-dir`）：
 
@@ -365,6 +373,32 @@ python curator_views/cli.py login --config config.yaml \
 `boost_cookie_file` 与 `cookie_file` 完全独立：留空时刷量以未登录（游客）模式
 运行，不会复用 `cookie_file`。旧配置若希望刷量带登录态，需显式把
 `boost_cookie_file` 指向同一文件。
+
+### refresh-cookie
+
+手动续期统计 Cookie（普通 `run` / `daemon` 会按配置自动续期，此命令用于排障或
+手动补刷）。读取 Cookie 文件，从 sidecar `<cookie_file>.session.json` 或 Cookie
+头中取出 `steamRefresh_steam`，换取新的 store 访问令牌，原子改写 Cookie 文件并
+更新 sidecar。
+
+```bash
+python curator_views/cli.py refresh-cookie --config config.yaml \
+  [--cookie-file PATH] [--force] [--timeout SECONDS]
+```
+
+- `--cookie-file PATH`：要续期的 Cookie 文件，默认取配置 `cookie_file`；
+- `--force`：忽略 `cookie_refresh_min_interval_hours` 限流，立即续期；
+- `--timeout SECONDS`：单次 HTTP 超时。
+
+成功打印 JSON 摘要（不含 Cookie 内容），失败退出码 1：
+
+```json
+{"mode": "refresh", "cookie_file": "cookie.txt", "clan_id": "45519015",
+ "refreshed": true, "reason": "Cookie 有效", "expires_at": "..."}
+```
+
+自动续期只处理正常过期；改密码、登出、撤销设备、Steam Guard 变更或出口 IP/ASN
+变化后仍需交互式 `login`。
 
 ### export
 
@@ -397,6 +431,9 @@ python curator_views/cli.py version
 | `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；与 `cookie_file` 完全独立，留空则刷量以未登录（游客）模式运行 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`，留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
+| `cookie_refresh_enabled` | `true` | 用 `steamRefresh_steam` 自动续期统计 Cookie；关闭后只读 `cookie.txt` |
+| `cookie_refresh_before_hours` | `12` | 距 `steamLoginSecure` 过期少于该小时数时主动续期；`0` 表示有 refresh token 就续期 |
+| `cookie_refresh_min_interval_hours` | `6` | 两次实际续期的最小间隔（小时），避免失败时空转；`0` 关闭限流 |
 | `ntfy_url` | （空） | ntfy 服务地址，如 `https://ntfy.sh` |
 | `ntfy_topic` | （空） | ntfy 主题名；与 `ntfy_url` 同时配置才启用推送 |
 | `ntfy_enabled` | `true` | 推送总开关；`false` 时所有通知只写日志，不排队也不补发 |
