@@ -379,7 +379,8 @@ python curator_views/cli.py login --config config.yaml \
 手动续期统计 Cookie（普通 `run` / `daemon` 会按配置自动续期，此命令用于排障或
 手动补刷）。读取 Cookie 文件，从 sidecar `<cookie_file>.session.json` 或 Cookie
 头中取出 `steamRefresh_steam`，换取新的 store 访问令牌，原子改写 Cookie 文件并
-更新 sidecar。
+更新 sidecar。Cookie 头中的刷新令牌优先于 sidecar；续期失败同样计入
+`cookie_refresh_min_interval_hours` 限流，避免反复请求登录接口。
 
 ```bash
 python curator_views/cli.py refresh-cookie --config config.yaml \
