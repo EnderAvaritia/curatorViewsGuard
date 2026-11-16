@@ -66,6 +66,54 @@ def build_cookie_string(cookies: Iterable[Dict[str, Any]]) -> str:
     return "; ".join(f"{name}={value}" for name, value in latest.items())
 
 
+def _cookie_domain_priority(domain: str) -> int:
+    """返回 Cookie 域在 store 优先策略下的优先级（数值越大越优先）。"""
+    if "store.steampowered.com" in domain:
+        return 3
+    if domain in (".steampowered.com", "steampowered.com"):
+        return 2
+    return 1
+
+
+def build_store_cookie_string(cookies: Iterable[Dict[str, Any]]) -> str:
+    """按 store 域优先导出 Cookie 字符串。
+
+    自 2024 年起 Steam 会按域下发不同的访问令牌，同名 ``steamLoginSecure``
+    在 store / login / community 等域下的值可能并不相同。鉴赏家后台
+    ``curator/{id}/admin/*`` 需要的是 store 作用域的令牌，若像
+    :func:`build_cookie_string` 那样只按“最后一次出现”取值，可能取到
+    login 或 community 域的令牌，导致后台访问被重定向。
+
+    因此本函数对每个 Cookie 名称按域优先级择值：``store.steampowered.com``
+    最高，其次 ``.steampowered.com`` / ``steampowered.com``，最后是其他
+    ``*steampowered.com``（login / help / checkout 等）；同优先级内仍保留
+    最后一次出现的值。只保留 domain 含 ``steampowered.com`` 的 Cookie，
+    跳过名或值为空的项，输出顺序按名称首次出现的先后，绝不修改值内容。
+
+    Args:
+        cookies: Playwright ``context.cookies()`` 返回的字典序列，
+            每项至少含 ``name`` / ``value`` / ``domain``。
+
+    Returns:
+        形如 ``"a=1; b=2"`` 的字符串；没有可用 Cookie 时返回空串。
+    """
+    best: Dict[str, tuple[int, str]] = {}
+    for item in cookies:
+        name = str(item.get("name") or "")
+        value = str(item.get("value") or "")
+        domain = str(item.get("domain") or "")
+        if not name or not value:
+            continue
+        if "steampowered.com" not in domain:
+            continue
+        priority = _cookie_domain_priority(domain)
+        current = best.get(name)
+        # dict 重复赋值保留首次插入位置，同优先级时值更新为最后一次出现
+        if current is None or priority >= current[0]:
+            best[name] = (priority, value)
+    return "; ".join(f"{name}={value}" for name, (_, value) in best.items())
+
+
 @dataclass
 class CookieCheckResult:
     """Cookie 有效性校验结果。"""

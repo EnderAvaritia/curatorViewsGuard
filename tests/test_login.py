@@ -130,6 +130,92 @@ def test_build_cookie_string_filters_dedupes_and_orders() -> None:
     assert login.build_cookie_string(cookies) == "a=9; b=2"
 
 
+def test_build_store_cookie_string_store_domain_wins() -> None:
+    """store 域的 steamLoginSecure 胜过 community / login 副本，值原样保留。"""
+    cookies = [
+        {
+            "name": "steamLoginSecure",
+            "value": "community-token",
+            "domain": "steamcommunity.com",
+        },
+        {
+            "name": "steamLoginSecure",
+            "value": "login-token",
+            "domain": "login.steampowered.com",
+        },
+        {
+            "name": "steamLoginSecure",
+            "value": "store-token",
+            "domain": "store.steampowered.com",
+        },
+    ]
+    assert login.build_store_cookie_string(cookies) == "steamLoginSecure=store-token"
+
+
+def test_build_store_cookie_string_keeps_non_store_and_drops_community() -> None:
+    """保留 steamCountry / sessionid 等非 store 域 Cookie，排除 community 域。"""
+    cookies = [
+        {
+            "name": "steamLoginSecure",
+            "value": "store-token",
+            "domain": "store.steampowered.com",
+        },
+        {
+            "name": "steamCountry",
+            "value": "CN%7Cabc",
+            "domain": "store.steampowered.com",
+        },
+        {"name": "sessionid", "value": "s1", "domain": "login.steampowered.com"},
+        {
+            "name": "steamLoginSecure",
+            "value": "community-token",
+            "domain": "steamcommunity.com",
+        },
+        {
+            "name": "steamCountry",
+            "value": "community-country",
+            "domain": "steamcommunity.com",
+        },
+    ]
+    assert (
+        login.build_store_cookie_string(cookies)
+        == "steamLoginSecure=store-token; steamCountry=CN%7Cabc; sessionid=s1"
+    )
+
+
+def test_build_store_cookie_string_root_domain_beats_login() -> None:
+    """没有 store 副本时，.steampowered.com 优先于 login.steampowered.com。"""
+    cookies = [
+        {
+            "name": "steamLoginSecure",
+            "value": "login-token",
+            "domain": "login.steampowered.com",
+        },
+        {
+            "name": "steamLoginSecure",
+            "value": "root-token",
+            "domain": ".steampowered.com",
+        },
+    ]
+    assert login.build_store_cookie_string(cookies) == "steamLoginSecure=root-token"
+
+
+def test_build_store_cookie_string_preserves_first_occurrence_order() -> None:
+    """输出顺序按名称首次出现，同优先级重复出现时最后一次的值生效。"""
+    cookies = [
+        {"name": "b", "value": "1", "domain": "login.steampowered.com"},
+        {"name": "a", "value": "2", "domain": "store.steampowered.com"},
+        {"name": "b", "value": "3", "domain": "store.steampowered.com"},
+        {"name": "b", "value": "4", "domain": "store.steampowered.com"},
+    ]
+    assert login.build_store_cookie_string(cookies) == "b=4; a=2"
+
+
+def test_build_store_cookie_string_empty_returns_empty() -> None:
+    """空输入返回空串。"""
+    assert login.build_store_cookie_string([]) == ""
+
+
 def test_validate_cookie_valid(monkeypatch) -> None:
     """200 且页面含 g_StatsAppViews 时判定有效。"""
     url = login.STATS_URL.format(clan_id="123")
