@@ -180,8 +180,9 @@ README 的 [12.2 Cookie 失效](../README.md#122-cookie-失效--抓取报未找�
 默认情况下 `run` 在同一进程内直接调用 Booster 刷量。若在 `config.yaml` 中配置
 `executor_cmd`（如 `python cli.py boost --config {config} --target {need} --apps {apps}`），
 `run`（调度器）会把计算出的任务下发给独立执行器子进程执行，执行器完成后
-调度器解析其 JSON 输出（`boosted` 字段）并计入每日简报。两种模式可随时切换，
-执行器也可手动单独触发。
+调度器以 `boost_log` 执行前后的差值为准统计本次刷量（执行器写同一个 `db_path`
+时），并解析其 stdout 中最后一个 JSON 对象的 `boosted` 作为兜底，计入每日简报。
+两种模式可随时切换，执行器也可手动单独触发。
 
 ### 每日刷量列表（可选）
 

@@ -125,6 +125,8 @@ def run_with(
     boost_totals: dict | None = None,
     saved_state: dict | None = None,
     storage: FakeStorage | None = None,
+    executor_cmd: str = "",
+    config_path: str = "",
     **config_overrides,
 ) -> dict:
     """以指定配置运行一次 run_daily，返回汇总字典。
@@ -158,7 +160,10 @@ def run_with(
             storage.saved.update(saved_state)
     fetcher = FakeFetcher(stats)
     notifier = FakeNotifier()
-    summary = run_daily(storage, fetcher, notifier, booster, config)
+    summary = run_daily(
+        storage, fetcher, notifier, booster, config,
+        executor_cmd=executor_cmd, config_path=config_path,
+    )
     return summary
 
 
@@ -283,6 +288,79 @@ class TestTodayBoosted:
             baseline_views=200,
         )
         assert summary["need"] == 0
+
+
+class TestSubprocessExecutorCount:
+    """executor_cmd 模式：本次刷量优先取 boost_log 差值，stdout 仅兜底。"""
+
+    def test_ledger_delta_wins_over_unparsable_stdout(self):
+        storage = FakeStorage(program_start_str())
+        stats = make_stats([100] * 30)
+
+        def fake_executor(*args, **kwargs):
+            # 执行器把刷量写进同一个库，但 stdout 没给出可用结果
+            storage.boost_totals[today_str()] = 100
+            return {"boosted": 0, "ok": True, "cmd": "x", "stderr": ""}
+
+        with patch(
+            "curator_views.core.scheduler._run_executor",
+            side_effect=fake_executor,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=200,
+                executor_cmd="python cli.py boost --target {need}",
+            )
+        assert summary["executor"] == "subprocess"
+        assert summary["need"] == 100
+        assert summary["boosted"] == 100
+
+    def test_ledger_delta_wins_over_mismatched_stdout(self):
+        storage = FakeStorage(program_start_str())
+        stats = make_stats([100] * 30)
+
+        def fake_executor(*args, **kwargs):
+            storage.boost_totals[today_str()] = 100
+            return {"boosted": 7, "ok": True, "cmd": "x", "stderr": ""}
+
+        with patch(
+            "curator_views.core.scheduler._run_executor",
+            side_effect=fake_executor,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=200,
+                executor_cmd="python cli.py boost --target {need}",
+            )
+        assert summary["boosted"] == 100
+
+    def test_stdout_used_when_ledger_unchanged(self):
+        # 自定义执行器写别的库 / 没写台账时，退回 stdout 的 boosted
+        storage = FakeStorage(program_start_str())
+        stats = make_stats([100] * 30)
+
+        def fake_executor(*args, **kwargs):
+            return {"boosted": 42, "ok": True, "cmd": "x", "stderr": ""}
+
+        with patch(
+            "curator_views.core.scheduler._run_executor",
+            side_effect=fake_executor,
+        ):
+            summary = run_with(
+                stats,
+                program_start_str(),
+                FakeBooster(),
+                storage=storage,
+                baseline_views=200,
+                executor_cmd="python cli.py boost --target {need}",
+            )
+        assert summary["boosted"] == 42
 
 
 class TestVolatility:

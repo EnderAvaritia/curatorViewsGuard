@@ -1243,7 +1243,19 @@ boost_mode / growth_factor / growth_rate：
                 dry_run=dry_run,
                 config_path=config_path,
             )
-            summary["boosted"] = exec_result["boosted"]
+            reported = exec_result["boosted"]
+            # 台账优先：执行器写的是同一个 db_path 时，用执行前后 boost_log
+            # 的差值作为本次实际刷量。这样即使执行器没打印 JSON、JSON 无法
+            # 解析，或把结果打印成了别的格式，调度器拿到的数量仍然准确；
+            # stdout 的 boosted 只在台账没有新增时兜底（自定义执行器写别的库）。
+            ledger_after = max(0, int(storage.get_boost_total(today_iso)))
+            ledger_delta = max(0, ledger_after - today_boosted)
+            if ledger_delta != reported:
+                logger.info(
+                    "执行器上报 %d 次，boost_log 新增 %d 次（以台账为准）。",
+                    reported, ledger_delta,
+                )
+            summary["boosted"] = ledger_delta if ledger_delta > 0 else reported
             if not exec_result["ok"]:
                 summary["executor_error"] = exec_result["stderr"]
         else:

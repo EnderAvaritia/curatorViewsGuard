@@ -453,7 +453,9 @@ executor_cmd: "python cli.py boost --config {config} --target {need} --apps {app
 - `{apps}`：推荐数量
 
 子进程超时 7200 秒；调度器解析 stdout 中最后一个 JSON 对象的 `boosted` 字段
-（单行、缩进多行、前后夹带日志都能识别）。执行器
+（单行、缩进多行、前后夹带日志都能识别）。若执行器写入同一个 `db_path`，调度器
+以执行前后 `boost_log` 的差值为准（`boosted` 仅在没有台账新增时兜底），因此即使
+执行器不打印 JSON，本次刷量数也准确。执行器
 可独立运行、独立排障，调度器崩溃也不会影响已经启动的执行器。
 
 ---
