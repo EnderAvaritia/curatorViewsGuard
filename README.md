@@ -68,6 +68,7 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 | --- | --- |
 | 每日浏览量 | Steam 鉴赏家后台按天统计的 `num_views`，通过 `g_StatsAppViews` 获取 |
 | 统计滞后 | Steam 当天统计通常在次日才完整，因此系统按“昨日数据”推算今日 |
+| 每日分界点 | Steam 统计的“一天”从该时刻开始（默认北京时间 **08:00** = UTC 0 点）；0:00~8:00 的刷量计入前一天 |
 | 基准（base） | 今日浏览量的参考水平：自动预测值，或 `baseline_views` 手动固定值 |
 | 今日目标（target） | `基准 × 目标系数`，系统希望今天达到的浏览量水平 |
 | 目标系数（multiplier） | 目标相对基准的比例；`stable` 恒为 `1.0`，`growth` 为 `growth_factor × (1 + growth_rate × 距生效日天数)` |
@@ -127,6 +128,10 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
                                       ▼
                  写 last_run_date（daemon 据此同日去重；dry-run 不写）
 ```
+
+> 流程里的“今天/昨天”是**逻辑日**：由 `day_boundary`（默认 `08:00`）切分，
+> 凌晨 0:00~7:59 仍属于前一天。抓取到的统计中，只有日期标签早于逻辑今天的
+> 完整日才参与预测/检测与“昨日”基准计算。
 
 ### 3.2 核心公式
 
@@ -477,6 +482,7 @@ CuratorViewsGuard/
         ├── login.py         # Playwright 半自动登录，导出/校验 Cookie
         ├── predictor.py     # 中位数 + 封顶趋势预测
         ├── anti_cheat.py    # 溢出检测 + 分摊抵扣 + 斜率检测
+        ├── daytime.py       # 每日分界点（day_boundary）与逻辑日工具
         ├── forecast.py      # 今天/明天起 N 天只读估算（纯函数，无 I/O）
         ├── chart.py         # forecast 折线图（控制台点状字符 + 自包含 HTML/SVG）
         ├── boost_list.py    # 每日刷量列表解析与原子消费
@@ -595,6 +601,7 @@ python curator_views/cli.py daemon --config config.yaml
 | `boost_cookie_file` | （空） | 刷量专用 Cookie 路径；与 `cookie_file` 完全独立 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`；留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库路径 |
+| `day_boundary` | `"08:00"` | 每日分界点（Asia/Shanghai，`HH:MM`）。Steam 统计通常在北京时间 08:00 换日，凌晨刷量会计入前一天；与 Steam 对齐可避免刷错日期，填 `"00:00"` 恢复自然日口径 |
 | `cookie_refresh_enabled` | `true` | 用 `steamRefresh_steam` 自动续期统计 Cookie；关闭后只读 `cookie.txt` |
 | `cookie_refresh_before_hours` | `12` | 距 `steamLoginSecure` 过期少于该小时数时主动续期；`0` 表示有 refresh token 就续期 |
 | `cookie_refresh_min_interval_hours` | `6` | 两次实际续期的最小间隔（小时），避免失败时空转；`0` 关闭限流 |
@@ -675,6 +682,11 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
 `daily_times` 接受列表，也接受逗号或空格分隔的字符串；非法条目跳过并记录警告。
 `daily_times` 为空（或未配置）时回退到 `daily_time`；完全解析不出有效时刻时回退到
 `10:00` 并记录警告。
+
+**跨分界点的时段**：`day_boundary` 默认 `08:00`，凌晨 0:00~7:59 的执行属于
+**前一个逻辑日**。例如 `daily_times` 含 `03:00` 时，它在 11-17 03:00 执行的是
+11-16 的收尾补量，台账与 `daily_plan` 都记为 11-16；09:00 起才进入 11-17。
+这正是与 Steam 统计对齐的行为，不需要把凌晨时段删掉。
 
 执行失败（网络、Cookie 失效、抓取异常等）**不会**把该时段标记为已完成：daemon 会按
 `retry_delay_minutes` 间隔在该时段内重试，`retry_max_times` 次仍失败才放弃该时段。
@@ -834,6 +846,8 @@ cookie_file: "cookie.txt"
 boost_cookie_file: ""
 proxy: ""
 db_path: "views.db"
+# Steam 每日统计的分界点（北京时间，HH:MM）；08:00 与 Steam 对齐
+day_boundary: "08:00"
 # 用 steamRefresh_steam 自动续期统计 Cookie（关闭后只读 cookie.txt）
 cookie_refresh_enabled: true
 # 距 steamLoginSecure 过期少于该小时数时主动续期
@@ -1062,8 +1076,9 @@ python curator_views/cli.py forecast --config config.yaml \
 - `--days N`：预测天数，默认 7，必须 ≥ 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，仅在内存使用，绝不写库；要求
   `clan_id` 非空；
-- `--today` / `--tomorrow`：从今天 00:00（默认）或明天 00:00 起算。今天的
-  统计要明天才完整，所以预测今天本身仍然是预测；
+- `--today` / `--tomorrow`：从逻辑今天 00:00（默认）或逻辑明天 00:00 起算
+  （逻辑日由 `day_boundary` 决定，默认 08:00 分界）。今天的统计要明天才完整，
+  所以预测今天本身仍然是预测；
 - `--natural trend|target`：默认 `natural`，即首日自然流量取“今天之前最近一个
   完整日的实际 − 当日刷量”（与 `run` 的缺口公式一致），未来日假设自然流量不变，
   因此每天都会重新计算缺口；显式指定时改用旧模型：
@@ -1098,9 +1113,9 @@ python curator_views/cli.py forecast --config config.yaml \
 - growth 起点只从 `kv_store` 读取，速率一致才沿用，否则按预测首日重新起算，
   不写回。
 
-默认从**今天 00:00**（Asia/Shanghai）起算，`--tomorrow` 可改为明天。自然口径下
-首日基准取今天之前最近一个完整日；若本地库最新日期早于昨天，会给出
-`stale_history` 提示，建议加 `--fetch`。
+默认从**逻辑今天 00:00**（Asia/Shanghai，`day_boundary` 默认 08:00 分界）起算，
+`--tomorrow` 可改为逻辑明天。自然口径下首日基准取今天之前最近一个完整日；
+若本地库最新日期早于昨天，会给出 `stale_history` 提示，建议加 `--fetch`。
 这是**估算不是精确预测**：未来自然流量只是外推；异常标记未持久化，因此
 未来日的 `in_cooldown` 恒为 `false`，也不做溢出扣减；自然口径同样不含恢复期与
 刷量列表，只复用 `run` 的缺口公式。首日则会读取 `run` 写入 `daily_plan` 的定档
@@ -1828,6 +1843,25 @@ need     = max(0, 当日配额 - 今日已刷)
 
 详见 [7.6 基线与波动参数](#76-基线与波动参数)。
 
+### 12.13 凌晨刷的量被算到前一天 / 刷错日期
+
+Steam 后台的“一天”不是按本地 0 点切分，而是通常在北京时间 **08:00**
+（UTC 0 点）才换日：00:00~07:59 之间发生的浏览会被统计进**前一天**。
+如果程序按自然日记账，凌晨执行的 `run` 就会把刷量记到“今天”，而 Steam 记到
+“昨天”，导致昨日自然流量、今日已刷和目标全部错位。
+
+系统用 `day_boundary`（默认 `"08:00"`）统一处理：
+
+- 逻辑今天 = 当前时间减去分界偏移后的日期，07:59 仍属于前一天；
+- `boost_log` 台账、`daily_plan` 定档、抖动持久化与 `last_run_date` 全部按逻辑日；
+- 最近一个完整统计日才作为“昨日”；标签等于逻辑今天的记录（若 Steam 已返回
+  进行中的半天数据）会被剔除，不参与预测；
+- `forecast` 的“今天/明天”与 `run` 使用同一分界点。
+
+一般**不要改**；只有当你实测 Steam 的统计切换时刻不是 08:00 时，才改成对应
+的 `HH:MM`（例如 `"07:00"`）。填 `"00:00"` 会恢复按自然日切分的旧口径。
+`info --json` 输出里的 `config.day_boundary` 可确认当前值。
+
 ---
 
 ## 13. 升级与迁移
@@ -1856,8 +1890,9 @@ boost_list_file: "boost_plan.txt"
 
 ### 13.3 forecast 默认包含今天并改用自然缺口口径
 
-`forecast` 现在默认从**今天 00:00** 起算（今天的数据次日才完整，所以预测今天
-仍然是预测），并把“今天之前最近一个完整日”的 `实际 − boost_log 刷量` 作为自然
+`forecast` 现在默认从**逻辑今天 00:00** 起算（`day_boundary` 默认 08:00 分界；
+今天的数据次日才完整，所以预测今天仍然是预测），并把“今天之前最近一个完整日”的
+`实际 − boost_log 刷量` 作为自然
 流量基准，未来日假设自然不变。因此表格会显示每天真实需要补的缺口，而不是把
 历史高位当成自然流量后显示 0。
 
@@ -1983,6 +2018,23 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 - 三个新配置键 `cookie_refresh_enabled` / `cookie_refresh_before_hours` /
   `cookie_refresh_min_interval_hours` 都有默认值，旧配置无需修改。
 
+### 13.13 每日分界点（day_boundary）
+
+新增 `day_boundary`，默认 `"08:00"`，用于对齐 Steam 后台的换日时刻：
+
+- Steam 的统计日在**北京时间 08:00（UTC 0 点）**切换，00:00~07:59 的浏览量
+  计入前一天；旧版本按自然日记账，凌晨执行时会把刷量记到错误日期；
+- `run` / `daemon` / `forecast` / `boost` 现在统一使用逻辑日：台账
+  （`boost_log`）、`daily_plan`、抖动持久化、`last_run_date`、今日已刷与
+  “昨日”基准都按分界点切分；
+- 最近一个**完整**统计日才作为昨日；若 Steam 返回了逻辑今天的进行中数据，
+  会被剔除，不参与预测/检测；
+- 旧配置无需修改（键有默认值）。**行为变化**：升级后凌晨 0:00~8:00 执行的
+  `run` 会记为前一天，这正是修复“刷错日期”的目的；确实想保留自然日口径时，
+  显式写 `day_boundary: "00:00"`；
+- 升级瞬间可能遇到旧 `program_start` 晚于当前逻辑日（例如凌晨升级），程序会
+  临时放宽一天并在日志告警，不会把历史全部过滤掉。
+
 ---
 
 ## 14. 安全与合规
@@ -2008,7 +2060,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **402** 个，覆盖：
+当前测试共 **503** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -2019,6 +2071,8 @@ python -m pytest tests/ -v
   forecast 逐日 `bound_hit` / `target_bound_hit` 与旧定档夹取；
 - 目标波动率、最小波动幅度、同日抖动复用（重跑/多时段/配置变更）、
   缺口配额跨时段续刷、抖动日不被误判为溢出；
+- 每日分界点：`day_boundary` 解析、逻辑日/凌晨归属、run_daily 的昨日基准与
+  台账日期、Booster 记账日期、forecast 今天/明天起算、配置与 info 透传；
 - 调度器子进程执行器、时区工具；
 - 每日刷量列表的解析、peek、消费与异常保留；
 - 双 Cookie 解析、未登录回退、Cookie 规范化与校验；
@@ -2059,6 +2113,7 @@ tests/
 ├── test_convergence.py
 ├── test_cookie_optional.py
 ├── test_daemon.py
+├── test_day_boundary.py
 ├── test_daemon_notify.py
 ├── test_daily_plan.py
 ├── test_fetcher.py

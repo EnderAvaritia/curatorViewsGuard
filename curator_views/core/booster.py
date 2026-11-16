@@ -31,6 +31,10 @@ import requests
 from bs4 import BeautifulSoup
 
 from .fetcher import Fetcher, read_cookie_file
+from .daytime import (
+    DEFAULT_DAY_BOUNDARY_MINUTES,
+    logical_date,
+)
 from .storage import Storage
 
 logger = logging.getLogger("curator_views.booster")
@@ -64,9 +68,16 @@ DEFAULT_HEADERS = {
 }
 
 
-def _today_str() -> str:
-    """返回 Asia/Shanghai 时区的今天日期 (YYYY-MM-DD)。"""
-    return datetime.now(_TZ).strftime("%Y-%m-%d")
+def _today_str(
+    boundary_minutes: int = DEFAULT_DAY_BOUNDARY_MINUTES,
+    now: Optional[datetime] = None,
+) -> str:
+    """返回当前逻辑日（YYYY-MM-DD）。
+
+    分界点默认 08:00（与 Steam 统计对齐）：凌晨 0:00~7:59 仍属于前一天。
+    刷量台账必须使用逻辑日，否则凌晨刷出的量会记到错误的日期。
+    """
+    return logical_date(now or datetime.now(_TZ), int(boundary_minutes))
 
 
 def _cyclic_chunks(items: List[str], size: int) -> Iterable[List[str]]:
@@ -115,6 +126,7 @@ class Booster:
         max_retries: int = 3,
         target_ratio: float = 0.95,
         distribution: str = "ratio",
+        day_boundary_minutes: int = DEFAULT_DAY_BOUNDARY_MINUTES,
     ) -> None:
         self.clan_id = clan_id
         self.cookie_file = cookie_file
@@ -128,6 +140,13 @@ class Booster:
         self.max_retries = max_retries
         self.target_ratio = target_ratio
         self.distribution = str(distribution).lower()
+        # 刷量台账按逻辑日记账（默认 08:00 分界，与 Steam 统计对齐）
+        minutes = int(day_boundary_minutes)
+        self.day_boundary_minutes = (
+            minutes
+            if 0 <= minutes < 24 * 60
+            else DEFAULT_DAY_BOUNDARY_MINUTES
+        )
 
         # 最近一次 run() 是否因连续失败而中止（供调度器判断通知级别）
         self.aborted = False
@@ -159,7 +178,7 @@ class Booster:
         6. 连续失败达到 max_retries 时中止并返回部分结果。
         """
         self.aborted = False
-        today = _today_str()
+        today = _today_str(self.day_boundary_minutes)
 
         fetcher = Fetcher(self.clan_id, self.cookie_file, self.proxy)
         try:

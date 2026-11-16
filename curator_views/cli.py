@@ -64,6 +64,15 @@ from curator_views.core.chart import (  # noqa: E402
 from curator_views.core.daemon import (  # noqa: E402
     Daemon, parse_daily_times, pick_run_marker,
 )
+from curator_views.core.daytime import (  # noqa: E402
+    DEFAULT_DAY_BOUNDARY,
+    day_label_from_ts,
+    format_day_boundary,
+    logical_date,
+    parse_day_boundary,
+    previous_date,
+    resolve_day_boundary,
+)
 from curator_views.core.forecast import forecast_days  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
     STATS_URL,
@@ -177,6 +186,16 @@ ntfy_quiet_hours: ""
 # 是否启用每日受控提升；命令行 --no-boost 可临时关闭
 # 白话：刷量总开关，false 就是只统计不刷，适合先观察几天。
 boost_enabled: true
+
+# ── 每日分界点 ────────────────────────────────────────────────────────────
+
+# 两天的分界时刻（Asia/Shanghai，格式 HH:MM）。
+# Steam 后台的“一天”不是本地 0 点切换：通常在北京时间早上 8 点（UTC 0 点）
+# 才切到新的一天，因此 0:00~8:00 之间刷的浏览量会被计入前一天。
+# 默认 08:00 与 Steam 统计对齐：凌晨执行 run 时会把台账、目标和“今天”
+# 都算到前一天，避免刷错日期；若你的统计确实按自然日切换，改成 "00:00"。
+# 白话：Steam 的“昨天”到早上 8 点才结束；这里决定几点之后算新的一天。
+day_boundary: "08:00"
 
 # ── 守护进程模式参数 ──────────────────────────────────────────────────────
 
@@ -571,6 +590,7 @@ def _make_booster(
         max_retries=int(cfg["max_retries"]),
         target_ratio=float(cfg["target_ratio"]),
         distribution=str(cfg["boost_distribution"]).lower(),
+        day_boundary_minutes=resolve_day_boundary(cfg),
     )
 
 
@@ -618,6 +638,7 @@ def _scheduler_config(
         "dry_run": bool(dry_run),
         "boost_list_file": _resolve_path(cfg_dir, list_file) if list_file else "",
         "boost_list_fallback": bool(cfg["boost_list_fallback"]),
+        "day_boundary_minutes": resolve_day_boundary(cfg),
     }
 
 
@@ -1104,7 +1125,8 @@ def _print_info_report(report: Dict[str, Any]) -> None:
     ]
     print(
         f"配置: 每日执行 {', '.join(daily_times)}；{boost_text}；"
-        f"boost_mode={config['boost_mode']}{bounds_text}"
+        f"boost_mode={config['boost_mode']}{bounds_text}；"
+        f"每日分界 {config.get('day_boundary', DEFAULT_DAY_BOUNDARY)}"
     )
 
     if config.get("boost_list_file"):
@@ -1183,6 +1205,9 @@ def cmd_info(args: argparse.Namespace) -> int:
             "boost_list_remaining": list_remaining,
             "boost_list_status": list_status,
             "boost_list_fallback": bool(cfg.get("boost_list_fallback", False)),
+            "day_boundary": format_day_boundary(
+                resolve_day_boundary(cfg)
+            ),
         },
         "data": _collect_info_data(db_path),
     }
@@ -1629,15 +1654,21 @@ def _read_forecast_db(
     return history, kv, boost_totals, plans
 
 
-def _forecast_start_epoch() -> int:
-    """--tomorrow 的预测首日：明天 00:00（Asia/Shanghai）。
+def _forecast_start_epoch(
+    boundary_minutes: int = parse_day_boundary(DEFAULT_DAY_BOUNDARY),
+    now: Optional[datetime] = None,
+) -> int:
+    """--tomorrow 的预测首日：逻辑明天 00:00（Asia/Shanghai）。
 
-默认从今天 00:00 起算；Steam 当天统计要次日才完整，所以预测今天仍是预测。
-"""
-    tomorrow = datetime.now(_TZ) + timedelta(days=1)
-    return int(
-        tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    默认从逻辑今天起算；逻辑日由 ``day_boundary`` 决定（默认 08:00 分界），
+    因此凌晨执行时“今天”仍是前一天。Steam 当天统计要次日才完整，所以预测
+    今天仍是预测。
+    """
+    now_dt = now or datetime.now(_TZ)
+    tomorrow_iso = logical_date(
+        now_dt + timedelta(days=1), int(boundary_minutes)
     )
+    return _date_to_epoch(tomorrow_iso)
 
 
 def _display_width(text: str) -> int:
@@ -1959,13 +1990,23 @@ def cmd_forecast(args: argparse.Namespace) -> int:
             for ts, views in sorted(merged.items())
         ]
 
-    # 程序启动日同样只读；缺失或非法时不过滤（从最早一条开始）
+    # 每日分界点：Steam 统计通常在北京时间 08:00 切换“新的一天”，凌晨执行
+    # 时仍算前一天。forecast 的“今天/明天”与 run_daily 使用同一口径。
+    boundary_minutes = resolve_day_boundary(cfg)
+    today_ts = _today_epoch(boundary_minutes)
+    today_iso = logical_date(datetime.now(_TZ), boundary_minutes)
+
+    # 程序启动日同样只读；缺失或非法时不过滤（从最早一条开始）。
+    # 调整 day_boundary 后旧启动日可能“晚于”逻辑今天，此时放宽一天，
+    # 避免把所有历史都过滤掉。
     program_start = kv.get("program_start", "").strip()
     if program_start:
         try:
             program_start_epoch = _date_to_epoch(program_start)
         except (ValueError, IndexError):
             program_start_epoch = 0
+        if program_start_epoch > today_ts:
+            program_start_epoch = today_ts - 86400
         if program_start_epoch:
             history = [
                 item for item in history
@@ -1981,47 +2022,47 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     # run_daily 的缺口公式一致；未来日假设自然流量不变（刷量不算自然），
     # 因此每天的缺口都会重新按 target − 自然流量 计算。
     # --natural trend|target 可显式切回旧的“实际趋势外推 / 收敛到目标”模型。
-    today_ts = _today_epoch()
     start_tomorrow = bool(getattr(args, "tomorrow", False))
-    start_ts = _forecast_start_epoch() if start_tomorrow else today_ts
+    start_ts = (
+        _forecast_start_epoch(boundary_minutes) if start_tomorrow else today_ts
+    )
     natural_mode_arg = getattr(args, "natural", None)
     use_natural_basis = natural_mode_arg is None
 
-    prior = [item for item in history if item["date_ts"] < today_ts]
+    prior = [
+        item for item in history
+        if day_label_from_ts(item["date_ts"]) < today_iso
+    ]
+    if not prior:
+        _print_error(
+            "预测需要今天之前至少一天的历史数据"
+            f"（按 day_boundary={format_day_boundary(boundary_minutes)} "
+            f"计算的今天为 {today_iso}）。"
+        )
+        return 1
     first_natural: Optional[int] = None
     yesterday_actual: Optional[int] = None
     yesterday_boosted: Optional[int] = None
     baseline_date: Optional[str] = None
     stale_warning: Optional[str] = None
     if use_natural_basis:
-        if not prior:
-            _print_error("自然口径需要今天之前至少一天的历史数据。")
-            return 1
         baseline_row = prior[-1]
-        baseline_date = datetime.fromtimestamp(
-            int(baseline_row["date_ts"]), tz=_TZ
-        ).strftime("%Y-%m-%d")
+        baseline_date = day_label_from_ts(int(baseline_row["date_ts"]))
         yesterday_actual = int(baseline_row["num_views"])
         yesterday_boosted = int(boost_totals.get(baseline_date, 0))
         first_natural = max(0, yesterday_actual - yesterday_boosted)
-        if int(baseline_row["date_ts"]) < today_ts - 86400:
-            expected_date = datetime.fromtimestamp(
-                today_ts - 86400, tz=_TZ
-            ).strftime("%Y-%m-%d")
+        expected_date = previous_date(today_iso)
+        if baseline_date < expected_date:
             stale_warning = (
                 f"本地库最新只到 {baseline_date}，早于昨天 {expected_date}；"
                 "自然缺口按该日数据计算，建议加 --fetch 或先运行 run。"
             )
-    if not start_tomorrow:
-        if not prior:
-            _print_error("今天视角需要今天之前至少一天的历史数据。")
-            return 1
-        history = prior
-    # start_tomorrow 保留完整历史：明天视角的基准可以包含今天已入库的数据
+    # 两个视角都只使用“日期标签早于逻辑今天”的完整日：逻辑今天的统计
+    # 尚未完整（Steam 在 day_boundary 才换日），不能当作一整天参与预测。
+    history = prior
 
     # 今日已刷：只影响首日缺口，重跑/中断后按剩余量续刷。
     # 明天视角不需要它（明天会从“昨日自然流量”里自动扣掉今天刷的量）。
-    today_iso = datetime.fromtimestamp(today_ts, tz=_TZ).strftime("%Y-%m-%d")
     today_boosted = (
         0 if start_tomorrow else max(0, int(boost_totals.get(today_iso, 0)))
     )
@@ -2072,6 +2113,8 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         "natural_mode": natural_mode_arg or "natural",
         "natural_basis": "natural" if use_natural_basis else natural_mode_arg,
         "perspective": "tomorrow" if start_tomorrow else "today",
+        "day_boundary": format_day_boundary(boundary_minutes),
+        "today": today_iso,
         "baseline_date": baseline_date,
         "yesterday_actual": yesterday_actual,
         "yesterday_boosted": yesterday_boosted,

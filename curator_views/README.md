@@ -38,6 +38,9 @@
 - 当日已刷续刷：缺口扣除 `boost_log` 里今天的累计，同一天重跑只补剩余量；
 - 多时段调度：`daily_times` 可配置一天多个执行时刻，时段级去重，后一时段按当日
   已刷自动补剩余缺口；
+- 每日分界点：`day_boundary` 默认 `"08:00"`，与 Steam 统计的换日时刻
+  （北京时间 08:00 = UTC 0 点）对齐；凌晨 0:00~7:59 的刷量会计入前一天，
+  台账、目标、`daily_plan` 与 `last_run_date` 都按逻辑日记账，避免刷错日期；
 - 失败重试：daemon 执行失败不标记该时段完成，按间隔重试；统计 Cookie 失效会
   单独告警，重新登录后下一次重试自动生效，无需重启进程；
 - Cookie 自动续期：用 `steamRefresh_steam` 在访问令牌临近过期时自动刷新统计
@@ -115,6 +118,8 @@ python curator_views/cli.py daemon --config config.yaml [--dry-run] [--boost | -
 ```
 
 - 启动时若今天尚未完成所有时段且已过对应时刻，立即补跑剩余时段；
+- 凌晨时段（`day_boundary` 默认 08:00 之前）执行的是**前一逻辑日**的收尾补量，
+  台账与定档记为前一天；09:00 起才进入新的一天；
 - 执行失败不退出进程，也**不把该时段标记为已完成**：按 `retry_delay_minutes`
   在该时段内重试，最多 `retry_max_times` 次；用尽后只放弃该时段，后续时段照常
   执行，随时可手动 `run` 补跑；
@@ -247,7 +252,8 @@ python curator_views/cli.py forecast --config config.yaml [--days N] [--fetch] \
 
 - `--days N`：预测天数，默认 7，必须 >= 1；
 - `--fetch`：额外从 Steam 在线抓取最新统计，只在内存使用、绝不写库；要求 `clan_id` 非空；
-- `--today` / `--tomorrow`：从今天 00:00（默认）或明天 00:00 起算；今天的统计要
+- `--today` / `--tomorrow`：从逻辑今天 00:00（默认）或逻辑明天 00:00 起算
+  （逻辑日由 `day_boundary` 决定，默认 08:00 分界）；今天的统计要
   明天才完整，所以预测今天本身仍然是预测；
 - `--natural trend|target`：默认 `natural`，首日自然流量 = 今天之前最近一个完整日
   的实际 − 当日刷量，未来日假设自然不变（与 `run` 的缺口公式一致，适合看
@@ -287,7 +293,8 @@ forecast 只以只读 URI 打开数据库，只执行 `SELECT`，不会写 `last
 growth 锚点、不会启用 WAL；数据库不存在或无历史数据时报错并以 1 退出。growth 起点只
 读取 `kv_store`，速率一致才沿用，否则按预测首日重新起算（不写回）。
 
-需要注意：Steam 统计滞后一天，默认从今天 00:00 起算（`--tomorrow` 改为明天），
+需要注意：Steam 统计滞后一天，默认从逻辑今天 00:00 起算（`--tomorrow` 改为逻辑明天，
+分界点见 `day_boundary`，默认 08:00），
 自然口径取今天之前最近一个完整日；本地库不是最新时给出 `stale_history` 提示。
 未来自然流量只是外推，所以结果是**估算不是精确预测**。forecast 输出的是托底目标
 `base × 目标系数（multiplier）`；`run_daily` 的检测参照是
@@ -432,6 +439,7 @@ python curator_views/cli.py version
 | `boost_cookie_file` | （空） | 刷量专用 Cookie 文件路径；与 `cookie_file` 完全独立，留空则刷量以未登录（游客）模式运行 |
 | `proxy` | （空） | 代理地址，如 `http://127.0.0.1:10279`，留空不使用 |
 | `db_path` | `views.db` | SQLite 数据库文件路径 |
+| `day_boundary` | `"08:00"` | 每日分界点（Asia/Shanghai，`HH:MM`）。Steam 统计通常在北京时间 08:00 换日，凌晨刷量计入前一天；`"00:00"` 恢复自然日口径 |
 | `cookie_refresh_enabled` | `true` | 用 `steamRefresh_steam` 自动续期统计 Cookie；关闭后只读 `cookie.txt` |
 | `cookie_refresh_before_hours` | `12` | 距 `steamLoginSecure` 过期少于该小时数时主动续期；`0` 表示有 refresh token 就续期 |
 | `cookie_refresh_min_interval_hours` | `6` | 两次实际续期的最小间隔（小时），避免失败时空转；`0` 关闭限流 |

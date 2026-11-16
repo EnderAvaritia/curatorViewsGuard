@@ -33,6 +33,13 @@ from .anti_cheat import (
 )
 from .boost_list import consume_next, peek_next
 from .booster import Booster
+from .daytime import (
+    DEFAULT_DAY_BOUNDARY_MINUTES,
+    day_label_from_ts,
+    format_day_boundary,
+    logical_date,
+    resolve_day_boundary,
+)
 from .fetcher import Fetcher
 from .notifier import Notifier
 from .predictor import predict_expected
@@ -49,14 +56,25 @@ except ZoneInfoNotFoundError:
     _TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
-def _today_iso() -> str:
-    """返回 Asia/Shanghai 时区的今天日期 (YYYY-MM-DD)。"""
-    return datetime.now(_TZ).strftime("%Y-%m-%d")
+def _today_iso(
+    boundary_minutes: int = DEFAULT_DAY_BOUNDARY_MINUTES,
+    now: Optional[datetime] = None,
+) -> str:
+    """返回 Asia/Shanghai 时区「今天」的逻辑日期 (YYYY-MM-DD)。
+
+    逻辑日由 ``day_boundary`` 决定：默认分界点为 08:00（与 Steam 统计对齐），
+    因此凌晨 0:00~7:59 仍属于前一天。传入 ``boundary_minutes=0`` 即恢复
+    按自然日切分的旧行为。
+    """
+    return logical_date(now or datetime.now(_TZ), int(boundary_minutes))
 
 
-def _today_epoch() -> int:
-    """返回 Asia/Shanghai 今天 00:00 的时间戳。"""
-    return _date_to_epoch(_today_iso())
+def _today_epoch(
+    boundary_minutes: int = DEFAULT_DAY_BOUNDARY_MINUTES,
+    now: Optional[datetime] = None,
+) -> int:
+    """返回逻辑今天 00:00（Asia/Shanghai）的时间戳。"""
+    return _date_to_epoch(_today_iso(boundary_minutes, now))
 
 
 def _date_to_epoch(date_str: str) -> int:
@@ -572,6 +590,7 @@ def run_daily(
     config: Dict[str, Any],
     executor_cmd: str = "",
     config_path: str = "",
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """执行一次每日流程，返回汇总字典供 CLI / 上报使用。
 
@@ -587,7 +606,8 @@ def run_daily(
         cooldown_days, exclude_flagged,
         baseline_days, slope_days, slope_threshold,
         boost_enabled (bool), dry_run (bool),
-        boost_list_file (str), boost_list_fallback (bool)
+        boost_list_file (str), boost_list_fallback (bool),
+        day_boundary / day_boundary_minutes（每日分界点）
     其中 single_cap / batch_size / target_ratio / boost_distribution 会应用到
     传入的 Booster 实例（以 config 为准），其余作为预测/检测参数直接传入。
 
@@ -595,6 +615,19 @@ def run_daily(
         大于 0 时启用手动基线模式：基准目标直接用该固定值，替代自动预测
         （中位数+趋势）。溢出检测的参照也使用该固定值，天然免疫被污染。
         为 0 或未配置时使用自动预测。
+
+    day_boundary / day_boundary_minutes：
+        Steam 统计的每日分界点（Asia/Shanghai）。Steam 后台通常在北京时间
+        早上 8 点（UTC 0 点）切换“新的一天”，因此 0:00~8:00 之间执行的刷量
+        会计入前一天。分界点默认 08:00：逻辑今天 = 当前时间减去分界偏移后的
+        日期；刷量台账、daily_plan、抖动持久化与 last_run_date 都按逻辑日记账，
+        避免把凌晨刷量记到错误的日期。填 ``"00:00"`` 即恢复按自然日切分。
+        ``config`` 可传 ``day_boundary``（``"08:00"`` 等字符串）或已解析的
+        ``day_boundary_minutes``（0~1439）。
+
+    now：
+        可选注入的当前时间（带时区），仅用于测试；为 None 时取系统当前时间。
+        同一逻辑日内的判断、jitter 复用与台账日期都以该时间为准。
 
     昨日刷量补偿：
         缺口以"昨日自然流量"为基准（昨日实际 − boost_log 记录的昨日刷量），
@@ -726,6 +759,7 @@ boost_mode / growth_factor / growth_rate：
     threads = int(config.get("threads", getattr(booster, "threads", 1)))
     wait_min = float(config.get("wait_min", getattr(booster, "wait_min", 8.0)))
     wait_max = float(config.get("wait_max", getattr(booster, "wait_max", 16.0)))
+    boundary_minutes = resolve_day_boundary(config)
 
     # Booster 的执行参数以 config 为准（调用方构建实例时可先给默认值）
     batch_size = int(config.get("batch_size", booster.batch_size))
@@ -735,9 +769,12 @@ boost_mode / growth_factor / growth_rate：
     booster.distribution = str(
         config.get("boost_distribution", "ratio")
     ).lower()
+    # 刷量台账的日期必须与调度器使用同一个逻辑日，否则凌晨刷量会记错日期。
+    booster.day_boundary_minutes = boundary_minutes
 
-    today_iso = _today_iso()
-    today_ts = _today_epoch()
+    now_dt = now or datetime.now(_TZ)
+    today_iso = _today_iso(boundary_minutes, now_dt)
+    today_ts = _date_to_epoch(today_iso)
 
     # 1. 抓取统计数据并入库（dry_run 只计算，不落库）
     stats = fetcher.fetch_stats()
@@ -747,9 +784,7 @@ boost_mode / growth_factor / growth_rate：
     last_date_iso = ""
     if stats:
         last_ts = stats[-1]["date_ts"]
-        last_date_iso = datetime.fromtimestamp(last_ts, tz=_TZ).strftime(
-            "%Y-%m-%d"
-        )
+        last_date_iso = day_label_from_ts(last_ts)
     if not dry_run:
         storage.save_state(
             "last_stats_date",
@@ -763,13 +798,30 @@ boost_mode / growth_factor / growth_rate：
         if not dry_run:
             storage.save_state("program_start", program_start)
     program_start_epoch = _date_to_epoch(program_start)
+    if program_start_epoch > today_ts:
+        # 调整 day_boundary 后，旧的自然日启动日可能“晚于”当前逻辑日。
+        # 放宽到昨天零点，避免一行历史都被过滤掉；不覆盖已存的值。
+        logger.warning(
+            "program_start=%s 晚于当前逻辑日 %s（可能修改过 day_boundary），"
+            "本次按昨天起算历史。",
+            program_start, today_iso,
+        )
+        program_start_epoch = today_ts - 86400
     history_sorted = sorted(
         (d for d in stats if d["date_ts"] >= program_start_epoch),
         key=lambda d: d["date_ts"],
     )
+    # Steam 当天统计尚未完整：只让“日期标签早于逻辑今天”的完整日参与
+    # 预测/检测/昨日基准；标签等于逻辑今天的记录（若 Steam 已返回）剔除，
+    # 避免把进行中的半天数据当成完整一天。
+    history_complete = [
+        d for d in history_sorted if day_label_from_ts(d["date_ts"]) < today_iso
+    ]
     logger.info(
-        "程序启动日=%s，启动后历史数据 %d 天（共 %d 天）。",
-        program_start, len(history_sorted), len(stats),
+        "程序启动日=%s，逻辑今天=%s（分界点 %s），完整历史数据 %d 天"
+        "（启动后 %d 天，共 %d 天）。",
+        program_start, today_iso, format_day_boundary(boundary_minutes),
+        len(history_complete), len(history_sorted), len(stats),
     )
 
     # 3. 逐日预测 + 异常溢出检测。
@@ -792,13 +844,13 @@ boost_mode / growth_factor / growth_rate：
             )
         )
     confirmed_flagged: set[int] = set()
-    history_clean = history_sorted
+    history_clean = history_complete
     overflow: list[dict] = []
     first_overflow: list[dict] = []
     max_rounds = 3 if exclude_flagged else 1
     for _ in range(max_rounds):
         history_clean = [
-            d for d in history_sorted if d["date_ts"] not in confirmed_flagged
+            d for d in history_complete if d["date_ts"] not in confirmed_flagged
         ]
         # 长期基线（更长窗口的中位数）：即使短期预期被污染，仍是独立参照。
         # 配置了目标下限时，长期基线不能低于下限：我们是主动把曲线托到
@@ -862,29 +914,26 @@ boost_mode / growth_factor / growth_rate：
             break
         confirmed_flagged |= new_flagged
 
-    # 4. 昨日实际（g_StatsAppViews 最新一条）与今日期望。
+    # 4. 昨日实际（最近一个完整统计日）与今日期望。
     #    注意：昨日实际里包含昨天我们自己刷的量，而今天刷的量只计入今天。
     #    若直接拿"昨日实际"当今天的自然流量基准，等于把昨天的补量重复扣
     #    一次，会造成目标永远补不满、并在目标附近来回补/不补（两天一摆）。
     #    因此从 boost_log 取回昨日刷量，还原"昨日自然流量"作为今日基准。
+    #    history_clean 已剔除逻辑今天，因此最后一条就是逻辑昨天（若存在）。
     yesterday_actual = 0
     yesterday_boosted = 0
     if history_clean:
         last_stat = history_clean[-1]
         yesterday_actual = int(last_stat["num_views"])
-        last_stat_date = datetime.fromtimestamp(
-            int(last_stat["date_ts"]), tz=_TZ
-        ).strftime("%Y-%m-%d")
+        last_stat_date = day_label_from_ts(int(last_stat["date_ts"]))
         yesterday_boosted = max(
             0, int(storage.get_boost_total(last_stat_date))
         )
     # 台账缺失（旧数据 / 子进程执行器写了别的库）时退化为旧行为（按 0 处理）；
     # 刷量记录大于实际值时夹到 0，避免自然流量算成负数导致超额补量。
     yesterday_natural = max(0, yesterday_actual - yesterday_boosted)
-    # Steam 统计滞后一天：今日期望基于全部已入库数据（不含今天）
-    history_without_today = [
-        d for d in history_clean if d["date_ts"] < today_ts
-    ]
+    # Steam 当天统计尚未完整：今日期望只基于完整历史（已剔除逻辑今天）。
+    history_without_today = history_clean
     if manual_baseline:
         base_expected = baseline_views
         startup_applied = False
@@ -958,7 +1007,15 @@ boost_mode / growth_factor / growth_rate：
     flagged_days = [d for d in first_overflow if d.get("flagged")]
     flagged_ts_first = {d["date_ts"] for d in flagged_days}
     deductions = compute_deductions(flagged_days, absorb_days)
-    today_deduction = float(deductions.get(today_ts, 0.0))
+    # 扣减表按被标记日的 date_ts + 86400×N 生成；Steam 的 date_ts 可能不在
+    # 本地零点（真实数据是 UTC 0 点 = 北京时间 08:00），因此按日期标签匹配，
+    # 不直接比较时间戳，避免凌晨时段整体错开 8 小时导致扣减丢失。
+    today_deduction = float(
+        {
+            day_label_from_ts(ts): amount
+            for ts, amount in deductions.items()
+        }.get(today_iso, 0.0)
+    )
 
     # 6. 今日缺口 = 期望 - 昨日自然流量 - 溢出扣减 - 今日已刷。
     #    自然流量已剔除昨日自己刷的量，补多少就只补"自然流量与目标之间"
@@ -1142,7 +1199,7 @@ boost_mode / growth_factor / growth_rate：
                 "list_status": list_status,
                 "list_amount": list_amount,
                 "signature": jitter_signature,
-                "updated_at": datetime.now(_TZ).isoformat(timespec="seconds"),
+                "updated_at": now_dt.isoformat(timespec="seconds"),
             }
         )
 
@@ -1185,6 +1242,7 @@ boost_mode / growth_factor / growth_rate：
     # 7. 汇总字典
     summary: Dict[str, Any] = {
         "date": today_iso,
+        "day_boundary": format_day_boundary(boundary_minutes),
         "dry_run": dry_run,
         "today_expected": today_expected,
         "today_expected_raw": round(today_expected_raw, 1),

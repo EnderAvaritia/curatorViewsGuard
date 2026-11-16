@@ -396,9 +396,12 @@ class TestForecastChartCli:
 
         assert code == 0
         page = chart_path.read_text(encoding="utf-8")
-        assert day_iso(0) in page
-        assert day_iso(2) in page
-        assert day_iso(1) not in page
+        # 只看图表本体：页面头部的“生成时间”也可能落在被跳过的日期上，
+        # 不能用来判断 day-step 是否生效。
+        chart_body = page[page.index("<svg"):]
+        assert day_iso(0) in chart_body
+        assert day_iso(2) in chart_body
+        assert day_iso(1) not in chart_body
 
     def test_no_chart_by_default(self, tmp_path, capsys):
         code = self._run(tmp_path, [])
