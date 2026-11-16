@@ -73,6 +73,23 @@ class FakeContext:
         self.closed = True
 
 
+class SequenceContext(FakeContext):
+    """按调用顺序返回不同 Cookie 列表的伪造上下文。"""
+
+    def __init__(self, sequences: list) -> None:
+        super().__init__([])
+        self._sequences = list(sequences)
+        self._index = 0
+
+    def cookies(self) -> list:
+        if self._index < len(self._sequences):
+            current = self._sequences[self._index]
+            self._index += 1
+        else:
+            current = self._sequences[-1]
+        return current
+
+
 class FakeChromium:
     """伪造 Playwright chromium 分支。"""
 
@@ -297,9 +314,111 @@ def test_login_via_browser_success_returns_steam_cookies() -> None:
         timeout_s=1.0,
         poll_interval=0.001,
         launcher=lambda: playwright,
+        refresh_wait_s=0.01,
     )
     assert cookie == "steamLoginSecure=abc; sessionid=s1"
     assert context.closed is True
+
+
+def test_login_via_browser_waits_for_refresh_cookie() -> None:
+    """首次只看到 steamLoginSecure 时继续轮询，直到刷新令牌出现。"""
+    login_only = [
+        {
+            "name": "steamLoginSecure",
+            "value": "abc",
+            "domain": "store.steampowered.com",
+        }
+    ]
+    with_refresh = login_only + [
+        {
+            "name": "steamRefresh_steam",
+            "value": "refresh-token",
+            "domain": "login.steampowered.com",
+        }
+    ]
+    context = SequenceContext([login_only, with_refresh])
+    playwright = FakePlaywright(context)
+
+    cookie = login.login_via_browser(
+        "profile",
+        timeout_s=5.0,
+        poll_interval=0.0,
+        launcher=lambda: playwright,
+        refresh_wait_s=1.0,
+    )
+
+    assert "steamLoginSecure=abc" in cookie
+    assert "steamRefresh_steam=refresh-token" in cookie
+    assert context.closed is True
+
+
+def test_login_via_browser_exports_without_refresh_after_window() -> None:
+    """刷新令牌始终不出现时，有界等待后仍导出已有 Cookie。"""
+    context = SequenceContext(
+        [
+            [
+                {
+                    "name": "steamLoginSecure",
+                    "value": "abc",
+                    "domain": "store.steampowered.com",
+                }
+            ]
+        ]
+    )
+    playwright = FakePlaywright(context)
+
+    cookie = login.login_via_browser(
+        "profile",
+        timeout_s=5.0,
+        poll_interval=0.0,
+        launcher=lambda: playwright,
+        refresh_wait_s=0.01,
+    )
+
+    assert cookie == "steamLoginSecure=abc"
+    assert context.closed is True
+
+
+def test_cmd_login_removes_stale_sidecar_without_refresh(
+    tmp_path, monkeypatch
+) -> None:
+    """新 Cookie 不含刷新令牌时删除旧 sidecar，避免串号续期。"""
+    from curator_views import cli
+    from curator_views.core.login import CookieCheckResult
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'clan_id: "45519015"\n'
+        'cookie_file: "cookie.txt"\n'
+        'ntfy_url: ""\n'
+        'ntfy_topic: ""\n',
+        encoding="utf-8",
+    )
+    cookie_path = tmp_path / "cookie.txt"
+    cookie_path.write_text("old=1\n", encoding="utf-8")
+    sidecar = tmp_path / "cookie.txt.session.json"
+    sidecar.write_text('{"refresh_cookie": "old"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli,
+        "login_via_browser",
+        lambda *a, **k: "steamLoginSecure=abc; sessionid=s1",
+    )
+    monkeypatch.setattr(
+        cli,
+        "validate_cookie",
+        lambda *a, **k: CookieCheckResult(
+            True, "Cookie 有效", 200, "https://example.invalid"
+        ),
+    )
+
+    code = cli.main(["login", "--config", str(config_path)])
+
+    assert code == 0
+    assert cookie_path.read_text(encoding="utf-8").strip() == (
+        "steamLoginSecure=abc; sessionid=s1"
+    )
+    assert not sidecar.exists()
 
 
 def test_build_parser_registers_login() -> None:

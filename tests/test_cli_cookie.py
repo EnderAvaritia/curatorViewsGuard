@@ -250,3 +250,78 @@ def test_dry_run_does_not_refresh(tmp_path, monkeypatch):
 
     assert code == 0
     assert FakeNotifier.instances[0].sent == []
+
+
+def test_terminal_prerun_failure_skips_forced_refresh_and_retry(
+    tmp_path, monkeypatch
+):
+    """执行前续期已判定需登录：不再强制刷新、不重跑，只通知一次。"""
+    config_path = _write_run_config(tmp_path)
+    FakeNotifier.instances = []
+    refreshes = {"count": 0}
+    runs = {"count": 0}
+
+    class DummyFetcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def terminal_refresh(*args, **kwargs):
+        refreshes["count"] += 1
+        raise RefreshError("令牌已失效", needs_login=True, reason="terminal")
+
+    def fail_run_daily(*args, **kwargs):
+        runs["count"] += 1
+        raise StatsAuthError("统计页被重定向到公开页面")
+
+    monkeypatch.setattr(cli, "Notifier", FakeNotifier)
+    monkeypatch.setattr(cli, "Fetcher", DummyFetcher)
+    monkeypatch.setattr(cli, "refresh_cookie_file", terminal_refresh)
+    monkeypatch.setattr(cli, "run_daily", fail_run_daily)
+
+    code = cli.main(["run", "--config", str(config_path), "--no-boost"])
+
+    assert code == 1
+    assert refreshes["count"] == 1
+    assert runs["count"] == 1
+    assert len(FakeNotifier.instances) == 1
+    assert len(FakeNotifier.instances[0].sent) == 1
+
+
+def test_forced_refresh_terminal_failure_skips_retry(tmp_path, monkeypatch):
+    """强制续期返回终止性失败：不再重跑 run_daily，只通知一次。"""
+    config_path = _write_run_config(tmp_path)
+    FakeNotifier.instances = []
+    refreshes = {"count": 0}
+    runs = {"count": 0}
+
+    class DummyFetcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def refresh_with_terminal(*args, **kwargs):
+        refreshes["count"] += 1
+        if kwargs.get("force"):
+            raise RefreshError("令牌已失效", needs_login=True, reason="terminal")
+        return RefreshOutcome(
+            False,
+            "throttled",
+            CookieState(steamid="1", refresh_cookie="refresh-token"),
+            None,
+        )
+
+    def fail_run_daily(*args, **kwargs):
+        runs["count"] += 1
+        raise StatsAuthError("统计页被重定向到公开页面")
+
+    monkeypatch.setattr(cli, "Notifier", FakeNotifier)
+    monkeypatch.setattr(cli, "Fetcher", DummyFetcher)
+    monkeypatch.setattr(cli, "refresh_cookie_file", refresh_with_terminal)
+    monkeypatch.setattr(cli, "run_daily", fail_run_daily)
+
+    code = cli.main(["run", "--config", str(config_path), "--no-boost"])
+
+    assert code == 1
+    assert refreshes["count"] == 2
+    assert runs["count"] == 1
+    assert len(FakeNotifier.instances) == 1
+    assert len(FakeNotifier.instances[0].sent) == 1

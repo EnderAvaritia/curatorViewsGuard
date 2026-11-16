@@ -5,7 +5,7 @@
 
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -58,10 +58,12 @@ class FakeResponse:
         payload: Any = None,
         cookies: Iterable[FakeCookie] = (),
         set_cookie: str = "",
+        status_code: int = 200,
     ) -> None:
         self._payload = payload
         self.cookies = FakeCookieJar(cookies)
         self.headers = {"Set-Cookie": set_cookie} if set_cookie else {}
+        self.status_code = status_code
 
     def json(self) -> Any:
         if isinstance(self._payload, BaseException):
@@ -77,6 +79,7 @@ class FakeSession:
         self.proxies = {}
         self.cookies = FakeCookieJar()
         self.posts: List[Tuple[str, Dict[str, Any], Optional[float]]] = []
+        self.requests: List[Dict[str, Any]] = []
         self._responses = list(responses)
 
     def post(
@@ -84,8 +87,19 @@ class FakeSession:
         url: str,
         data: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
+        allow_redirects: bool = True,
+        cookies: Optional[Dict[str, str]] = None,
     ) -> FakeResponse:
         self.posts.append((url, dict(data or {}), timeout))
+        self.requests.append(
+            {
+                "url": url,
+                "data": dict(data or {}),
+                "timeout": timeout,
+                "allow_redirects": allow_redirects,
+                "cookies": dict(cookies or {}),
+            }
+        )
         if not self._responses:
             raise AssertionError(f"未预置响应，收到意外请求：{url}")
         response = self._responses.pop(0)
@@ -377,6 +391,10 @@ class TestRefreshStoreSession:
             f"{sr.STORE_ORIGIN}/login/settoken",
         ]
         assert session.posts[1][1] == {"redir": sr.STORE_ORIGIN + "/"}
+        assert session.requests[1]["cookies"] == {
+            sr.REFRESH_COOKIE_NAME: refresh_value
+        }
+        assert session.requests[1]["allow_redirects"] is False
         assert session.posts[2][1] == {
             "steamID": steamid,
             "nonce": "nonce-fallback",
@@ -407,6 +425,85 @@ class TestRefreshStoreSession:
         pairs = sr.parse_cookie_header(result.cookie)
         assert pairs[sr.STORE_COOKIE_NAME] == login_value(steamid, access_jwt)
         assert pairs["sessionid"] == "header-session"
+        assert session.requests[0]["allow_redirects"] is False
+        assert session.requests[1]["allow_redirects"] is False
+
+    def test_settoken_redirect_with_set_cookie_is_success(self) -> None:
+        """settoken 返回 302 + Set-Cookie 时仍视为成功并采用该 Cookie。"""
+        steamid = "76561198000000000"
+        access_jwt = make_jwt(1800000000)
+        set_cookie = (
+            f"{sr.STORE_COOKIE_NAME}={login_value(steamid, access_jwt)}; "
+            "Path=/; sessionid=redirect-session; Path=/"
+        )
+        finalize = FakeResponse(finalize_payload(steamid))
+        settoken = FakeResponse(
+            ValueError("no json body"),
+            set_cookie=set_cookie,
+            status_code=302,
+        )
+        session = FakeSession([finalize, settoken])
+
+        result = sr.refresh_store_session(
+            login_value(steamid, make_jwt(1900000000)),
+            session_factory=lambda: session,
+        )
+
+        pairs = sr.parse_cookie_header(result.cookie)
+        assert pairs[sr.STORE_COOKIE_NAME] == login_value(steamid, access_jwt)
+        assert pairs["sessionid"] == "redirect-session"
+        assert session.requests[1]["allow_redirects"] is False
+
+    def test_settoken_empty_body_with_cookie_is_success(self) -> None:
+        """响应体为 {} 但带 Set-Cookie 时不得因缺少 result 丢弃令牌。"""
+        steamid = "76561198000000000"
+        access_jwt = make_jwt(1800000000)
+        set_cookie = (
+            f"{sr.STORE_COOKIE_NAME}={login_value(steamid, access_jwt)}; Path=/"
+        )
+        finalize = FakeResponse(finalize_payload(steamid))
+        settoken = FakeResponse({}, set_cookie=set_cookie)
+        session = FakeSession([finalize, settoken])
+
+        result = sr.refresh_store_session(
+            login_value(steamid, make_jwt(1900000000)),
+            session_factory=lambda: session,
+        )
+
+        assert sr.parse_cookie_header(result.cookie)[sr.STORE_COOKIE_NAME] == (
+            login_value(steamid, access_jwt)
+        )
+
+    def test_settoken_redirect_without_cookie_needs_login(self) -> None:
+        """settoken 3xx 且没有 Cookie 时要求重新登录。"""
+        steamid = "76561198000000000"
+        finalize = FakeResponse(finalize_payload(steamid))
+        settoken = FakeResponse(
+            ValueError("no json body"), status_code=302
+        )
+        session = FakeSession([finalize, settoken])
+
+        with pytest.raises(sr.RefreshError) as excinfo:
+            sr.refresh_store_session(
+                login_value(steamid, make_jwt(1900000000)),
+                session_factory=lambda: session,
+            )
+
+        assert excinfo.value.needs_login is True
+
+    def test_finalizelogin_redirect_without_json_needs_login(self) -> None:
+        """finalizelogin 302（被重定向到登录页）时要求重新登录。"""
+        session = FakeSession(
+            [FakeResponse(ValueError("login page html"), status_code=302)]
+        )
+
+        with pytest.raises(sr.RefreshError) as excinfo:
+            sr.refresh_store_session(
+                login_value("76561198000000000", make_jwt(1900000000)),
+                session_factory=lambda: session,
+            )
+
+        assert excinfo.value.needs_login is True
 
     def test_network_error_wrapped_without_token(self) -> None:
         """requests 网络异常包装为 RefreshError，且消息不含令牌。"""
@@ -573,6 +670,7 @@ class TestRefreshCookieFile:
         assert pairs["last"] == "keep"
         assert pairs[sr.STORE_COOKIE_NAME] == new_access
         assert pairs["sessionid"] == "new-session"
+        assert pairs[sr.REFRESH_COOKIE_NAME] == new_refresh
         assert written_text.strip().startswith(
             "foo=bar; steamLoginSecure="
         )
@@ -610,3 +708,240 @@ class TestRefreshCookieFile:
         assert state_data["steamid"] == steamid
         assert state_data["refresh_cookie"].startswith(steamid + "%7C%7C")
         assert cookie.read_text(encoding="utf-8").strip() == original
+
+    def test_header_refresh_token_overrides_stale_sidecar(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Cookie 头里的刷新令牌优先于 sidecar 中的旧令牌。"""
+        steamid = "76561198000000000"
+        header_refresh = login_value(steamid, make_jwt(1950000000))
+        stale_refresh = login_value(steamid, make_jwt(1900000000))
+        header = (
+            f"steamLoginSecure={login_value(steamid, make_jwt(1800000000))}; "
+            f"{sr.REFRESH_COOKIE_NAME}={header_refresh}"
+        )
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(cookie, header)
+        sr.save_cookie_state(
+            str(cookie),
+            sr.CookieState(steamid=steamid, refresh_cookie=stale_refresh),
+        )
+        seen = []
+
+        def fake_refresh(refresh_cookie, *args: Any, **kwargs: Any):
+            seen.append(refresh_cookie)
+            return sr.RefreshResult(
+                cookie=(
+                    f"steamLoginSecure={login_value(steamid, make_jwt(1810000000))}; "
+                    f"{sr.REFRESH_COOKIE_NAME}={header_refresh}"
+                ),
+                steamid=steamid,
+                refresh_cookie=header_refresh,
+                expires_at=1810000000,
+            )
+
+        monkeypatch.setattr(sr, "refresh_store_session", fake_refresh)
+        outcome = sr.refresh_cookie_file(str(cookie), force=True)
+
+        assert outcome.refreshed is True
+        assert seen == [header_refresh]
+
+    def test_header_steamid_mismatch_without_header_refresh(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """头里没有刷新令牌但登录 Cookie 属于另一账号时拒绝使用 sidecar。"""
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            f"steamLoginSecure={login_value('111', make_jwt(1800000000))}",
+        )
+        sr.save_cookie_state(
+            str(cookie),
+            sr.CookieState(
+                steamid="222",
+                refresh_cookie=login_value("222", make_jwt(1900000000)),
+            ),
+        )
+
+        def fail_if_called(*args: Any, **kwargs: Any):
+            raise AssertionError("账号不匹配时不应发起刷新")
+
+        monkeypatch.setattr(sr, "refresh_store_session", fail_if_called)
+        with pytest.raises(sr.RefreshError) as excinfo:
+            sr.refresh_cookie_file(str(cookie), force=True)
+
+        assert excinfo.value.reason == "account_mismatch"
+        assert excinfo.value.needs_login is True
+
+    def test_failure_records_last_attempt_and_throttles_next(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """失败也记录 last_attempt_at，下一次非强制刷新被节流。"""
+        steamid = "76561198000000000"
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            cookie_header(steamid, make_jwt(1800000000), make_jwt(1900000000)),
+        )
+        calls = {"count": 0}
+
+        def fail_refresh(*args: Any, **kwargs: Any):
+            calls["count"] += 1
+            raise sr.RefreshError("boom", reason="network")
+
+        monkeypatch.setattr(sr, "refresh_store_session", fail_refresh)
+
+        with pytest.raises(sr.RefreshError):
+            sr.refresh_cookie_file(str(cookie), force=True, now_fn=lambda: now)
+
+        state = sr.load_cookie_state(str(cookie))
+        assert state.last_attempt_at == now.isoformat()
+
+        outcome = sr.refresh_cookie_file(
+            str(cookie),
+            now_fn=lambda: now + timedelta(hours=1),
+            min_interval_hours=6,
+        )
+        assert outcome.reason == "throttled"
+        assert calls["count"] == 1
+
+    def test_zero_before_hours_refreshes_far_future_token(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """before_hours=0 表示不设过期门槛，即使令牌很久后才过期也刷新。"""
+        steamid = "76561198000000000"
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            cookie_header(
+                steamid,
+                make_jwt(int(now.timestamp()) + 1000 * 3600),
+                make_jwt(1900000000),
+            ),
+        )
+        new_refresh = login_value(steamid, make_jwt(1900009999))
+
+        def fake_refresh(*args: Any, **kwargs: Any):
+            return sr.RefreshResult(
+                cookie=(
+                    f"steamLoginSecure={login_value(steamid, make_jwt(1810000000))}; "
+                    f"{sr.REFRESH_COOKIE_NAME}={new_refresh}"
+                ),
+                steamid=steamid,
+                refresh_cookie=new_refresh,
+                expires_at=1810000000,
+            )
+
+        monkeypatch.setattr(sr, "refresh_store_session", fake_refresh)
+        outcome = sr.refresh_cookie_file(
+            str(cookie),
+            expires_within_hours=0,
+            now_fn=lambda: now,
+        )
+
+        assert outcome.refreshed is True
+
+    def test_future_last_refresh_does_not_wedge(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """未来时间戳（时钟回拨）被忽略，不会永久卡住刷新。"""
+        steamid = "76561198000000000"
+        now = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            cookie_header(steamid, make_jwt(1800000000), make_jwt(1900000000)),
+        )
+        sr.save_cookie_state(
+            str(cookie),
+            sr.CookieState(
+                steamid=steamid,
+                refresh_cookie=login_value(steamid, make_jwt(1900000000)),
+                last_refresh_at=(now + timedelta(days=1)).isoformat(),
+            ),
+        )
+
+        def fake_refresh(*args: Any, **kwargs: Any):
+            return sr.RefreshResult(
+                cookie=(
+                    f"steamLoginSecure={login_value(steamid, make_jwt(1810000000))}"
+                ),
+                steamid=steamid,
+                refresh_cookie=login_value(steamid, make_jwt(1900000000)),
+                expires_at=1810000000,
+            )
+
+        monkeypatch.setattr(sr, "refresh_store_session", fake_refresh)
+        outcome = sr.refresh_cookie_file(str(cookie), now_fn=lambda: now)
+
+        assert outcome.refreshed is True
+
+    def test_empty_cookie_file_path_raises_before_fs(self) -> None:
+        """空路径在读取文件系统前直接报缺少刷新令牌。"""
+        with pytest.raises(sr.RefreshError) as excinfo:
+            sr.refresh_cookie_file("")
+
+        assert excinfo.value.needs_login is True
+        assert excinfo.value.reason == "missing_refresh_token"
+
+    def test_state_write_failure_does_not_mask_refresh_error(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """保存 sidecar 失败时仍抛出原始 RefreshError。"""
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            cookie_header(
+                "76561198000000000", make_jwt(1800000000), make_jwt(1900000000)
+            ),
+        )
+
+        def fail_refresh(*args: Any, **kwargs: Any):
+            raise sr.RefreshError("原始错误", reason="network")
+
+        def fail_save(*args: Any, **kwargs: Any):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(sr, "refresh_store_session", fail_refresh)
+        monkeypatch.setattr(sr, "save_cookie_state", fail_save)
+
+        with pytest.raises(sr.RefreshError, match="原始错误"):
+            sr.refresh_cookie_file(str(cookie), force=True)
+
+    def test_state_write_failure_after_success_still_refreshes(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """成功刷新时 sidecar 写入失败不把成功变成崩溃。"""
+        steamid = "76561198000000000"
+        cookie = tmp_path / "cookie.txt"
+        write_cookie(
+            cookie,
+            cookie_header(steamid, make_jwt(1800000000), make_jwt(1900000000)),
+        )
+        new_refresh = login_value(steamid, make_jwt(1900009999))
+
+        def fake_refresh(*args: Any, **kwargs: Any):
+            return sr.RefreshResult(
+                cookie=(
+                    f"steamLoginSecure={login_value(steamid, make_jwt(1810000000))}; "
+                    f"{sr.REFRESH_COOKIE_NAME}={new_refresh}"
+                ),
+                steamid=steamid,
+                refresh_cookie=new_refresh,
+                expires_at=1810000000,
+            )
+
+        def fail_save(*args: Any, **kwargs: Any):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(sr, "refresh_store_session", fake_refresh)
+        monkeypatch.setattr(sr, "save_cookie_state", fail_save)
+
+        outcome = sr.refresh_cookie_file(str(cookie), force=True)
+
+        assert outcome.refreshed is True
+        assert sr.parse_cookie_header(cookie.read_text(encoding="utf-8"))[
+            sr.REFRESH_COOKIE_NAME
+        ] == new_refresh

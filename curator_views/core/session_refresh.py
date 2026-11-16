@@ -44,7 +44,7 @@ LOGIN_ORIGIN = "https://login.steampowered.com"
 STORE_ORIGIN = "https://store.steampowered.com"
 
 # 表示需要人类重新登录的 EResult（令牌失效、被撤销、账号需验证等）
-TERMINAL_ERESULTS = frozenset({15, 21, 26, 27})
+TERMINAL_ERESULTS = frozenset({15, 17, 18, 21, 26, 27})
 
 # Set-Cookie 响应头中的 name=value 片段
 _SET_COOKIE_RE = re.compile(r"(?:^|[,;]\s*)([^=;,\s]+)=([^;,\s]*)")
@@ -58,6 +58,9 @@ class RefreshError(RuntimeError):
     Attributes:
         needs_login: 是否必须由人类重新执行 ``login`` 才能恢复。
         eresult: Steam 返回的 EResult（未知时为 ``None``）。
+        reason: 机器可读的失败原因（``"missing_refresh_token"`` /
+            ``"account_mismatch"`` / ``"terminal"`` / ``"network"`` /
+            ``"malformed"``；其他情况为空串）。
     """
 
     def __init__(
@@ -66,10 +69,12 @@ class RefreshError(RuntimeError):
         *,
         needs_login: bool = False,
         eresult: Optional[int] = None,
+        reason: str = "",
     ) -> None:
         super().__init__(message)
         self.needs_login = needs_login
         self.eresult = eresult
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -96,24 +101,63 @@ class CookieState:
     steamid: str = ""
     refresh_cookie: str = ""
     last_refresh_at: str = ""
+    last_attempt_at: str = ""
     last_error: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RefreshOutcome:
-    """一次刷新决策的结果。"""
+    """一次刷新决策的结果。
+
+    位置参数 ``status`` 与旧版 ``reason`` 字段含义相同（``"refreshed"`` /
+    ``"throttled"`` / ``"not_expiring"`` / ``"failed"``）。失败时额外携带
+    ``needs_login``、``failure_reason`` 与 ``error``，方便调用方决定是否继续重试。
+    """
 
     refreshed: bool
     """是否真正执行了刷新。"""
 
     reason: str
-    """``"refreshed"`` / ``"throttled"`` / ``"not_expiring"``。"""
+    """刷新状态：``"refreshed"`` / ``"throttled"`` / ``"not_expiring"`` /
+    ``"failed"``。"""
 
     state: CookieState
     """刷新后的状态对象。"""
 
     result: Optional[RefreshResult] = None
     """成功刷新时的会话数据。"""
+
+    needs_login: bool = False
+    """失败时是否必须重新交互式登录。"""
+
+    failure_reason: str = ""
+    """失败时的机器可读原因（来自 :class:`RefreshError.reason`）。"""
+
+    error: str = ""
+    """失败时的可读错误消息。"""
+
+    def __init__(
+        self,
+        refreshed: bool,
+        status: str,
+        state: CookieState,
+        result: Optional[RefreshResult] = None,
+        *,
+        needs_login: bool = False,
+        reason: str = "",
+        failure_reason: str = "",
+        error: str = "",
+    ) -> None:
+        # ``reason`` 关键字在失败结果中表示失败原因（兼容旧调用方同时使用
+        # 位置参数 status 与 reason= 的场景），状态字段仍名为 ``reason``。
+        failure = failure_reason or reason
+        object.__setattr__(self, "refreshed", refreshed)
+        object.__setattr__(self, "reason", status)
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "result", result)
+        object.__setattr__(self, "needs_login", needs_login)
+        object.__setattr__(self, "failure_reason", failure)
+        object.__setattr__(self, "error", error)
 
 
 def parse_cookie_header(header: str) -> Dict[str, str]:
@@ -263,17 +307,24 @@ def cookie_expires_at(header: str, name: str = STORE_COOKIE_NAME) -> int:
 
 
 def merge_store_cookie(
-    header: str, *, access_cookie: str, sessionid: str = ""
+    header: str,
+    *,
+    access_cookie: str,
+    sessionid: str = "",
+    refresh_cookie: str = "",
 ) -> str:
     """把新的访问 Cookie 合并进现有 Cookie 头。
 
     保持现有 Cookie 的顺序：``steamLoginSecure`` 原位替换，``sessionid``
-    在提供时原位替换；缺失则追加到末尾；其余 Cookie 原样保留。
+    与 ``steamRefresh_steam`` 在提供时原位替换；缺失则追加到末尾；其余
+    Cookie 原样保留。
 
     Args:
         header: 现有 Cookie 头。
         access_cookie: 新的 ``steamLoginSecure`` 值。
         sessionid: 可选的新的 ``sessionid`` 值；空串表示不修改现有值。
+        refresh_cookie: 可选的新的 ``steamRefresh_steam`` 值；空串表示不修改
+            现有值（向后兼容）。
 
     Returns:
         合并后的 Cookie 头。
@@ -287,6 +338,7 @@ def merge_store_cookie(
     merged: list[Tuple[str, str]] = []
     access_replaced = False
     sessionid_replaced = False
+    refresh_replaced = False
     for part in header.split(";"):
         piece = part.strip()
         if not piece or "=" not in piece:
@@ -301,6 +353,9 @@ def merge_store_cookie(
         elif name == "sessionid" and sessionid:
             merged.append((name, sessionid))
             sessionid_replaced = True
+        elif name == REFRESH_COOKIE_NAME and refresh_cookie:
+            merged.append((name, refresh_cookie))
+            refresh_replaced = True
         else:
             merged.append((name, value))
 
@@ -308,6 +363,8 @@ def merge_store_cookie(
         merged.append((STORE_COOKIE_NAME, access_cookie))
     if sessionid and not sessionid_replaced:
         merged.append(("sessionid", sessionid))
+    if refresh_cookie and not refresh_replaced:
+        merged.append((REFRESH_COOKIE_NAME, refresh_cookie))
     return build_cookie_header(merged)
 
 
@@ -332,21 +389,46 @@ def _eresult_error(code: Optional[int], action: str) -> RefreshError:
             message += "，登录态已失效，请重新运行 login"
         else:
             message += "，请稍后重试"
-    return RefreshError(message, needs_login=needs_login, eresult=code)
+    reason = "terminal" if needs_login else ""
+    return RefreshError(
+        message, needs_login=needs_login, eresult=code, reason=reason
+    )
+
+
+def _is_redirect(response: Any) -> bool:
+    """响应是否为 3xx 重定向。"""
+    try:
+        status = int(getattr(response, "status_code", 200))
+    except (TypeError, ValueError):
+        return False
+    return 300 <= status < 400
 
 
 def _json_payload(response: Any) -> Dict[str, Any]:
-    """解析响应 JSON，失败时抛出不含凭据的 :class:`RefreshError`。"""
+    """解析响应 JSON，失败时抛出不含凭据的 :class:`RefreshError`。
+
+    3xx 且没有 JSON 载荷通常意味着 Steam 把请求重定向到了登录页（令牌
+    失效或 IP 不匹配），此时直接要求重新登录。
+    """
     try:
         payload = response.json()
     except (AttributeError, TypeError, ValueError) as exc:
+        if _is_redirect(response):
+            raise RefreshError(
+                "Steam 将请求重定向到登录页（登录态已失效），请重新运行 login",
+                needs_login=True,
+                reason="terminal",
+            ) from exc
         raise RefreshError(
             "Steam 返回了无法解析的响应（JSON 解析失败），请稍后重试",
             needs_login=False,
+            reason="malformed",
         ) from exc
     if not isinstance(payload, dict):
         raise RefreshError(
-            "Steam 返回了非预期的响应结构，请稍后重试", needs_login=False
+            "Steam 返回了非预期的响应结构，请稍后重试",
+            needs_login=False,
+            reason="malformed",
         )
     return payload
 
@@ -420,12 +502,13 @@ def _set_cookie_values(response: Any, name: str) -> str:
 
 
 def _extract_response_cookie(
-    response: Any, name: str, domain_hint: str
+    response: Any, name: str, domain_hint: str, session: Any = None
 ) -> str:
     """从单个响应的 Cookie 中提取指定值，优先匹配指定域名。
 
-    先看响应携带的 Cookie jar（指定域优先于任意域），最后回退到
-    ``Set-Cookie`` 响应头。只读取当前响应，避免复用 Session 里的旧令牌。
+    顺序：本跳响应的 Cookie jar（指定域优先于任意域）→ ``Set-Cookie``
+    响应头 → Session 的 Cookie jar（指定域优先）。禁用重定向后，请求库
+    通常只暴露最后一跳的 Cookie，Session jar 是跨跳 Cookie 的最后兜底。
     """
     preferred, fallback = _cookie_values_from_jar(
         getattr(response, "cookies", None), name, domain_hint
@@ -434,7 +517,13 @@ def _extract_response_cookie(
         return preferred
     if fallback:
         return fallback
-    return _set_cookie_values(response, name)
+    header_value = _set_cookie_values(response, name)
+    if header_value:
+        return header_value
+    jar_preferred, jar_fallback = _cookie_values_from_jar(
+        getattr(session, "cookies", None), name, domain_hint
+    )
+    return jar_preferred or jar_fallback
 
 
 def _find_store_transfer(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -461,31 +550,48 @@ def _settoken(
     refresh_cookie: str,
     timeout: float,
 ) -> RefreshResult:
-    """向 settoken 接口换取新的 ``steamLoginSecure`` 并组装结果。"""
+    """向 settoken 接口换取新的 ``steamLoginSecure`` 并组装结果。
+
+    先提取响应中的 ``steamLoginSecure``：只要拿到了 Cookie 即视为成功，
+    不因响应体是 ``{}`` / ``{"success": true}`` / 缺少 ``result`` 而丢弃。
+    Cookie 缺失时才回看响应体的 EResult；3xx 且没有 Cookie 说明 Steam
+    把请求重定向到了登录页，需要重新登录。
+    """
     response = session.post(
         url,
         data={"steamID": steamid, "nonce": nonce, "auth": auth},
         timeout=timeout,
+        allow_redirects=False,
     )
-    payload = _json_payload(response)
-    result_code = _to_int(payload.get("result"))
-    if result_code != 1:
-        error_code = result_code
-        if error_code is None:
-            error_code = _to_int(payload.get("eresult") or payload.get("error"))
-        raise _eresult_error(error_code, "Steam 登录令牌交换")
 
     access_cookie = _extract_response_cookie(
-        response, STORE_COOKIE_NAME, "store.steampowered.com"
+        response, STORE_COOKIE_NAME, "store.steampowered.com", session=session
     )
     if not access_cookie:
+        if _is_redirect(response):
+            raise RefreshError(
+                "Steam 登录令牌交换被重定向到登录页（登录态已失效），"
+                "请重新运行 login",
+                needs_login=True,
+                reason="terminal",
+            )
+        payload = _json_payload(response)
+        result_code = _to_int(payload.get("result"))
+        if result_code != 1:
+            error_code = result_code
+            if error_code is None:
+                error_code = _to_int(
+                    payload.get("eresult") or payload.get("error")
+                )
+            raise _eresult_error(error_code, "Steam 登录令牌交换")
         raise RefreshError(
             "Steam 未返回新的 steamLoginSecure Cookie，请重新运行 login",
             needs_login=True,
+            reason="malformed",
         )
 
     returned_sessionid = _extract_response_cookie(
-        response, "sessionid", "store.steampowered.com"
+        response, "sessionid", "store.steampowered.com", session=session
     )
     sessionid = returned_sessionid or fallback_sessionid
     merged = build_cookie_header(
@@ -526,6 +632,8 @@ def _refresh_via_ajaxrefresh(
         f"{LOGIN_ORIGIN}/jwt/ajaxrefresh",
         data={"redir": redir},
         timeout=timeout,
+        cookies={REFRESH_COOKIE_NAME: refresh_cookie},
+        allow_redirects=False,
     )
     payload = _json_payload(response)
     if not payload.get("success"):
@@ -539,11 +647,15 @@ def _refresh_via_ajaxrefresh(
         raise RefreshError(
             "Steam 备用刷新响应缺少必要字段，请重新运行 login",
             needs_login=True,
+            reason="malformed",
         )
 
     rotated_refresh = (
         _extract_response_cookie(
-            response, REFRESH_COOKIE_NAME, "login.steampowered.com"
+            response,
+            REFRESH_COOKIE_NAME,
+            "login.steampowered.com",
+            session=session,
         )
         or refresh_cookie
     )
@@ -593,7 +705,9 @@ def refresh_store_session(
     """
     if not refresh_cookie:
         raise RefreshError(
-            "steamRefresh_steam 为空，请重新运行 login", needs_login=True
+            "steamRefresh_steam 为空，请重新运行 login",
+            needs_login=True,
+            reason="missing_refresh_token",
         )
 
     session = session_factory() if session_factory is not None else requests.Session()
@@ -609,7 +723,9 @@ def refresh_store_session(
     steamid_hint, refresh_jwt = _split_login_value(refresh_cookie)
     if not refresh_jwt:
         raise RefreshError(
-            "steamRefresh_steam 内容无效，请重新运行 login", needs_login=True
+            "steamRefresh_steam 内容无效，请重新运行 login",
+            needs_login=True,
+            reason="missing_refresh_token",
         )
     sessionid = secrets.token_hex(12)
 
@@ -618,6 +734,7 @@ def refresh_store_session(
             f"{LOGIN_ORIGIN}/jwt/finalizelogin",
             data={"nonce": refresh_jwt, "sessionid": sessionid, "redir": redir},
             timeout=timeout,
+            allow_redirects=False,
         )
         finalize_payload = _json_payload(finalize_response)
 
@@ -630,6 +747,7 @@ def refresh_store_session(
                 finalize_response,
                 REFRESH_COOKIE_NAME,
                 "login.steampowered.com",
+                session=session,
             )
             or refresh_cookie
         )
@@ -672,6 +790,7 @@ def refresh_store_session(
         raise RefreshError(
             "刷新 Steam 会话时网络请求失败，请检查网络或代理后重试",
             needs_login=False,
+            reason="network",
         ) from exc
 
 
@@ -719,6 +838,7 @@ def load_cookie_state(cookie_file: str) -> CookieState:
         steamid=_text("steamid"),
         refresh_cookie=_text("refresh_cookie"),
         last_refresh_at=_text("last_refresh_at"),
+        last_attempt_at=_text("last_attempt_at"),
         last_error=_text("last_error"),
     )
 
@@ -742,6 +862,11 @@ def save_cookie_state(cookie_file: str, state: CookieState) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(payload)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         try:
             os.chmod(tmp_path, 0o600)
         except OSError:
@@ -775,6 +900,32 @@ def _as_utc(moment: datetime) -> datetime:
     return moment
 
 
+def _latest_throttle_anchor(
+    state: CookieState, now: datetime
+) -> Optional[datetime]:
+    """返回用于节流的时间锚点：取最近一次刷新/尝试中较晚者。
+
+    时钟回拨保护：明显晚于当前时间（> now + 60s）的时间戳视为无效并忽略，
+    避免未来时间永久卡死刷新。"""
+    anchors: list[datetime] = []
+    for raw in (state.last_refresh_at, state.last_attempt_at):
+        parsed = _parse_state_time(raw)
+        if parsed is None:
+            continue
+        if parsed > now + timedelta(seconds=60):
+            continue
+        anchors.append(parsed)
+    return max(anchors) if anchors else None
+
+
+def _save_state_quietly(cookie_file: str, state: CookieState) -> None:
+    """保存状态文件；写入失败只记警告，不掩盖原始刷新结果。"""
+    try:
+        save_cookie_state(cookie_file, state)
+    except OSError as exc:
+        logger.warning("保存 Steam 会话刷新状态失败: %s", exc)
+
+
 def refresh_cookie_file(
     cookie_file: str,
     *,
@@ -791,11 +942,11 @@ def refresh_cookie_file(
     流程：
 
     1. 读取现有 Cookie 文件（兼容浏览器请求头 / cURL）；
-    2. 从状态文件或 Cookie 中取得 ``steamRefresh_steam``；
-    3. 默认按 ``min_interval_hours`` 节流；
-    4. 可选地只在访问令牌接近过期时刷新；
-    5. 刷新成功后把新访问令牌合并回现有 Cookie 头并原子写回，
-       同时更新 ``<cookie_file>.session.json``。
+    2. 以 Cookie 头中的 ``steamRefresh_steam`` 为准，sidecar 仅作缓存；
+    3. 默认按最近一次刷新/尝试时间节流；
+    4. 可选地只在访问令牌接近过期时刷新（``0`` / ``None`` 表示不设过期门槛）；
+    5. 刷新成功后把新访问令牌与轮换后的刷新令牌合并回现有 Cookie 头并原子
+       写回，先写 Cookie 文件、再更新 ``<cookie_file>.session.json``。
 
     Args:
         cookie_file: Cookie 文件路径。
@@ -803,50 +954,81 @@ def refresh_cookie_file(
         timeout: 单次 HTTP 请求超时秒数。
         proxy: 可选代理地址。
         force: 为 ``True`` 时跳过节流。
-        min_interval_hours: 两次刷新之间的最小间隔（小时）。
+        min_interval_hours: 两次刷新（或失败尝试）之间的最小间隔（小时）。
         expires_within_hours: 仅在访问令牌将在该小时数内过期时刷新；
-            ``None`` 表示不检查。
+            ``None`` 或 ``<= 0`` 表示不检查。
         now_fn: 可注入的当前时间函数（测试用），默认 UTC 当前时间。
 
     Returns:
         刷新结果或跳过原因。
 
     Raises:
-        RefreshError: Cookie 文件缺失、缺少刷新令牌或刷新失败。
+        RefreshError: Cookie 文件缺失、缺少刷新令牌、账号不匹配或刷新失败。
     """
+    if not cookie_file:
+        raise RefreshError(
+            "Cookie 文件路径为空",
+            needs_login=True,
+            reason="missing_refresh_token",
+        )
+
     current_time_fn = now_fn or (lambda: datetime.now(timezone.utc))
     try:
         header = fetcher.read_cookie_file(cookie_file)
     except FileNotFoundError as exc:
         raise RefreshError(
-            "Cookie 文件不存在，请先运行 login 生成", needs_login=True
+            "Cookie 文件不存在，请先运行 login 生成",
+            needs_login=True,
+            reason="missing_refresh_token",
         ) from exc
     except fetcher.CookieFileError as exc:
         raise RefreshError(
-            f"Cookie 文件不可用：{exc}", needs_login=True
+            f"Cookie 文件不可用：{exc}",
+            needs_login=True,
+            reason="missing_refresh_token",
         ) from exc
 
     state = load_cookie_state(cookie_file)
-    if not state.refresh_cookie:
-        state.refresh_cookie = extract_refresh_cookie(header)
-    if not state.steamid:
-        state.steamid = _split_login_value(state.refresh_cookie)[0]
+    normalized_header = fetcher.extract_cookie(header)
+    header_refresh = extract_refresh_cookie(header)
+    if header_refresh:
+        # Cookie 头是刷新令牌的唯一事实来源：手动重新登录 / 替换 Cookie 文件
+        # 后必须优先采用头里的新令牌，而不是继续使用 sidecar 缓存。
+        state.refresh_cookie = header_refresh
+        header_steamid = _split_login_value(header_refresh)[0]
+        if header_steamid:
+            state.steamid = header_steamid
+    elif state.refresh_cookie:
+        if not state.steamid:
+            state.steamid = _split_login_value(state.refresh_cookie)[0]
+        access_value = parse_cookie_header(normalized_header).get(
+            STORE_COOKIE_NAME, ""
+        )
+        access_steamid = _split_login_value(access_value)[0]
+        if access_steamid and state.steamid and access_steamid != state.steamid:
+            raise RefreshError(
+                "Cookie 头与 sidecar 属于不同 Steam 账号，"
+                "请重新运行 login 生成新的刷新令牌",
+                needs_login=True,
+                reason="account_mismatch",
+            )
 
     if not state.refresh_cookie:
         raise RefreshError(
             "Cookie 中缺少 steamRefresh_steam，无法自动刷新，请重新运行 login",
             needs_login=True,
+            reason="missing_refresh_token",
         )
 
     now = _as_utc(current_time_fn())
 
-    if not force:
-        last_refresh = _parse_state_time(state.last_refresh_at)
-        if last_refresh is not None:
-            if now - last_refresh < timedelta(hours=min_interval_hours):
+    if not force and min_interval_hours > 0:
+        anchor = _latest_throttle_anchor(state, now)
+        if anchor is not None:
+            if now - anchor < timedelta(hours=min_interval_hours):
                 return RefreshOutcome(False, "throttled", state, None)
 
-    if expires_within_hours is not None:
+    if expires_within_hours is not None and expires_within_hours > 0:
         expires_at = cookie_expires_at(header)
         if expires_at > 0:
             remaining_hours = (expires_at - now.timestamp()) / 3600.0
@@ -862,7 +1044,8 @@ def refresh_cookie_file(
         )
     except RefreshError as exc:
         state.last_error = str(exc)
-        save_cookie_state(cookie_file, state)
+        state.last_attempt_at = now.isoformat()
+        _save_state_quietly(cookie_file, state)
         logger.warning(
             "Steam 会话刷新失败（steamid=%s）：%s", state.steamid, exc
         )
@@ -872,15 +1055,21 @@ def refresh_cookie_file(
     access_cookie = result_pairs.get(STORE_COOKIE_NAME, "")
     returned_sessionid = result_pairs.get("sessionid", "")
     merged_header = merge_store_cookie(
-        header, access_cookie=access_cookie, sessionid=returned_sessionid
+        header,
+        access_cookie=access_cookie,
+        sessionid=returned_sessionid,
+        refresh_cookie=result.refresh_cookie,
     )
+    # 先原子写 Cookie 文件，再写 sidecar：即使中间崩溃，新的 Cookie 头也
+    # 会因“头优先”而继续生效，不会因为旧 sidecar 而让令牌失效。
     login.write_cookie_file(cookie_file, merged_header)
 
     state.steamid = result.steamid or state.steamid
     state.refresh_cookie = result.refresh_cookie or state.refresh_cookie
     state.last_refresh_at = now.isoformat()
+    state.last_attempt_at = now.isoformat()
     state.last_error = ""
-    save_cookie_state(cookie_file, state)
+    _save_state_quietly(cookie_file, state)
 
     logger.info("Steam 会话刷新成功（steamid=%s）", state.steamid)
     return RefreshOutcome(True, "refreshed", state, result)

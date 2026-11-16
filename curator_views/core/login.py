@@ -36,6 +36,8 @@ DEFAULT_PROFILE_DIR = ".steam_profile"
 
 # 登录成功的标志 Cookie 名称
 _LOGIN_COOKIE_NAME = "steamLoginSecure"
+# 长期刷新令牌 Cookie 名称（登录完成后由 Steam 延迟下发）
+_REFRESH_COOKIE_NAME = "steamRefresh_steam"
 
 
 def build_cookie_string(cookies: Iterable[Dict[str, Any]]) -> str:
@@ -188,11 +190,15 @@ def login_via_browser(
     proxy: Optional[str] = None,
     poll_interval: float = 1.0,
     launcher: Optional[Callable[[], Any]] = None,
+    refresh_wait_s: float = 10.0,
 ) -> str:
     """打开 Chromium 由人类完成登录，并导出 Steam 域下的 Cookie。
 
     使用持久化用户目录复用登录态；轮询直至出现非空的 ``steamLoginSecure``
-    Cookie 或超时。无论成功、超时还是异常，都会关闭浏览器上下文与 Playwright。
+    Cookie 或超时。``steamRefresh_steam`` 通常比登录 Cookie 稍晚下发，因此
+    首次看到登录 Cookie 后会在 ``refresh_wait_s``（不超过剩余登录超时）内
+    继续轮询刷新令牌；窗口结束仍未出现时照常导出已有 Cookie。无论成功、
+    超时还是异常，都会关闭浏览器上下文与 Playwright。
 
     Args:
         profile_dir: Chromium 持久化用户目录。
@@ -202,6 +208,7 @@ def login_via_browser(
         poll_interval: 轮询 Cookie 的间隔秒数。
         launcher: 可注入的 Playwright 启动器，默认 ``sync_playwright``，
             测试可传入伪造实现以避免真实浏览器依赖。
+        refresh_wait_s: 首次看到登录 Cookie 后，额外等待刷新令牌的秒数。
 
     Returns:
         形如 ``"name=value; ..."`` 的 Cookie 字符串。
@@ -258,6 +265,24 @@ def login_via_browser(
                     f"登录超时（{timeout_s:.0f} 秒内未检测到登录 Cookie）。"
                 )
             time.sleep(poll_interval)
+
+        # 登录 Cookie 出现后，刷新令牌可能还会延迟写入；在有限窗口内继续
+        # 轮询，拿到就提前导出，超时则导出已有 Cookie（cmd_login 会提示缺失）。
+        def _has_refresh(items: list) -> bool:
+            return any(
+                item.get("name") == _REFRESH_COOKIE_NAME and item.get("value")
+                for item in items
+            )
+
+        refresh_deadline = min(
+            deadline,
+            time.monotonic() + max(0.0, refresh_wait_s),
+        )
+        while not _has_refresh(cookies):
+            if time.monotonic() >= refresh_deadline:
+                break
+            time.sleep(poll_interval)
+            cookies = context.cookies()
 
         cookie = build_store_cookie_string(cookies)
         if not cookie:

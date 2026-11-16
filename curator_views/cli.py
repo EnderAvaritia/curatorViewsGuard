@@ -89,8 +89,10 @@ from curator_views.core.session_refresh import (  # noqa: E402
     RefreshOutcome,
     cookie_expires_at,
     extract_refresh_cookie,
+    load_cookie_state,
     refresh_cookie_file,
     save_cookie_state,
+    session_state_path,
     split_refresh_cookie,
 )
 from curator_views.core.scheduler import (  # noqa: E402
@@ -464,6 +466,15 @@ def _number(value: Any, default: float) -> float:
         return default
 
 
+def _config_enabled(value: Any, default: bool = True) -> bool:
+    """解析布尔配置；字符串 ``"false"`` / ``"0"`` / ``"no"`` / ``"off"`` 视为关闭。"""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off", ""}
+    return bool(value)
+
+
 def _check_cookie_file(cookie_file: str, label: str = "Cookie") -> bool:
     """检查 Cookie 文件是否可用；缺失时不终止，改为未登录模式继续。
 
@@ -648,11 +659,12 @@ def _refresh_cookie_quietly(
         proxy: 可选代理地址。
 
     Returns:
-        真正调用刷新时的结果；跳过或失败时返回 ``None``。
+        真正调用刷新时的结果；跳过时返回 ``None``，失败时返回带
+        ``reason="failed"`` 的结果（供调用方判断是否继续重试）。
     """
     if dry_run or not cookie_file:
         return None
-    if not bool(cfg.get("cookie_refresh_enabled", True)):
+    if not _config_enabled(cfg.get("cookie_refresh_enabled", True)):
         return None
     min_interval = _number(
         cfg.get("cookie_refresh_min_interval_hours", 6), 6.0
@@ -668,11 +680,31 @@ def _refresh_cookie_quietly(
             expires_within_hours=None if force else before_hours,
         )
     except RefreshError as exc:
-        logger.warning("统计 Cookie 自动续期失败: %s", exc)
-        return None
+        level = (
+            logging.INFO
+            if exc.reason == "missing_refresh_token"
+            else logging.WARNING
+        )
+        logger.log(level, "统计 Cookie 自动续期失败: %s", exc)
+        return RefreshOutcome(
+            False,
+            "failed",
+            load_cookie_state(cookie_file),
+            None,
+            needs_login=exc.needs_login,
+            reason=exc.reason,
+            error=str(exc),
+        )
     except Exception as exc:  # noqa: BLE001 - 自动续期绝不能阻断主流程
         logger.warning("统计 Cookie 自动续期异常: %s", exc)
-        return None
+        return RefreshOutcome(
+            False,
+            "failed",
+            load_cookie_state(cookie_file),
+            None,
+            needs_login=False,
+            error=str(exc),
+        )
     if outcome.refreshed:
         logger.info("统计 Cookie 已自动续期（%s）", cookie_file)
     else:
@@ -710,7 +742,7 @@ def _execute_daily(
     # 让 Fetcher 直接读到刷新后的文件。dry-run / 关闭续期 / 未配置 Cookie
     # 时 helper 会立即返回，不产生任何副作用。
     before_hours = _number(cfg.get("cookie_refresh_before_hours", 12), 12.0)
-    _refresh_cookie_quietly(
+    pre_outcome = _refresh_cookie_quietly(
         cookie_file,
         clan_id,
         cfg,
@@ -743,9 +775,25 @@ def _execute_daily(
             config_path=config_path,
         )
     except StatsAuthError as exc:
+        # 若执行前续期已经因终止性原因失败（刷新令牌失效 / 账号不匹配），
+        # 本次执行不再强制刷新，避免同一执行内反复尝试同一个坏令牌。
+        if (
+            pre_outcome is not None
+            and pre_outcome.reason == "failed"
+            and pre_outcome.needs_login
+        ):
+            notifier.send(
+                "统计 Cookie 失效，今日执行失败",
+                f"{exc}\n\n"
+                f"处理：python curator_views/cli.py login --config {config_path}\n"
+                "重新登录后无需重启 daemon，下一次重试会自动读取新的 Cookie 文件。",
+                level="error",
+            )
+            raise exc
+
         # Cookie 失效时先强制续期一次（绕过最小间隔），成功后用新的 Fetcher
         # 重试一次；Fetcher 在构造时读取 Cookie，刷新后必须重建实例。
-        outcome = _refresh_cookie_quietly(
+        forced_outcome = _refresh_cookie_quietly(
             cookie_file,
             clan_id,
             cfg,
@@ -754,7 +802,24 @@ def _execute_daily(
             dry_run=dry_run,
             proxy=proxy,
         )
-        if outcome is not None and outcome.refreshed:
+        if (
+            forced_outcome is not None
+            and forced_outcome.reason == "failed"
+            and (
+                forced_outcome.needs_login
+                or forced_outcome.failure_reason == "terminal"
+            )
+        ):
+            # 终止性失败：不再重试 run_daily，一次执行最多尝试一次强制刷新。
+            notifier.send(
+                "统计 Cookie 失效，今日执行失败",
+                f"{exc}\n\n"
+                f"处理：python curator_views/cli.py login --config {config_path}\n"
+                "重新登录后无需重启 daemon，下一次重试会自动读取新的 Cookie 文件。",
+                level="error",
+            )
+            raise exc
+        if forced_outcome is not None and forced_outcome.refreshed:
             retry_fetcher = Fetcher(clan_id, cookie_file, proxy)
             try:
                 return run_daily(
@@ -1334,6 +1399,14 @@ def cmd_login(args: argparse.Namespace) -> int:
         else:
             logger.info("已保存刷新令牌，后续可自动续期统计 Cookie。")
     else:
+        # 新 Cookie 不含刷新令牌时必须清掉旧 sidecar，否则后续自动续期会
+        # 用上一个账号的刷新令牌覆盖这份全新登录。
+        try:
+            Path(session_state_path(cookie_file)).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("清理旧刷新令牌状态失败: %s", exc)
+        else:
+            logger.info("已清理旧的刷新令牌状态（新 Cookie 不含刷新令牌）。")
         logger.info(
             "登录 Cookie 不含 steamRefresh_steam，自动续期暂不可用；"
             "需使用携带刷新令牌的交互式登录。"
@@ -1381,7 +1454,7 @@ def cmd_refresh_cookie(args: argparse.Namespace) -> int:
             force=args.force,
             min_interval_hours=min_interval,
         )
-    except RefreshError as exc:
+    except (RefreshError, OSError) as exc:
         print(
             json.dumps(
                 {
