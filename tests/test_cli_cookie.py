@@ -1,7 +1,17 @@
-"""统计 Cookie 失效时的 CLI 行为：推送可操作告警并以 1 退出。"""
+"""统计 Cookie 失效时的 CLI 行为：推送可操作告警并以 1 退出。
+
+同时覆盖自动续期：鉴权失败后续期并重试一次、无刷新令牌时只告警一次、
+以及 dry-run 绝不触发续期。
+"""
 
 from curator_views import cli
 from curator_views.core.fetcher import StatsAuthError
+from curator_views.core.session_refresh import (
+    CookieState,
+    RefreshError,
+    RefreshOutcome,
+    RefreshResult,
+)
 
 CONFIG_TEXT = """\
 clan_id: "45519015"
@@ -105,3 +115,138 @@ def test_forecast_fetch_hints_relogin_on_auth_error(
     err = capsys.readouterr().err
     assert "Cookie 已失效" in err
     assert "login --config" in err
+
+
+def _refreshed_outcome() -> RefreshOutcome:
+    return RefreshOutcome(
+        True,
+        "refreshed",
+        CookieState(steamid="1", refresh_cookie="refresh-token"),
+        RefreshResult(
+            cookie="steamLoginSecure=a",
+            steamid="1",
+            refresh_cookie="refresh-token",
+            expires_at=0,
+        ),
+    )
+
+
+def _write_run_config(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'clan_id: "45519015"\n'
+        'cookie_file: "cookie.txt"\n'
+        'db_path: "views.db"\n'
+        "boost_enabled: false\n"
+        'ntfy_url: ""\n'
+        'ntfy_topic: ""\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "cookie.txt").write_text(
+        "steamLoginSecure=a\n", encoding="utf-8"
+    )
+    return config_path
+
+
+def test_auth_error_refreshes_and_retries_once(tmp_path, monkeypatch):
+    config_path = _write_run_config(tmp_path)
+    FakeNotifier.instances = []
+    events = []
+    run_calls = {"count": 0}
+
+    class RecordingFetcher:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            events.append("fetcher")
+            RecordingFetcher.instances.append(self)
+
+    def fake_refresh(*args, **kwargs):
+        events.append("refresh")
+        return _refreshed_outcome()
+
+    def fake_run_daily(*args, **kwargs):
+        events.append("run")
+        run_calls["count"] += 1
+        if run_calls["count"] == 1:
+            raise StatsAuthError("统计页被重定向到公开页面")
+        return {"refreshed_ok": True}
+
+    monkeypatch.setattr(cli, "Notifier", FakeNotifier)
+    monkeypatch.setattr(cli, "Fetcher", RecordingFetcher)
+    monkeypatch.setattr(cli, "refresh_cookie_file", fake_refresh)
+    monkeypatch.setattr(cli, "run_daily", fake_run_daily)
+
+    code = cli.main(["run", "--config", str(config_path), "--no-boost"])
+
+    assert code == 0
+    assert run_calls["count"] == 2
+    assert len(RecordingFetcher.instances) == 2
+    assert events == [
+        "refresh",
+        "fetcher",
+        "run",
+        "refresh",
+        "fetcher",
+        "run",
+    ]
+    assert FakeNotifier.instances[0].sent == []
+
+
+def test_auth_error_without_refresh_token_notifies_once(
+    tmp_path, monkeypatch
+):
+    config_path = _write_run_config(tmp_path)
+    FakeNotifier.instances = []
+
+    class DummyFetcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def fail_refresh(*args, **kwargs):
+        raise RefreshError("缺少刷新令牌", needs_login=True)
+
+    def fail_run_daily(*args, **kwargs):
+        raise StatsAuthError("统计页被重定向到公开页面")
+
+    monkeypatch.setattr(cli, "Notifier", FakeNotifier)
+    monkeypatch.setattr(cli, "Fetcher", DummyFetcher)
+    monkeypatch.setattr(cli, "refresh_cookie_file", fail_refresh)
+    monkeypatch.setattr(cli, "run_daily", fail_run_daily)
+
+    code = cli.main(["run", "--config", str(config_path), "--no-boost"])
+
+    assert code == 1
+    assert len(FakeNotifier.instances) == 1
+    sent = FakeNotifier.instances[0].sent
+    assert len(sent) == 1
+    title, message, level = sent[0]
+    assert "Cookie 失效" in title
+    assert "login --config" in message
+    assert level == "error"
+
+
+def test_dry_run_does_not_refresh(tmp_path, monkeypatch):
+    config_path = _write_run_config(tmp_path)
+    FakeNotifier.instances = []
+
+    class DummyFetcher:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("dry-run 不能触发 Cookie 续期")
+
+    monkeypatch.setattr(cli, "Notifier", FakeNotifier)
+    monkeypatch.setattr(cli, "Fetcher", DummyFetcher)
+    monkeypatch.setattr(cli, "refresh_cookie_file", fail_if_called)
+    monkeypatch.setattr(
+        cli, "run_daily", lambda *a, **k: {"dry_run": True}
+    )
+
+    code = cli.main(
+        ["run", "--config", str(config_path), "--dry-run", "--no-boost"]
+    )
+
+    assert code == 0
+    assert FakeNotifier.instances[0].sent == []

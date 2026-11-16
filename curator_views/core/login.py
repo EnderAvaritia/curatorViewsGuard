@@ -259,7 +259,7 @@ def login_via_browser(
                 )
             time.sleep(poll_interval)
 
-        cookie = build_cookie_string(cookies)
+        cookie = build_store_cookie_string(cookies)
         if not cookie:
             raise RuntimeError("登录成功但未取到任何 steampowered.com Cookie")
         return cookie

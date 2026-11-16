@@ -32,6 +32,9 @@ class TestLoadConfigDefaults:
         assert cfg["boost_distribution"] == "ratio"
         assert cfg["executor_cmd"] == ""
         assert cfg["boost_list_fallback"] is True
+        assert cfg["cookie_refresh_enabled"] is True
+        assert cfg["cookie_refresh_before_hours"] == 12
+        assert cfg["cookie_refresh_min_interval_hours"] == 6
 
     def test_user_values_override_defaults(self, tmp_path):
         cfg = cli._load_config(

@@ -10,6 +10,7 @@
   forecast     只读推算未来 N 天的目标 / 假设自然流量 / 刷量缺口
   boost        手动执行一轮受控提升
   login        半自动登录 Steam 并生成/校验 cookie.txt（需要 playwright）
+  refresh-cookie 用 steamRefresh_steam 手动续期统计 Cookie
   export       从本地数据库导出每日统计数据（json / csv）
   version      打印版本号
 
@@ -27,6 +28,7 @@
   python cli.py boost --config config.yaml --target 500 --apps 5 --dry-run
   python cli.py login --config config.yaml
   python cli.py login --config config.yaml --validate-only
+  python cli.py refresh-cookie --config config.yaml
   python cli.py export --config config.yaml --format csv --out stats.csv
   python cli.py version
 """
@@ -64,10 +66,12 @@ from curator_views.core.daemon import (  # noqa: E402
 )
 from curator_views.core.forecast import forecast_days  # noqa: E402
 from curator_views.core.fetcher import (  # noqa: E402
+    STATS_URL,
     CookieFileError,
     Fetcher,
     StatsAuthError,
     extract_cookie,
+    read_cookie_file,
     validate_cookie_header,
 )
 from curator_views.core.login import (  # noqa: E402
@@ -79,6 +83,16 @@ from curator_views.core.login import (  # noqa: E402
 )
 from curator_views.core.notifier import Notifier  # noqa: E402
 from curator_views.core.predictor import predict_expected  # noqa: E402
+from curator_views.core.session_refresh import (  # noqa: E402
+    CookieState,
+    RefreshError,
+    RefreshOutcome,
+    cookie_expires_at,
+    extract_refresh_cookie,
+    refresh_cookie_file,
+    save_cookie_state,
+    split_refresh_cookie,
+)
 from curator_views.core.scheduler import (  # noqa: E402
     _TZ,
     _daily_throughput_capacity,
@@ -120,6 +134,13 @@ cookie_file: "cookie.txt"
 # 单独生成（不同账号需配合不同的 --profile-dir 保存登录态）。
 # 白话：刷量想用哪个号就填哪个号的 Cookie 文件；不填就是游客刷量。
 boost_cookie_file: ""
+
+# 用 steamRefresh_steam 自动续期统计 Cookie（关闭后只读 cookie_file）
+cookie_refresh_enabled: true
+# 距 steamLoginSecure 过期少于该小时数时主动续期（0 = 有令牌就续期）
+cookie_refresh_before_hours: 12
+# 两次实际续期的最小间隔（小时），避免失败时空转（0 = 关闭限流）
+cookie_refresh_min_interval_hours: 6
 
 # 代理地址（可选），如 http://127.0.0.1:10279；留空表示不使用代理
 # 白话：国内直连 Steam 不稳就填代理，稳定就留空。
@@ -435,6 +456,14 @@ def _resolve_cookie_paths(
     return stats_cookie, boost_cookie
 
 
+def _number(value: Any, default: float) -> float:
+    """把配置值转换为浮点数；缺失或类型非法时回退默认值。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _check_cookie_file(cookie_file: str, label: str = "Cookie") -> bool:
     """检查 Cookie 文件是否可用；缺失时不终止，改为未登录模式继续。
 
@@ -597,6 +626,62 @@ def cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_cookie_quietly(
+    cookie_file: str,
+    clan_id: str,
+    cfg: Dict[str, Any],
+    *,
+    force: bool,
+    before_hours: float,
+    dry_run: bool,
+    proxy: Optional[str],
+) -> Optional[RefreshOutcome]:
+    """尽力续期统计 Cookie，任何失败都只记日志、绝不抛出。
+
+    Args:
+        cookie_file: 统计用 Cookie 文件；空串表示未配置，直接跳过。
+        clan_id: 鉴赏家组 ID，用于构造刷新后的跳转地址。
+        cfg: 配置字典（读取 ``cookie_refresh_enabled`` 与最小间隔）。
+        force: 为 ``True`` 时跳过最小间隔限流（鉴权失败后的强制刷新）。
+        before_hours: 仅在访问令牌该小时数内过期时刷新。
+        dry_run: 演练模式，不读写任何 Cookie。
+        proxy: 可选代理地址。
+
+    Returns:
+        真正调用刷新时的结果；跳过或失败时返回 ``None``。
+    """
+    if dry_run or not cookie_file:
+        return None
+    if not bool(cfg.get("cookie_refresh_enabled", True)):
+        return None
+    min_interval = _number(
+        cfg.get("cookie_refresh_min_interval_hours", 6), 6.0
+    )
+    try:
+        outcome = refresh_cookie_file(
+            cookie_file,
+            redir=STATS_URL.format(clan_id=clan_id),
+            timeout=20.0,
+            proxy=proxy,
+            force=force,
+            min_interval_hours=min_interval,
+            expires_within_hours=None if force else before_hours,
+        )
+    except RefreshError as exc:
+        logger.warning("统计 Cookie 自动续期失败: %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 - 自动续期绝不能阻断主流程
+        logger.warning("统计 Cookie 自动续期异常: %s", exc)
+        return None
+    if outcome.refreshed:
+        logger.info("统计 Cookie 已自动续期（%s）", cookie_file)
+    else:
+        logger.debug(
+            "统计 Cookie 本次无需续期（%s）：%s", cookie_file, outcome.reason
+        )
+    return outcome
+
+
 def _execute_daily(
     cfg: Dict[str, Any],
     config_path: str,
@@ -621,6 +706,20 @@ def _execute_daily(
     proxy = cfg.get("proxy") or None
     _check_cookie_files(cookie_file, boost_cookie_file)
 
+    # 执行前静默续期：在构造 Fetcher 之前刷新临近过期的统计 Cookie，
+    # 让 Fetcher 直接读到刷新后的文件。dry-run / 关闭续期 / 未配置 Cookie
+    # 时 helper 会立即返回，不产生任何副作用。
+    before_hours = _number(cfg.get("cookie_refresh_before_hours", 12), 12.0)
+    _refresh_cookie_quietly(
+        cookie_file,
+        clan_id,
+        cfg,
+        force=False,
+        before_hours=before_hours,
+        dry_run=dry_run,
+        proxy=proxy,
+    )
+
     storage = Storage(db_path)
     fetcher = Fetcher(clan_id, cookie_file, proxy)
     notifier = _build_notifier(cfg, db_path)
@@ -644,8 +743,33 @@ def _execute_daily(
             config_path=config_path,
         )
     except StatsAuthError as exc:
-        # Cookie 失效是可人工修复的问题：立刻推送一条可操作的告警，
-        # 然后交给 daemon 的重试机制（重试时 Fetcher 会重新读取 Cookie 文件）。
+        # Cookie 失效时先强制续期一次（绕过最小间隔），成功后用新的 Fetcher
+        # 重试一次；Fetcher 在构造时读取 Cookie，刷新后必须重建实例。
+        outcome = _refresh_cookie_quietly(
+            cookie_file,
+            clan_id,
+            cfg,
+            force=True,
+            before_hours=before_hours,
+            dry_run=dry_run,
+            proxy=proxy,
+        )
+        if outcome is not None and outcome.refreshed:
+            retry_fetcher = Fetcher(clan_id, cookie_file, proxy)
+            try:
+                return run_daily(
+                    storage,
+                    retry_fetcher,
+                    notifier,
+                    booster,
+                    sched_cfg,
+                    executor_cmd=executor_cmd,
+                    config_path=config_path,
+                )
+            except StatsAuthError as retry_exc:
+                # 续期成功但重试仍失效：按原有告警逻辑处理，抛重试错误。
+                exc = retry_exc
+        # 续期不可用或重试仍失效：保持原有的“告警 + 重试机制兜底”行为。
         notifier.send(
             "统计 Cookie 失效，今日执行失败",
             f"{exc}\n\n"
@@ -653,7 +777,7 @@ def _execute_daily(
             "重新登录后无需重启 daemon，下一次重试会自动读取新的 Cookie 文件。",
             level="error",
         )
-        raise
+        raise exc
 
 
 def _setup_logging(
@@ -1193,6 +1317,27 @@ def cmd_login(args: argparse.Namespace) -> int:
             return 1
 
     write_cookie_file(cookie_file, cookie)
+    # 若导出的 Cookie 含长期刷新令牌，顺手写入 sidecar，供后续 run/daemon
+    # 自动续期，无需再手动执行 refresh-cookie。
+    refresh_value = extract_refresh_cookie(cookie)
+    if refresh_value:
+        steamid, _refresh_jwt = split_refresh_cookie(refresh_value)
+        try:
+            save_cookie_state(
+                cookie_file,
+                CookieState(steamid=steamid, refresh_cookie=refresh_value),
+            )
+        except OSError as exc:
+            logger.warning(
+                "保存刷新令牌失败（自动续期可能不可用）: %s", exc
+            )
+        else:
+            logger.info("已保存刷新令牌，后续可自动续期统计 Cookie。")
+    else:
+        logger.info(
+            "登录 Cookie 不含 steamRefresh_steam，自动续期暂不可用；"
+            "需使用携带刷新令牌的交互式登录。"
+        )
     summary = {
         "mode": "login",
         "cookie_file": cookie_file,
@@ -1203,6 +1348,91 @@ def cmd_login(args: argparse.Namespace) -> int:
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_refresh_cookie(args: argparse.Namespace) -> int:
+    """用 ``steamRefresh_steam`` 手动续期统计 Cookie。
+
+    读取 Cookie 文件（或 sidecar）中的长期刷新令牌，换取新的 store 访问令牌，
+    原子改写 Cookie 文件并更新 sidecar；成功后可选校验并打印 JSON 摘要。
+    输出绝不包含 Cookie / 令牌内容。
+    """
+    cfg = _load_config(Path(args.config))
+    cfg_dir = Path(args.config).resolve().parent
+    stats_cookie, _boost_cookie = _resolve_cookie_paths(cfg, cfg_dir)
+    if args.cookie_file:
+        cookie_file = _resolve_path(cfg_dir, args.cookie_file)
+    elif stats_cookie:
+        cookie_file = stats_cookie
+    else:
+        cookie_file = str(cfg_dir / "cookie.txt")
+    clan_id = str(cfg.get("clan_id") or "").strip()
+    proxy = cfg.get("proxy") or None
+    redir = STATS_URL.format(clan_id=clan_id or "0")
+    min_interval = _number(
+        cfg.get("cookie_refresh_min_interval_hours", 6), 6.0
+    )
+    try:
+        outcome = refresh_cookie_file(
+            cookie_file,
+            redir=redir,
+            timeout=args.timeout,
+            proxy=proxy,
+            force=args.force,
+            min_interval_hours=min_interval,
+        )
+    except RefreshError as exc:
+        print(
+            json.dumps(
+                {
+                    "mode": "refresh",
+                    "cookie_file": cookie_file,
+                    "clan_id": clan_id,
+                    "refreshed": False,
+                    "valid": False,
+                    "reason": str(exc),
+                    "skip_reason": "",
+                    "expires_at": "",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        _print_error(str(exc))
+        _print_error(
+            "提示: 运行 `python curator_views/cli.py login --config "
+            f"{args.config}` 重新登录后再试。"
+        )
+        return 1
+
+    cookie = read_cookie_file(cookie_file)
+    valid: Optional[bool]
+    if clan_id:
+        check = validate_cookie(cookie, clan_id, proxy=proxy)
+        valid = check.valid
+        reason = check.reason
+    else:
+        valid = None
+        reason = "未配置 clan_id，跳过有效性校验"
+
+    expires_ts = cookie_expires_at(cookie)
+    expires_at = (
+        datetime.fromtimestamp(expires_ts, tz=_TZ).isoformat()
+        if expires_ts > 0
+        else ""
+    )
+    summary = {
+        "mode": "refresh",
+        "cookie_file": cookie_file,
+        "clan_id": clan_id,
+        "refreshed": bool(outcome.refreshed),
+        "valid": valid,
+        "reason": reason,
+        "skip_reason": "" if outcome.refreshed else outcome.reason,
+        "expires_at": expires_at,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 1 if valid is False else 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -1920,6 +2150,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_login.add_argument("--cookie-file", default=None,
                          help="写入的 Cookie 文件路径（默认取配置 cookie_file）")
     p_login.set_defaults(func=cmd_login)
+
+    p_refresh = sub.add_parser(
+        "refresh-cookie", help="用 steamRefresh_steam 手动续期统计 Cookie"
+    )
+    p_refresh.add_argument("--config", default="config.yaml",
+                           help="配置文件路径（默认 config.yaml）")
+    p_refresh.add_argument("--cookie-file", default=None,
+                           help="要续期的 Cookie 文件路径（默认取配置 cookie_file）")
+    p_refresh.add_argument("--force", action="store_true",
+                           help="忽略最小续期间隔，立即续期")
+    p_refresh.add_argument("--timeout", type=float, default=20.0,
+                           help="单次 HTTP 请求超时秒数（默认 20）")
+    p_refresh.set_defaults(func=cmd_refresh_cookie)
 
     p_export = sub.add_parser("export", help="导出每日统计数据")
     p_export.add_argument("--config", default="config.yaml", help="配置文件路径（默认 config.yaml）")

@@ -10,6 +10,8 @@ venv/
 cookie.txt
 # 浏览器登录态配置目录，含登录 Cookie
 .steam_profile/
+# 自动续期 sidecar（含 steamRefresh_steam 刷新令牌，属登录凭据）
+*.session.json
 
 # 数据库与运行时产物
 *.db

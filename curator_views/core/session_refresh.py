@@ -197,6 +197,20 @@ def _split_login_value(value: str) -> Tuple[str, str]:
     return "", text
 
 
+def split_refresh_cookie(value: str) -> Tuple[str, str]:
+    """把 steamRefresh_steam 值拆成 (steamid, 原始 JWT)；无分隔符时 steamid 为空。
+
+    Args:
+        value: ``steamRefresh_steam`` 的值（可为 URL 编码的
+            ``<steamid>%7C%7C<jwt>``）。
+
+    Returns:
+        ``(steamid, jwt)``；缺少分隔符时第一项为空串。委托
+        :func:`_split_login_value` 完成 URL 解码与分割。
+    """
+    return _split_login_value(value)
+
+
 def jwt_expires_at(token: str) -> int:
     """读取 JWT 载荷中的 ``exp``。
 

@@ -186,6 +186,24 @@ class TestCookieHeaderHelpers:
         assert sr.extract_refresh_cookie("") == ""
 
 
+class TestSplitRefreshCookie:
+    def test_split_encoded_value(self) -> None:
+        """URL 编码的 <steamid>%7C%7C<jwt> 拆成 steamid 与 JWT。"""
+        assert sr.split_refresh_cookie("76561198000000000%7C%7Cjwt-token") == (
+            "76561198000000000",
+            "jwt-token",
+        )
+
+    def test_split_raw_separator(self) -> None:
+        """未编码的 || 同样可以拆分。"""
+        assert sr.split_refresh_cookie("123||raw-jwt") == ("123", "raw-jwt")
+
+    def test_split_without_separator_returns_empty_steamid(self) -> None:
+        """没有分隔符时整段当作 JWT，steamid 为空串。"""
+        assert sr.split_refresh_cookie("jwt-only") == ("", "jwt-only")
+        assert sr.split_refresh_cookie("") == ("", "")
+
+
 class TestJwtExpiry:
     def test_jwt_expires_at_handcrafted_token(self) -> None:
         """可解析无签名 JWT 的 exp。"""
