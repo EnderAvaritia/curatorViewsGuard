@@ -134,15 +134,21 @@ def _target_multiplier(
 def _normalize_target_bounds(
     target_min: float = 0.0, target_max: float = 0.0
 ) -> tuple[float, float]:
-    """归一化目标上下界：负数按 0（不设界）处理，min > max 时交换并告警。"""
+    """归一化目标上下界：负数按 0（不设界）处理；min > max 视为配置错误。
+
+    ``target_min`` / ``target_max`` 是当日总量的硬边界，倒置意味着配置笔误
+    （例如把上限 5000 写进了 target_min），绝不能静默调换——调换会把上限
+    变成下限，实际总量可能翻倍。因此同时 > 0 且倒置时直接抛出 ``ValueError``，
+    由调用方拒绝执行。
+    """
     low = max(0.0, float(target_min or 0))
     high = max(0.0, float(target_max or 0))
     if low > 0 and high > 0 and low > high:
-        logger.warning(
-            "target_min (%g) 大于 target_max (%g)，已按交换后的 [%g, %g] 夹取。",
-            low, high, high, low,
+        raise ValueError(
+            f"配置错误: target_min ({low:g}) 大于 target_max ({high:g})；"
+            "target_min/target_max 是当日总量的硬边界，请修正配置后重试"
+            "（要求 target_min <= target_max）。"
         )
-        low, high = high, low
     return low, high
 
 
@@ -277,8 +283,8 @@ def _clamp_target(
     - ``target_min`` > 0 且目标低于下限时抬到下限（托底，防目标一路下滑）；
     - ``target_max`` > 0 且目标高于上限时压到上限（封顶，防 growth 无限上涨）；
     - 两者都为 0 时不设界，原样返回；
-    - 两者都 > 0 且 ``target_min > target_max`` 时视为配置笔误，记录警告并
-      交换后再夹取，避免目标被夹成矛盾值。
+    - 两者都 > 0 且 ``target_min > target_max`` 属于配置错误，由
+      ``_normalize_target_bounds`` 抛出 ``ValueError``，不会静默夹成矛盾值。
 
     Returns:
         ``(夹取后的目标, 命中的边界)``，边界为 ``"min"`` / ``"max"`` / ``""``。
@@ -721,6 +727,15 @@ boost_mode / growth_factor / growth_rate：
         属于配置/IO 错误，即使开启该开关也不回退，仍按 0 处理并标记 warning，
         避免掩盖配置问题。
     """
+    # ── 硬边界校验：必须最先执行 ─────────────────────────────────────────
+    # 配置倒置时立即失败，确保不会抓取统计、写库（daily_stats / daily_plan /
+    # 抖动状态）、消费刷量列表或发起任何提升请求。
+    target_min = float(config.get("target_min", 0) or 0)
+    target_max = float(config.get("target_max", 0) or 0)
+    target_floor, target_ceiling = _normalize_target_bounds(
+        target_min, target_max
+    )
+
     # ── 读取配置（带默认值）──────────────────────────────────────────────
     window_days = int(config.get("window_days", 14))
     trend_cap = float(config.get("trend_cap", 0.15))
@@ -734,11 +749,6 @@ boost_mode / growth_factor / growth_rate：
     boost_mode = str(config.get("boost_mode", "stable")).lower()
     growth_factor = float(config.get("growth_factor", 1.0) or 1.0)
     growth_rate = float(config.get("growth_rate", 0) or 0)
-    target_min = float(config.get("target_min", 0) or 0)
-    target_max = float(config.get("target_max", 0) or 0)
-    target_floor, target_ceiling = _normalize_target_bounds(
-        target_min, target_max
-    )
     volatility = float(config.get("volatility", 0) or 0)
     volatility_min = float(config.get("volatility_min", 0) or 0)
     target_volatility = float(config.get("target_volatility", 0) or 0)

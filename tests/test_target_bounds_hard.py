@@ -9,9 +9,14 @@ import logging
 import random
 from unittest.mock import patch
 
+import pytest
+
 from curator_views import cli
 from curator_views.core.forecast import forecast_days
-from curator_views.core.scheduler import _bound_boost
+from curator_views.core.scheduler import (
+    _bound_boost,
+    _normalize_target_bounds,
+)
 from tests.test_daily_plan import make_plan
 from tests.test_forecast import (
     START_TS,
@@ -62,6 +67,21 @@ class TestBoundBoostHelper:
             need, hit = _bound_boost(5000, 100, 5000, 1500)
         assert (need, hit) == (1400, "max")
         assert any("配置矛盾" in item.message for item in caplog.records)
+
+
+class TestNormalizeTargetBounds:
+    def test_inverted_bounds_raise(self):
+        with pytest.raises(ValueError, match="target_min"):
+            _normalize_target_bounds(20000, 5000)
+
+    def test_zero_means_unbounded(self):
+        assert _normalize_target_bounds(0, 0) == (0.0, 0.0)
+
+    def test_equal_bounds_are_valid_single_point_window(self):
+        assert _normalize_target_bounds(5000, 5000) == (5000.0, 5000.0)
+
+    def test_negatives_clamp_to_zero(self):
+        assert _normalize_target_bounds(-100, -5) == (0.0, 0.0)
 
 
 # ── run_daily ────────────────────────────────────────────────────────────
@@ -258,6 +278,98 @@ class TestRunDailyHardBounds:
 
 
 # ── forecast ─────────────────────────────────────────────────────────────
+
+
+class TestForecastInvertedBounds:
+    def test_forecast_days_raises_for_inverted_bounds(self):
+        config = forecast_config(
+            baseline_views=1000.0, target_min=20000, target_max=5000
+        )
+        with pytest.raises(ValueError, match="target_min"):
+            forecast_days(
+                make_history(views=1000),
+                config,
+                START_TS,
+                days=3,
+                first_natural=1000,
+            )
+
+
+# ── CLI 命令拒绝倒置配置 ─────────────────────────────────────────────────
+
+
+class TestCommandsRejectInvertedBounds:
+    def _write(self, tmp_path, text):
+        path = tmp_path / "config.yaml"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_run_fails_before_requiring_clan_id(self, tmp_path, capsys):
+        # 缺少 clan_id 也不能掩盖倒置错误：校验必须先于 _build_runtime。
+        config_path = self._write(
+            tmp_path,
+            'target_min: 20000\ntarget_max: 5000\ndb_path: "views.db"\n',
+        )
+        code = cli.main(["run", "--config", str(config_path), "--dry-run"])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "target_min (20000) 大于 target_max (5000)" in captured.err
+        assert "缺少必填项" not in captured.err
+        assert "Traceback" not in captured.err
+        assert not (tmp_path / "views.db").exists()
+
+    def test_forecast_rejects_file_bounds_without_json(self, tmp_path, capsys):
+        config_path = self._write(
+            tmp_path,
+            'target_min: 20000\ntarget_max: 5000\ndb_path: "views.db"\n',
+        )
+        code = cli.main(
+            ["forecast", "--config", str(config_path), "--days", "1", "--json"]
+        )
+        captured = capsys.readouterr()
+        assert code == 1
+        assert captured.out == ""
+        assert "target_min (20000) 大于 target_max (5000)" in captured.err
+
+    def test_forecast_rejects_inverted_set_overrides(self, tmp_path, capsys):
+        # 配置文件本身合法，--set 的 what-if 值同样必须校验。
+        config_path = self._write(
+            tmp_path,
+            'clan_id: "45519015"\ntarget_min: 0\ntarget_max: 0\n'
+            'db_path: "views.db"\n',
+        )
+        code = cli.main(
+            [
+                "forecast",
+                "--config",
+                str(config_path),
+                "--set",
+                "target_min=20000",
+                "--set",
+                "target_max=5000",
+                "--json",
+            ]
+        )
+        captured = capsys.readouterr()
+        assert code == 1
+        assert captured.out == ""
+        assert "target_min (20000) 大于 target_max (5000)" in captured.err
+
+    def test_daemon_returns_1_at_startup(self, tmp_path, capsys, monkeypatch):
+        config_path = self._write(
+            tmp_path,
+            'target_min: 20000\ntarget_max: 5000\ndb_path: "views.db"\n',
+        )
+
+        def _fail(self):
+            pytest.fail("倒置配置不应进入 daemon 循环")
+
+        monkeypatch.setattr(cli.Daemon, "run_forever", _fail)
+        code = cli.main(["daemon", "--config", str(config_path)])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "target_min (20000) 大于 target_max (5000)" in captured.err
+        assert "Traceback" not in captured.err
 
 
 class TestForecastHardBounds:

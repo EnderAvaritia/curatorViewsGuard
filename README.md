@@ -42,6 +42,7 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 - **目标有安全边界**：`target_min` / `target_max` 是每日总量的绝对硬边界
   （自然流量 + 刷量），抖动、刷量列表与手动 `boost` 都不得突破上限；`0` 表示
   该方向不设界，run / daemon 实际执行与 forecast 预览都使用同一口径。
+  `target_min > target_max` 属于配置错误，三个命令会拒绝执行。
 - **配置可预测**：正式执行前可用 `forecast` 只读推算今天/明天起 N 天的目标与缺口，
   判断配置会不会空转或超载；`--chart` 可直接在控制台输出点状字符折线图
   （目标/自然流量/配额/待刷），`--chart PATH` 还可写自包含 HTML 用浏览器查看。
@@ -231,6 +232,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
   恢复期、`boost_enabled: false`、列表为空/0 等不刷状态不会被强行补量。
   `run` / `daemon` 实际执行与 `forecast` 预览使用同一口径；下限同时抬高短期与
   长期反作弊参照，避免把自己托底刷出来的量误判为恶意刷量。
+- 两者都 > 0 且 `target_min > target_max` 属于配置错误：`run` / `daemon` /
+  `forecast` 会以退出码 1 拒绝执行，不会刷量、不写库；旧版本会静默交换，已移除。
 - 下限约束的是“决定下发的刷量”，不是平台最终送达量：提升失败、被容量/吞吐
   或 `target_ratio` 截断时，实际总量仍可能低于下限。
 
@@ -787,6 +790,10 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
   下限会同步抬高短期与长期检测参照，托底刷量不会被判成恶意刷量。注意下限约束
   的是“决定下发的刷量”，提升失败或被容量/吞吐/`target_ratio` 截断时，实际
   总量仍可能低于下限。
+- `target_min > target_max`（两者都 > 0）属于配置错误：`run` / `daemon` /
+  `forecast` 会以退出码 1 拒绝执行，不抓取、不写 `daily_stats` / `daily_plan`、
+  不消费刷量列表、不发提升请求（旧版本会静默交换，已移除）。`target_min` 与
+  `target_max` 相等是合法的单点窗口。
 - `volatility` 作用于缺口（当日配额），`target_volatility` 作用于今日目标；
   两者抖动值按日期持久化，同一天重跑/多时段复用。带 `*_min` 时幅度在
   `[min, max]` 内均匀取值、方向随机，避免曲线过于平缓。两者都没有硬性上限，
@@ -1861,6 +1868,27 @@ Steam 后台的“一天”不是按本地 0 点切分，而是通常在北京�
 一般**不要改**；只有当你实测 Steam 的统计切换时刻不是 08:00 时，才改成对应
 的 `HH:MM`（例如 `"07:00"`）。填 `"00:00"` 会恢复按自然日切分的旧口径。
 `info --json` 输出里的 `config.day_boundary` 可确认当前值。
+
+### 12.14 target_min 大于 target_max 会怎样
+
+症状：配置写成了 `target_min: 20000`、`target_max: 5000`（上下界倒置），
+`run` / `daemon` / `forecast` 启动后直接报错并以退出码 1 结束，不刷量也不写库，
+错误信息类似：
+
+```text
+错误: 配置错误: target_min (20000) 大于 target_max (5000)；target_min/target_max 是当日总量的硬边界，请修正配置后重试（要求 target_min <= target_max）。
+```
+
+这两个键是当日总量的绝对硬边界，倒置说明把上限误写进了下限。旧版本会把它
+静默交换成 `[5000, 20000]`，导致本意是上限的 5,000 反而变成托底下限、实际提升
+天花板变成 20,000 − 自然流量；现在改为直接拒绝执行：不抓取统计、不写
+`daily_stats` / `daily_plan`、不消费 `boost_list_file` 行、不发送任何提升请求。
+`daemon` 热加载到倒置配置时同样会在该时段失败（记录 `last_error`，不标记时段
+完成），修正配置后下一轮自动恢复。
+
+修正方式：确保 `target_min <= target_max`（两者相等表示单点窗口，合法）。
+`0` 仍然表示该方向不设界；负数按 0 处理。`forecast --set target_min=...`
+的 what-if 覆盖值也会做同样校验。
 
 ---
 

@@ -109,6 +109,7 @@ from curator_views.core.scheduler import (  # noqa: E402
     _daily_throughput_capacity,
     _date_to_epoch,
     _effective_threads,
+    _normalize_target_bounds,
     _today_epoch,
     run_daily,
 )
@@ -311,6 +312,8 @@ growth_rate: 0.0
 # 两者都为 0 时不设界（默认）。下限约束的是“决定下发的刷量”，不是平台最终
 # 实际送达量：提升失败、容量/吞吐或 target_ratio 截断时，总量仍可能低于下限。
 # run / daemon 实际执行与 forecast 预览使用同一口径。
+# 注意：target_min 必须 <= target_max；倒置属于配置错误，run / daemon /
+# forecast 会直接拒绝执行（退出码 1），不会刷量也不写库。
 # 白话：想给每天刷到的浏览量封顶就填 target_max；怕一路跌就填 target_min
 # 托底；填 0 表示不管。
 target_min: 0
@@ -417,6 +420,22 @@ def _with_defaults(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def _print_error(message: str) -> None:
     """向 stderr 打印错误信息。"""
     print(f"错误: {message}", file=sys.stderr)
+
+
+def _check_target_bounds(cfg: Dict[str, Any]) -> Optional[str]:
+    """校验 target_min <= target_max；返回错误信息，None 表示通过。
+
+    ``target_min`` / ``target_max`` 是当日总量的硬边界，倒置属于配置错误，
+    必须拒绝执行而不是静默调换。三个命令共用本函数，保证提示口径一致。
+    """
+    try:
+        _normalize_target_bounds(
+            float(cfg.get("target_min", 0) or 0),
+            float(cfg.get("target_max", 0) or 0),
+        )
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -901,10 +920,17 @@ def _setup_logging(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    # 硬边界校验必须在 _build_runtime 之前：缺少 clan_id 也不能掩盖倒置错误。
+    cfg = _load_config(config_path)
+    bounds_error = _check_target_bounds(cfg)
+    if bounds_error:
+        _print_error(bounds_error)
+        return 1
     (
         cfg, _cfg_dir, _clan_id, _cookie_file,
         _boost_cookie_file, db_path, _proxy,
-    ) = _build_runtime(Path(args.config))
+    ) = _build_runtime(config_path)
     _setup_logging(Path(args.config), db_path)
 
     # --no-boost 关闭提升；--boost 强制开启；两者都不传时以配置为准
@@ -931,6 +957,11 @@ def cmd_daemon(args: argparse.Namespace) -> int:
     """
     config_path = Path(args.config)
     cfg = _load_config(config_path)
+    # 启动即校验硬边界，避免进入循环后才发现配置错误。
+    bounds_error = _check_target_bounds(cfg)
+    if bounds_error:
+        _print_error(bounds_error)
+        return 1
     cfg_dir = config_path.resolve().parent
     db_path = _resolve_path(cfg_dir, str(cfg.get("db_path", "views.db")))
     log_path = _setup_logging(config_path, db_path, console=True)
@@ -1942,6 +1973,12 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     cfg = _load_config(config_path)
     cfg_dir = config_path.resolve().parent
     _apply_overrides(cfg, getattr(args, "set", None) or [])
+
+    # --set 覆盖后同样校验硬边界，倒置时拒绝执行且不输出任何部分 JSON。
+    bounds_error = _check_target_bounds(cfg)
+    if bounds_error:
+        _print_error(bounds_error)
+        return 1
 
     sched_cfg = _scheduler_config(
         cfg, bool(cfg.get("boost_enabled", True)), True, cfg_dir

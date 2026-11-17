@@ -1251,18 +1251,24 @@ class TestTargetBounds:
         assert summary["target_bound"] == ""
         assert summary["need"] == 1900
 
-    def test_swapped_bounds_are_normalized(self):
-        # min 900 > max 600（笔误）→ 交换为 [600, 900]，目标 1000 压到 900
-        summary = run_with(
-            make_stats([100] * 30),
-            program_start_str(),
-            FakeBooster(),
-            baseline_views=1000,
-            target_min=900,
-            target_max=600,
-        )
-        assert summary["today_expected"] == 900
-        assert summary["target_bound"] == "max"
+    def test_inverted_bounds_raise_error(self):
+        # min 900 > max 600（笔误）→ 硬配置错误：拒绝执行，且不刷、不写、不落抖动
+        storage = FakeStorage(program_start_str())
+        booster = FakeBooster()
+        with pytest.raises(ValueError, match="target_min"):
+            run_with(
+                make_stats([100] * 30),
+                program_start_str(),
+                booster,
+                storage=storage,
+                target_min=900,
+                target_max=600,
+            )
+        assert booster.calls == []
+        assert storage.written_stats == []
+        assert storage.daily_plans == {}
+        assert storage.saved == {}
+        assert storage.load_state("daily_jitter") == ""
 
     def test_lower_bound_raises_long_baseline(self):
         # 历史低位 100、最近 5 天已被托底到 1000；长期基线若仍取 100，
