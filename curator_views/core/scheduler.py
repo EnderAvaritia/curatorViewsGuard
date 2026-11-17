@@ -145,7 +145,7 @@ def _normalize_target_bounds(
     high = max(0.0, float(target_max or 0))
     if low > 0 and high > 0 and low > high:
         raise ValueError(
-            f"配置错误: target_min ({low:g}) 大于 target_max ({high:g})；"
+            f"target_min ({low:g}) 大于 target_max ({high:g})；"
             "target_min/target_max 是当日总量的硬边界，请修正配置后重试"
             "（要求 target_min <= target_max）。"
         )

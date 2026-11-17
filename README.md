@@ -1876,7 +1876,7 @@ Steam 后台的“一天”不是按本地 0 点切分，而是通常在北京�
 错误信息类似：
 
 ```text
-错误: 配置错误: target_min (20000) 大于 target_max (5000)；target_min/target_max 是当日总量的硬边界，请修正配置后重试（要求 target_min <= target_max）。
+错误: target_min (20000) 大于 target_max (5000)；target_min/target_max 是当日总量的硬边界，请修正配置后重试（要求 target_min <= target_max）。
 ```
 
 这两个键是当日总量的绝对硬边界，倒置说明把上限误写进了下限。旧版本会把它

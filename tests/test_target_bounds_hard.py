@@ -314,6 +314,8 @@ class TestCommandsRejectInvertedBounds:
         captured = capsys.readouterr()
         assert code == 1
         assert "target_min (20000) 大于 target_max (5000)" in captured.err
+        # 不要出现「错误: 配置错误:」这种重复前缀
+        assert "错误: 配置错误" not in captured.err
         assert "缺少必填项" not in captured.err
         assert "Traceback" not in captured.err
         assert not (tmp_path / "views.db").exists()
