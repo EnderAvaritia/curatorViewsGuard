@@ -287,6 +287,44 @@ def jwt_expires_at(token: str) -> int:
         return 0
 
 
+def cookie_token_ip(
+    header: str, name: str = STORE_COOKIE_NAME
+) -> str:
+    """读取 Cookie 头中登录令牌绑定的出口 IP（JWT 载荷的 ``ip_subject``）。
+
+    Steam 的 ``steamLoginSecure`` 与登录时的出口 IP 绑定；换一个出口 IP
+    访问后台会被重定向到公开页。该函数只用于排障提示，解析失败返回空串，
+    绝不抛出异常。
+
+    Args:
+        header: Cookie 头文本（可含 ``Cookie:`` 前缀）。
+        name: Cookie 名称，默认 ``steamLoginSecure``。
+
+    Returns:
+        登录令牌绑定的出口 IP；Cookie 缺失或载荷无该字段时返回空串。
+    """
+    if not header:
+        return ""
+    try:
+        normalized = fetcher.extract_cookie(header)
+        value = parse_cookie_header(normalized).get(name, "")
+        if not value:
+            return ""
+        _, jwt = _split_login_value(value)
+        parts = jwt.split(".")
+        if len(parts) < 2 or not parts[1]:
+            return ""
+        payload = parts[1].strip()
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+        if not isinstance(data, dict):
+            return ""
+        return str(data.get("ip_subject") or "").strip()
+    except Exception:  # noqa: BLE001 - 排障提示不允许影响主流程
+        return ""
+
+
 def cookie_expires_at(header: str, name: str = STORE_COOKIE_NAME) -> int:
     """读取 Cookie 头中指定 Cookie 的 JWT 过期时间。
 

@@ -97,6 +97,7 @@ from curator_views.core.session_refresh import (  # noqa: E402
     RefreshError,
     RefreshOutcome,
     cookie_expires_at,
+    cookie_token_ip,
     extract_refresh_cookie,
     load_cookie_state,
     refresh_cookie_file,
@@ -1360,6 +1361,34 @@ def cmd_boost(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cookie_redirect_hint(cookie: str, reason: str) -> str:
+    """为“被重定向到公开页”的校验失败生成出口 IP 排查提示。
+
+    Steam 的 ``steamLoginSecure`` 与登录时的出口 IP 绑定。Chromium 会自动
+    使用系统代理，而程序只使用配置里的 ``proxy``；两者出口 IP 不一致时，
+    校验和后续抓取都会被重定向。提示里会带上令牌绑定的出口 IP 便于核对。
+
+    Args:
+        cookie: 刚导出的 Cookie 字符串。
+        reason: ``validate_cookie`` 返回的失败原因。
+
+    Returns:
+        提示文本；原因与重定向无关时返回空串。
+    """
+    if "重定向" not in reason:
+        return ""
+    token_ip = cookie_token_ip(cookie)
+    hint = (
+        "提示: Steam 登录令牌与出口 IP 绑定。Chromium 会自动使用系统代理，"
+        "而程序只使用配置里的 proxy；两者出口 IP 不一致时后台会重定向到"
+        "公开页。若浏览器走代理，请在配置文件中填写相同的 proxy（如 "
+        "http://127.0.0.1:10279）后重试。"
+    )
+    if token_ip:
+        hint += f" 本次令牌绑定的出口 IP: {token_ip}。"
+    return hint
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     """半自动登录 Steam 并生成/校验 Cookie 文件。
 
@@ -1434,6 +1463,9 @@ def cmd_login(args: argparse.Namespace) -> int:
         reason = result.reason
         if not result.valid:
             _print_error(f"登录得到的 Cookie 校验失败：{result.reason}")
+            hint = _cookie_redirect_hint(cookie, result.reason)
+            if hint:
+                _print_error(hint)
             _print_error("已放弃写入，避免覆盖原有 Cookie 文件。")
             return 1
 

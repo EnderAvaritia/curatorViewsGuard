@@ -218,6 +218,27 @@ class TestSplitRefreshCookie:
         assert sr.split_refresh_cookie("") == ("", "")
 
 
+class TestCookieTokenIp:
+    def _jwt_with_ip(self, ip: str) -> str:
+        header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"ip_subject": ip}, separators=(",", ":")).encode()
+        ).rstrip(b"=").decode()
+        return f"{header}.{payload}."
+
+    def test_reads_ip_subject_from_store_cookie(self) -> None:
+        """从 steamLoginSecure 的 JWT 载荷读取 ip_subject。"""
+        jwt = self._jwt_with_ip("18.181.147.10")
+        header = f"{sr.STORE_COOKIE_NAME}={login_value('76561198000000000', jwt)}"
+        assert sr.cookie_token_ip(header) == "18.181.147.10"
+
+    def test_missing_or_garbage_returns_empty(self) -> None:
+        """缺 Cookie 或载荷无该字段时返回空串，不抛异常。"""
+        assert sr.cookie_token_ip("") == ""
+        assert sr.cookie_token_ip("a=1") == ""
+        assert sr.cookie_token_ip(f"{sr.STORE_COOKIE_NAME}=a.b.c") == ""
+
+
 class TestJwtExpiry:
     def test_jwt_expires_at_handcrafted_token(self) -> None:
         """可解析无签名 JWT 的 exp。"""

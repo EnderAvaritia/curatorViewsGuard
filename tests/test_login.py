@@ -503,6 +503,58 @@ def test_cmd_login_removes_stale_sidecar_without_refresh(
     assert not sidecar.exists()
 
 
+def test_cmd_login_prints_proxy_ip_hint_on_redirect(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """校验被重定向时提示出口 IP 不一致，并明确不覆盖 Cookie 文件。"""
+    import base64
+    import json
+
+    from curator_views import cli
+    from curator_views.core.login import CookieCheckResult
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'clan_id: "45519015"\n'
+        'cookie_file: "cookie.txt"\n'
+        'ntfy_url: ""\n'
+        'ntfy_topic: ""\n',
+        encoding="utf-8",
+    )
+    cookie_path = tmp_path / "cookie.txt"
+    cookie_path.write_text("old=1\n", encoding="utf-8")
+
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"ip_subject": "18.181.147.10"}).encode()
+    ).rstrip(b"=").decode()
+    jwt = f"{header}.{payload}."
+    exported = (
+        "steamLoginSecure=76561198836530221%7C%7C" + jwt + "; sessionid=s1"
+    )
+
+    monkeypatch.setattr(cli, "login_via_browser", lambda *a, **k: exported)
+    monkeypatch.setattr(
+        cli,
+        "validate_cookie",
+        lambda *a, **k: CookieCheckResult(
+            False,
+            "请求被重定向到公开页面（Cookie 可能已失效或未登录）",
+            200,
+            "https://store.steampowered.com/curator/45519015-x/",
+        ),
+    )
+
+    code = cli.main(["login", "--config", str(config_path)])
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "出口 IP" in err
+    assert "18.181.147.10" in err
+    assert "proxy" in err
+    assert cookie_path.read_text(encoding="utf-8").strip() == "old=1"
+
+
 def test_build_parser_registers_login() -> None:
     """login 子命令已注册，默认值与 --validate-only 解析正确。"""
     from curator_views import cli

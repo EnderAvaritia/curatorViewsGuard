@@ -1718,6 +1718,22 @@ CLI 只警告不退出。统计后台通常需要登录，因此 `run` / `check`
 症状：`admin/overview` 被重定向到公开 curator 页，fetcher 提示
 “统计页被重定向到公开页面（Cookie 已失效或未登录）”，或返回 HTTP 401/403。
 
+**先排查出口 IP 不一致**（最常见的“刚登录就校验失败”）：
+
+Steam 的 `steamLoginSecure` JWT 里带有 `ip_subject` / `ip_confirmer`，令牌与
+登录时的出口 IP 绑定。`login` 打开的 Chromium **会自动使用系统代理**，而
+`requests`（校验、`check`、`run`、`forecast --fetch`）只使用配置里的 `proxy`。
+浏览器走代理（例如 Clash `127.0.0.1:10279`）而 `proxy` 留空时，两者出口 IP
+不同，Steam 会把后台重定向到公开页，表现为“Cookie 校验失败”。
+
+判断方法：登录失败提示里会带 `本次令牌绑定的出口 IP: x.x.x.x`；对比程序实际
+出口 IP（例如 `curl -x http://127.0.0.1:10279 https://api.ipify.org`）即可确认。
+修复：把配置里的 `proxy` 写成与浏览器系统代理**完全相同**的地址后重新登录：
+
+```yaml
+proxy: "http://127.0.0.1:10279"
+```
+
 `daemon` 的处理方式：
 
 - 把这类错误与普通网络/解析错误区分开（`StatsAuthError`），**不把当天标记为已完成**；
@@ -2090,7 +2106,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **515** 个，覆盖：
+当前测试共 **518** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
