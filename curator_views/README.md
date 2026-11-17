@@ -341,8 +341,10 @@ python curator_views/cli.py boost --config config.yaml --target N [--apps M] [--
 
 Steam 登录页有验证码、新设备/异地还要 Steam Guard 手机确认，无法可靠全自动。
 `login` 采用 Playwright 半自动登录：打开真实 Chromium 窗口由你完成登录，脚本
-等待 `steamLoginSecure` 出现后导出 Cookie，并校验有效性，通过才写入 `cookie.txt`
-（校验失败不覆盖原文件）。需额外安装 playwright（可选）：
+等待 **store 作用域**（`store.steampowered.com` 域）的 `steamLoginSecure` 出现后
+导出 Cookie；只有社区 / 登录域的令牌不算成功，若检测到这类登录态会先打开商店
+首页触发令牌交换。导出后校验有效性，通过才写入 `cookie.txt`（校验失败不覆盖
+原文件）。需额外安装 playwright（可选）：
 
 ```bash
 pip install playwright

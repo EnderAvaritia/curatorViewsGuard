@@ -1281,7 +1281,9 @@ python curator_views/cli.py login --config config.yaml \
 
 Steam 登录页有图形验证码，新设备/异地登录还可能需要 Steam Guard 手机确认，
 无法可靠全自动。`login` 使用 Playwright 打开真实 Chromium 窗口，由你完成登录，
-脚本轮询等待 `steamLoginSecure` Cookie 出现，导出 `steampowered.com` 域下的
+脚本轮询等待 **store 作用域**（`store.steampowered.com` 域）的 `steamLoginSecure`
+Cookie 出现；仅社区 / 登录域的令牌不足以访问鉴赏家后台，检测到这类登录态时
+会自动打开商店首页触发令牌交换。拿到 store 令牌后导出 `steampowered.com` 域下的
 Cookie，再用鉴赏家后台页面校验；校验通过才原子写入目标文件。
 
 参数：
@@ -2088,7 +2090,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **503** 个，覆盖：
+当前测试共 **515** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；

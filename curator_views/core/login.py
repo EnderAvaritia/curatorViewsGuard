@@ -18,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -30,6 +31,9 @@ from curator_views.core.fetcher import (
 
 # Steam 登录页地址
 LOGIN_URL = "https://store.steampowered.com/login/"
+# 商店首页：已有登录态但 store 域名尚未拿到令牌时，用它触发 Steam 的
+# finalizelogin -> settoken 令牌交换。
+STORE_HOME_URL = "https://store.steampowered.com/"
 
 # Playwright 持久化浏览器用户目录（相对配置文件目录），保存登录态
 DEFAULT_PROFILE_DIR = ".steam_profile"
@@ -38,6 +42,32 @@ DEFAULT_PROFILE_DIR = ".steam_profile"
 _LOGIN_COOKIE_NAME = "steamLoginSecure"
 # 长期刷新令牌 Cookie 名称（登录完成后由 Steam 延迟下发）
 _REFRESH_COOKIE_NAME = "steamRefresh_steam"
+# 鉴赏家后台需要的访问令牌所属域（store 作用域，login/community 的值不可用）
+_STORE_DOMAIN_HINT = "store.steampowered.com"
+
+
+def _has_store_login(cookies: Iterable[Dict[str, Any]]) -> bool:
+    """判断 Cookie 列表中是否已有 store 作用域的登录令牌。
+
+    仅凭 ``steamLoginSecure`` 出现不足以判定成功：社区登录会先下发
+    ``steamcommunity.com`` / ``login.steampowered.com`` 域的令牌，而鉴赏家
+    后台 ``curator/{id}/admin/*`` 只认 ``store.steampowered.com`` 域的值。
+    导出前者会导致后台被重定向到公开页。
+    """
+    return any(
+        item.get("name") == _LOGIN_COOKIE_NAME
+        and item.get("value")
+        and _STORE_DOMAIN_HINT in str(item.get("domain") or "")
+        for item in cookies
+    )
+
+
+def _has_any_login(cookies: Iterable[Dict[str, Any]]) -> bool:
+    """判断 Cookie 列表中是否出现任意域的 ``steamLoginSecure``。"""
+    return any(
+        item.get("name") == _LOGIN_COOKIE_NAME and item.get("value")
+        for item in cookies
+    )
 
 
 def build_cookie_string(cookies: Iterable[Dict[str, Any]]) -> str:
@@ -169,7 +199,10 @@ def validate_cookie(
     final_url = response.url
     if status != 200:
         return CookieCheckResult(False, f"HTTP {status}", status, final_url)
-    if final_url != url or "/admin/" not in final_url:
+    # 只允许 admin 页面自身的无害跳转（补斜杠、附加 ?l= 等）；一旦离开
+    # ``/admin/`` 路径即视为被重定向到公开页。不能要求最终 URL 与请求 URL
+    # 完全相等，否则 Steam 追加查询参数时会把有效 Cookie 误判为失效。
+    if "/admin/" not in urlsplit(final_url).path:
         return CookieCheckResult(
             False,
             "请求被重定向到公开页面（Cookie 可能已失效或未登录）",
@@ -192,13 +225,16 @@ def login_via_browser(
     launcher: Optional[Callable[[], Any]] = None,
     refresh_wait_s: float = 10.0,
 ) -> str:
-    """打开 Chromium 由人类完成登录，并导出 Steam 域下的 Cookie。
+    """打开 Chromium 由人类完成登录，并导出 store 作用域的 Cookie。
 
-    使用持久化用户目录复用登录态；轮询直至出现非空的 ``steamLoginSecure``
-    Cookie 或超时。``steamRefresh_steam`` 通常比登录 Cookie 稍晚下发，因此
-    首次看到登录 Cookie 后会在 ``refresh_wait_s``（不超过剩余登录超时）内
-    继续轮询刷新令牌；窗口结束仍未出现时照常导出已有 Cookie。无论成功、
-    超时还是异常，都会关闭浏览器上下文与 Playwright。
+    使用持久化用户目录复用登录态；轮询直至出现 **store.steampowered.com 域**
+    的非空 ``steamLoginSecure`` 或超时。仅出现社区 / 登录域的令牌不算成功：
+    鉴赏家后台只认 store 域的令牌。若检测到其他域的登录态而 store 域令牌尚未
+    下发，会打开商店首页触发 Steam 的 ``finalizelogin`` -> ``settoken`` 交换。
+    ``steamRefresh_steam`` 通常比登录 Cookie 稍晚下发，因此拿到 store 令牌后
+    会在 ``refresh_wait_s``（不超过剩余登录超时）内继续轮询刷新令牌；窗口结束
+    仍未出现时照常导出已有 Cookie。无论成功、超时还是异常，都会关闭浏览器
+    上下文与 Playwright。
 
     Args:
         profile_dir: Chromium 持久化用户目录。
@@ -252,17 +288,25 @@ def login_via_browser(
 
         deadline = time.monotonic() + timeout_s
         cookies: list = []
+        store_home_visited = False
         while True:
             cookies = context.cookies()
-            logged_in = any(
-                item.get("name") == _LOGIN_COOKIE_NAME and item.get("value")
-                for item in cookies
-            )
-            if logged_in:
+            if _has_store_login(cookies):
                 break
+            # 已有任意域登录态、但 store 域令牌还没下发时，打开商店首页触发
+            # Steam 的 finalizelogin -> settoken 交换；只尝试一次。
+            if not store_home_visited and _has_any_login(cookies):
+                store_home_visited = True
+                try:
+                    page.goto(STORE_HOME_URL, wait_until="domcontentloaded")
+                except Exception:  # noqa: BLE001 - 导航失败时继续轮询
+                    pass
             if time.monotonic() >= deadline:
                 raise RuntimeError(
-                    f"登录超时（{timeout_s:.0f} 秒内未检测到登录 Cookie）。"
+                    f"登录超时（{timeout_s:.0f} 秒内未取得 "
+                    "store.steampowered.com 域的 steamLoginSecure）。"
+                    "请确认在浏览器中完成的是 Steam 商店登录，"
+                    "而不是仅登录了社区页面。"
                 )
             time.sleep(poll_interval)
 

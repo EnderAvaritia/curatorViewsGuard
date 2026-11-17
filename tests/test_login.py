@@ -61,10 +61,11 @@ class FakeContext:
     def __init__(self, cookies: list) -> None:
         self._cookies = cookies
         self.pages = []
+        self.page = FakePage()
         self.closed = False
 
     def new_page(self) -> FakePage:
-        return FakePage()
+        return self.page
 
     def cookies(self) -> list:
         return self._cookies
@@ -258,6 +259,21 @@ def test_validate_cookie_redirected(monkeypatch) -> None:
     assert result.final_url != url
 
 
+def test_validate_cookie_accepts_admin_url_with_extra_query(monkeypatch) -> None:
+    """Steam 给 admin 页附加查询参数时仍判定有效（不要求 URL 完全相等）。"""
+    url = login.STATS_URL.format(clan_id="123")
+    patch_session(
+        monkeypatch,
+        FakeResponse(
+            200,
+            url + "/?l=english",
+            'g_StatsAppViews = [{"date":1,"num_views":2}];',
+        ),
+    )
+    result = login.validate_cookie("a=1", "123")
+    assert result.valid is True
+
+
 def test_validate_cookie_http_error(monkeypatch) -> None:
     """HTTP 非 200 时判定无效并带上状态码。"""
     url = login.STATS_URL.format(clan_id="123")
@@ -376,6 +392,72 @@ def test_login_via_browser_exports_without_refresh_after_window() -> None:
     )
 
     assert cookie == "steamLoginSecure=abc"
+    assert context.closed is True
+
+
+def test_login_via_browser_waits_for_store_domain_token() -> None:
+    """仅社区域登录态时先打开商店首页，等 store 域令牌出现后再导出。"""
+    community_only = [
+        {
+            "name": "steamLoginSecure",
+            "value": "community-token",
+            "domain": "steamcommunity.com",
+        },
+        {
+            "name": "steamRefresh_steam",
+            "value": "refresh-token",
+            "domain": "login.steampowered.com",
+        },
+    ]
+    with_store = community_only + [
+        {
+            "name": "steamLoginSecure",
+            "value": "store-token",
+            "domain": "store.steampowered.com",
+        }
+    ]
+    context = SequenceContext([community_only, with_store])
+    playwright = FakePlaywright(context)
+
+    cookie = login.login_via_browser(
+        "profile",
+        timeout_s=5.0,
+        poll_interval=0.0,
+        launcher=lambda: playwright,
+        refresh_wait_s=0.01,
+    )
+
+    assert "steamLoginSecure=store-token" in cookie
+    assert "steamLoginSecure=community-token" not in cookie
+    assert login.STORE_HOME_URL in context.page.goto_urls
+    assert context.closed is True
+
+
+def test_login_via_browser_store_token_never_appears_times_out() -> None:
+    """只有社区域令牌时超时，并提示需要商店登录（不能导出无效 Cookie）。"""
+    community_only = [
+        {
+            "name": "steamLoginSecure",
+            "value": "community-token",
+            "domain": "steamcommunity.com",
+        },
+        {
+            "name": "steamRefresh_steam",
+            "value": "refresh-token",
+            "domain": "login.steampowered.com",
+        },
+    ]
+    context = SequenceContext([community_only])
+    playwright = FakePlaywright(context)
+
+    with pytest.raises(RuntimeError, match="store\\.steampowered\\.com"):
+        login.login_via_browser(
+            "profile",
+            timeout_s=0.05,
+            poll_interval=0.001,
+            launcher=lambda: playwright,
+            refresh_wait_s=0.01,
+        )
     assert context.closed is True
 
 
