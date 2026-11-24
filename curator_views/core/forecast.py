@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from .predictor import predict_expected
 from .scheduler import (
     _TZ,
+    _apply_min_daily_change,
     _bound_boost,
     _ceiling_boost,
     _clamp_target,
@@ -58,6 +59,7 @@ def forecast_days(
     first_day_boosted: int = 0,
     model_volatility: bool = True,
     first_day_plan: Optional[Dict[str, Any]] = None,
+    prev_target: Optional[float] = None,
 ) -> Dict[str, Any]:
     """逐日推算未来 ``days`` 天的目标、假设自然流量与刷量缺口。
 
@@ -86,6 +88,9 @@ def forecast_days(
             ``target`` / 抖动 / 配额 / 恢复期 / 列表状态，不再抽样；签名不一致时
             丢弃并重新抽样（warning ``plan_signature_mismatch``）；``None`` 时
             保持旧行为。未来日始终是独立抽样预测。
+        prev_target: 预测首日「上一逻辑日」的最终目标，用于 ``min_daily_change``。
+            通常由调用方从 ``daily_plan`` 取出上一日定档的 ``target``；``None``
+            时首日不套用最小变动，从第二天起按上一行目标继续约束。
 
     逐日算法（与 ``run_daily`` 一致）：
         - ``base``：``baseline_views > 0`` 时取该固定值，否则取
@@ -145,6 +150,8 @@ def forecast_days(
     )
     volatility = float(config.get("volatility", 0) or 0)
     volatility_min = float(config.get("volatility_min", 0) or 0)
+    # 相邻两天最小变动（比例）：与 run_daily 同一口径，逐行套用到目标上。
+    min_daily_change = abs(float(config.get("min_daily_change", 0) or 0))
     target_jitter_low, target_jitter_high = _jitter_bounds(
         target_volatility, target_volatility_min
     )
@@ -200,6 +207,7 @@ def forecast_days(
         volatility_min,
         target_volatility,
         target_volatility_min,
+        min_daily_change,
     )
     first_date_iso = _iso_date(int(start_ts))
     plan = first_day_plan if isinstance(first_day_plan, dict) else None
@@ -260,6 +268,28 @@ def forecast_days(
             target, target_bound = _clamp_target(
                 jittered_target, target_floor, target_ceiling
             )
+        # 相邻两天最小变动：首日参照上一逻辑日目标（prev_target），之后参照
+        # 上一行最终目标。首日复用定档时不再重复套用（run 写入的 target 已含）。
+        min_change_applied = False
+        if not use_plan and min_daily_change > 0:
+            reference_target = (
+                float(prev_target or 0.0) if index == 0
+                else float(previous_target)
+            )
+            if reference_target > 0:
+                adjusted, min_change_applied = _apply_min_daily_change(
+                    target,
+                    reference_target,
+                    min_daily_change,
+                    direction_hint=base - reference_target,
+                    target_min=target_floor,
+                    target_max=target_ceiling,
+                )
+                if min_change_applied:
+                    target = adjusted
+                    target_bound = _clamp_target(
+                        target, target_floor, target_ceiling
+                    )[1]
         # 目标抖动区间（预览用）：不随本次抽样变化，始终展示可能范围。
         target_low, _ = _clamp_target(
             max(0.0, raw_target * (1.0 - target_jitter_high)),
@@ -386,6 +416,7 @@ def forecast_days(
             "target_high": round(float(target_high), 1),
             "target_jitter": round(float(target_jitter), 6),
             "target_bound": target_bound,
+            "min_change_applied": min_change_applied,
             "assumed_natural": assumed_natural,
             "already_boosted": already_boosted,
             "gross_need": gross_need,
@@ -474,6 +505,7 @@ def forecast_days(
     )
     summary["target_volatility"] = target_volatility
     summary["volatility"] = volatility
+    summary["min_daily_change"] = min_daily_change
     summary["volatility_modeled"] = bool(model_volatility)
     summary["bound_hits"] = dict(bound_counts)
     # 边界对应的可刷量：仅在调用方给出 first_natural（今日视角）时计算，

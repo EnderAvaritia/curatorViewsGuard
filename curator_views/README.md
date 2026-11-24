@@ -29,6 +29,7 @@
   两级波动率：`volatility` 让当日缺口配额随机（缺口大时用），`target_volatility`
   让今日目标随机（固定基线/缺口小时用）；`volatility_min` /
   `target_volatility_min` 给幅度设下限，抖动按天持久化、同日多时段复用；
+  `min_daily_change` 是确定性下限，保证相邻两天目标至少变动该比例，避免曲线过平；
 - 每日刷量列表：配置 `boost_list_file` 后按列表逐行刷量，一行一个数量，
   每天消费首行并在成功后删除该行（刷完一行删一行）；默认 `boost_list_fallback: true`
   （列表耗尽后自动回退基线/自动预测继续刷，设 false 为用完即停）；
@@ -483,6 +484,7 @@ python curator_views/cli.py version
 | `volatility_min` | `0` | 缺口抖动的最小幅度；`0` 不设下限 |
 | `target_volatility` | `0` | 目标波动率：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |
 | `target_volatility_min` | `0` | 目标抖动的最小幅度；`0` 不设下限 |
+| `min_daily_change` | `0` | 相邻两天目标的最小相对变动（0~1）；变化不足时沿原方向补足，`0` 关闭 |
 | `boost_n` | `5` | 每日提升使用的最近推荐数量 |
 | `single_cap` | `300` | 单个游戏单日成功访问次数上限 |
 | `batch_size` | `50` | 每批处理的游戏数量 |

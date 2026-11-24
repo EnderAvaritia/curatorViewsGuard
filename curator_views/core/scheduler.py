@@ -196,8 +196,14 @@ def _jitter_signature(
     volatility_min: float,
     target_volatility: float,
     target_volatility_min: float,
+    min_daily_change: float = 0.0,
 ) -> str:
-    """生成当日抖动配置签名：配置未变时同一天复用同一组抖动值。"""
+    """生成当日抖动配置签名：配置未变时同一天复用同一组抖动值。
+
+    ``min_daily_change`` 也计入签名：它会在抖动之后改写今日目标，配置变更后
+    旧定档的目标不再适用，``forecast`` 应重新抽样并重新套用最小变动约束。
+    ``0.0`` 为默认值，保证旧调用方（含测试）不传该参数时签名口径不变。
+    """
     return json.dumps(
         [
             round(float(baseline_views), 6),
@@ -210,6 +216,7 @@ def _jitter_signature(
             round(float(volatility_min), 6),
             round(float(target_volatility), 6),
             round(float(target_volatility_min), 6),
+            round(float(min_daily_change), 6),
         ],
         ensure_ascii=False,
         separators=(",", ":"),
@@ -295,6 +302,61 @@ def _clamp_target(
     if high > 0 and target > high:
         return high, "max"
     return target, ""
+
+
+def _apply_min_daily_change(
+    target: float,
+    prev_target: float,
+    min_daily_change: float,
+    direction_hint: float = 0.0,
+    target_min: float = 0.0,
+    target_max: float = 0.0,
+) -> tuple[float, bool]:
+    """保证相邻两天目标至少变动 ``min_daily_change``（比例）。
+
+    背景：中位数 + 封顶趋势预测出的目标可能连续几天几乎相同，浏览曲线会
+    平得像一条直线，反而更像机器行为。本函数给「今日目标相对上一逻辑日目标」
+    的相对变动设一个下限：
+
+    - ``ratio = (target - prev_target) / prev_target``；
+    - ``|ratio| >= min_daily_change`` 时原样返回（不干预自然变化）；
+    - 否则沿原变化方向补足到 ``prev_target × (1 ± min_daily_change)``；
+      变化正好为 0 时用 ``direction_hint`` 决定方向（通常传自然趋势），
+      hint 也为 0 时默认向上，避免反复卡在同一水平。
+
+    调整结果仍按 ``target_min`` / ``target_max`` 夹取：边界优先，夹取后仍可能
+    小于最小变动（例如撞上下限），此时按边界值执行并视为已应用。
+
+    Args:
+        target: 按预测/抖动/边界算出的今日目标。
+        prev_target: 上一逻辑日的最终目标；``<= 0`` 时无法比较，直接返回。
+        min_daily_change: 最小相对变动（0~1）。``<= 0`` 表示关闭，直接返回。
+        direction_hint: 变化为 0 时的方向提示：``>= 0`` 向上，``< 0`` 向下。
+        target_min / target_max: 目标上下界（0 表示该方向不设界）。
+
+    Returns:
+        ``(调整后的目标, 是否发生了调整)``。
+    """
+    prev = float(prev_target or 0)
+    p = abs(float(min_daily_change or 0))
+    if p <= 0 or prev <= 0:
+        return float(target), False
+    p = min(p, 1.0)
+
+    ratio = (float(target) - prev) / prev
+    if abs(ratio) >= p:
+        return float(target), False
+
+    if ratio > 0:
+        direction = 1.0
+    elif ratio < 0:
+        direction = -1.0
+    else:
+        direction = 1.0 if direction_hint >= 0 else -1.0
+
+    adjusted = max(0.0, prev * (1.0 + direction * p))
+    adjusted, _ = _clamp_target(adjusted, target_min, target_max)
+    return adjusted, abs(adjusted - float(target)) > 1e-9
 
 
 def _floor_boost(natural: float, target_min: float) -> int:
@@ -430,6 +492,12 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
         lines.append(
             f"缺口抖动: {summary['gap_jitter']:+.2%}"
             f"（当日配额 {summary.get('boost_quota', 0):,}）"
+        )
+    if summary.get("min_change_applied"):
+        lines.append(
+            f"相邻两天最小变动: {summary.get('min_daily_change', 0):.2%}"
+            f"（昨日目标 {summary.get('prev_target')} → "
+            f"今日目标 {summary['today_expected']:.0f}）"
         )
     lines.extend([
         f"今日预期浏览量: {summary['today_expected']:.0f}",
@@ -753,6 +821,8 @@ boost_mode / growth_factor / growth_rate：
     volatility_min = float(config.get("volatility_min", 0) or 0)
     target_volatility = float(config.get("target_volatility", 0) or 0)
     target_volatility_min = float(config.get("target_volatility_min", 0) or 0)
+    # 相邻两天最小变动（比例）：保证今日目标相对上一逻辑日目标至少变动该值。
+    min_daily_change = abs(float(config.get("min_daily_change", 0) or 0))
     gap_low, gap_high = _jitter_bounds(volatility, volatility_min)
     target_jitter_low, target_jitter_high = _jitter_bounds(
         target_volatility, target_volatility_min
@@ -974,6 +1044,7 @@ boost_mode / growth_factor / growth_rate：
         volatility_min,
         target_volatility,
         target_volatility_min,
+        min_daily_change,
     )
     target_jitter, gap_jitter = _resolve_daily_jitters(
         storage,
@@ -1010,6 +1081,64 @@ boost_mode / growth_factor / growth_rate：
             today_expected_jittered, bound_label, today_expected,
             target_floor, target_ceiling,
         )
+
+    # 4.5 相邻两天最小变动：先取上一逻辑日的最终目标作为参照。
+    #     优先读 daily_plan（那才是 run 当天真正执行的目标，含抖动与最小变动），
+    #     缺失时用历史重算上一日的目标（base × 倍率，再按上下界夹取）。
+    #     只改写“今日目标”，不改历史自然流量；边界夹取仍然优先。
+    prev_target = 0.0
+    min_change_before = today_expected
+    min_change_applied = False
+    if min_daily_change > 0:
+        yesterday_iso = day_label_from_ts(today_ts - 86400)
+        get_plan = getattr(storage, "get_daily_plan", None)
+        if callable(get_plan):
+            prev_plan = get_plan(yesterday_iso) or {}
+            try:
+                prev_target = float(prev_plan.get("target") or 0)
+            except (TypeError, ValueError):
+                prev_target = 0.0
+        if prev_target <= 0 and history_clean:
+            prior_hist = history_clean[:-1]
+            if manual_baseline:
+                yday_base = float(baseline_views)
+            else:
+                yday_base = float(
+                    predict_expected(
+                        prior_hist,
+                        window_days=window_days,
+                        trend_cap=trend_cap,
+                        startup_factor=startup_factor,
+                        trend_min_points=trend_min_points,
+                    )["expected"]
+                )
+            yday_ts = int(history_clean[-1]["date_ts"])
+            yday_multiplier = _target_multiplier(
+                multiplier, growth_rate, drift_start_ts, yday_ts
+            )
+            prev_target, _ = _clamp_target(
+                yday_base * yday_multiplier, target_floor, target_ceiling
+            )
+        if prev_target > 0:
+            adjusted, min_change_applied = _apply_min_daily_change(
+                today_expected,
+                prev_target,
+                min_daily_change,
+                direction_hint=base_expected - prev_target,
+                target_min=target_floor,
+                target_max=target_ceiling,
+            )
+            if min_change_applied:
+                today_expected = adjusted
+                _, target_bound = _clamp_target(
+                    today_expected, target_floor, target_ceiling
+                )
+                logger.info(
+                    "相邻两天最小变动 %.2f%%：昨日目标 %.0f，原今日目标 %.0f"
+                    " → %.0f（避免曲线过平）。",
+                    min_daily_change * 100.0, prev_target,
+                    min_change_before, today_expected,
+                )
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
     #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
@@ -1287,6 +1416,10 @@ boost_mode / growth_factor / growth_rate：
         "target_volatility_min": target_volatility_min,
         "target_jitter": round(target_jitter, 6),
         "gap_jitter": round(gap_jitter, 6),
+        "min_daily_change": min_daily_change,
+        "prev_target": round(prev_target, 1) if prev_target > 0 else None,
+        "target_before_min_change": round(min_change_before, 1),
+        "min_change_applied": min_change_applied,
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,
         "boost_list_status": list_status,

@@ -342,6 +342,15 @@ target_volatility: 0.0
 # 内均匀取值、方向随机；0 = 不设下限。
 target_volatility_min: 0.0
 
+# 相邻两天最小变动（比例，0~1，0 = 关闭）。
+# 保证「今日目标」相对「上一逻辑日目标」至少变动该比例：若按预测算出的
+# 变化更小，就沿原变化方向补足（变化为 0 时沿自然趋势方向），避免连续
+# 几天目标几乎不变、曲线平得像一条直线。调整后仍受 target_min / target_max
+# 夹取；只改写目标，不改变历史自然流量。上一日目标优先取 daily_plan 定档，
+# 没有定档时用历史重算。forecast 预览与 run 使用同一口径。
+# 白话：怕每天的目标几乎一样、曲线太假，就填 0.02（相邻两天至少差 2%）。
+min_daily_change: 0.0
+
 # ── 每日刷量列表（可选）──────────────────────────────────────────────────
 
 # 刷量列表文件路径（相对本文件所在目录），留空表示不使用列表模式。
@@ -646,6 +655,7 @@ def _scheduler_config(
         "volatility_min": float(cfg["volatility_min"] or 0),
         "target_volatility": float(cfg["target_volatility"] or 0),
         "target_volatility_min": float(cfg["target_volatility_min"] or 0),
+        "min_daily_change": float(cfg["min_daily_change"] or 0),
         "boost_n": int(cfg["boost_n"]),
         "single_cap": int(cfg["single_cap"]),
         "batch_size": int(cfg["batch_size"]),
@@ -1886,6 +1896,12 @@ def _print_forecast_report(
                 f"（下限命中 {min_hits} 天，上限命中 {max_hits} 天；"
                 "上限=自然流量+刷量）"
             )
+    min_change = float(config.get("min_daily_change", 0) or 0)
+    if min_change > 0:
+        print(
+            f"相邻两天最小变动: ≥{min_change:.0%}"
+            "（今日目标相对上一逻辑日目标至少变动该比例；仍受上下界夹取）"
+        )
     print(
         f"单日容量: {capacity:,} 次"
         f"（boost_n={boost_n} × single_cap={single_cap}）"
@@ -2148,6 +2164,17 @@ def cmd_forecast(args: argparse.Namespace) -> int:
     except (TypeError, ValueError, IndexError):
         growth_start_ts = 0
 
+    # 相邻两天最小变动的首日参照：上一逻辑日的最终目标（daily_plan 定档）。
+    # 没有定档时留 None，首日不套用，从第二行起按上一行目标继续约束。
+    prev_target: Optional[float] = None
+    prev_day_iso = day_label_from_ts(int(start_ts) - 86400)
+    prev_plan = plans.get(prev_day_iso) if plans else None
+    if prev_plan and prev_plan.get("target"):
+        try:
+            prev_target = float(prev_plan["target"])
+        except (TypeError, ValueError):
+            prev_target = None
+
     result = forecast_days(
         history,
         sched_cfg,
@@ -2161,6 +2188,7 @@ def cmd_forecast(args: argparse.Namespace) -> int:
         first_day_plan=(
             plans.get(today_iso) if not start_tomorrow else None
         ),
+        prev_target=prev_target,
     )
     if stale_warning:
         result["warnings"].append(

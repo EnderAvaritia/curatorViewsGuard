@@ -146,6 +146,9 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
               growth 模式：目标系数 = growth_factor × (1 + growth_rate × 距生效日天数)
               target_min / target_max 为 0 时表示该方向不设界
               目标抖动 = ±uniform(target_volatility_min, target_volatility)  # 0 时关闭
+              相邻两天最小变动：若 |今日目标 − 昨日目标| / 昨日目标 < min_daily_change，
+                        沿原变化方向补到 昨日目标 × (1 ± min_daily_change)，
+                        变化为 0 时沿自然趋势方向，再按上下界夹取  # 0 时关闭
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
@@ -280,6 +283,14 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 目标抖动 = ±uniform(target_volatility_min, target_volatility)
 缺口抖动 = ±uniform(volatility_min, volatility)
 ```
+
+**相邻两天最小变动（`min_daily_change`）** 是另一条独立的**确定性**约束，不是随机
+抖动：它保证「今日目标」相对「上一逻辑日目标」至少变动该比例，避免预测出的目标
+连续几天几乎不变、曲线平得像一条直线。变化不足时沿原方向补足（涨就补涨、跌就
+补跌），变化正好为 0 时沿自然趋势方向（趋势也为 0 则向上）；调整后仍受
+`target_min` / `target_max` 夹取，因此撞边界时实际变化可能小于该比例。参照优先
+取 `daily_plan` 中上一逻辑日的最终目标（含抖动），没有定档时用历史重算。它与
+`volatility` / `target_volatility` 可叠加：后两者是随机抖动，本项是确定性的下限。
 
 **行为细节：**
 
@@ -750,6 +761,7 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
 | `volatility_min` | `0` | 缺口抖动的最小幅度，防止抽到接近 0 导致曲线过平；`0` 不设下限 |
 | `target_volatility` | `0` | 目标随机抖动幅度：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |
 | `target_volatility_min` | `0` | 目标抖动的最小幅度；`0` 不设下限 |
+| `min_daily_change` | `0` | 相邻两天目标的最小相对变动（0~1）；变化不足时沿原方向补足，`0` 关闭 |
 
 **说明：**
 
@@ -799,6 +811,13 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
   `[min, max]` 内均匀取值、方向随机，避免曲线过于平缓。两者都没有硬性上限，
   但会按 `1 + target_volatility + volatility` 放大反作弊检测参照。详见
   [3.6](#36-波动率让曲线不那么机械)。
+- `min_daily_change` 作用于**今日目标**：保证它与上一逻辑日目标至少相差该比例，
+  防止连续多天目标几乎不变、曲线过于平直。参照优先取 `daily_plan` 里昨日
+  定档的最终目标，没有定档时用历史重算；变化不足时沿原方向补足（变化为 0 时
+  沿自然趋势方向），调整后仍按 `target_min` / `target_max` 夹取，因此撞边界时
+  实际变化可能小于该值。它与 `volatility` / `target_volatility` 不冲突：后者是
+  随机抖动，本项是确定性的日间变动下限。`run` / `daemon` 与 `forecast` 使用同一
+  口径；`min_daily_change` 已计入波动配置签名，改动后会丢弃旧定档并重新计算。
 
 ### 7.7 刷量列表
 
@@ -904,6 +923,8 @@ volatility: 0.10
 volatility_min: 0.0
 target_volatility: 0.0
 target_volatility_min: 0.0
+# 相邻两天目标最小变动（0=关闭；0.02 表示至少差 2%）
+min_daily_change: 0.0
 
 boost_list_file: ""
 boost_list_fallback: true
@@ -2106,7 +2127,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **518** 个，覆盖：
+当前测试共 **538** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -2117,6 +2138,8 @@ python -m pytest tests/ -v
   forecast 逐日 `bound_hit` / `target_bound_hit` 与旧定档夹取；
 - 目标波动率、最小波动幅度、同日抖动复用（重跑/多时段/配置变更）、
   缺口配额跨时段续刷、抖动日不被误判为溢出；
+- 相邻两天最小变动：纯函数方向/阈值/零变化/上下界夹取、run_daily 从
+  daily_plan 取昨日目标（无定档时历史重算）、forecast 逐行套用与首日参照；
 - 每日分界点：`day_boundary` 解析、逻辑日/凌晨归属、run_daily 的昨日基准与
   台账日期、Booster 记账日期、forecast 今天/明天起算、配置与 info 透传；
 - 调度器子进程执行器、时区工具；
@@ -2165,6 +2188,7 @@ tests/
 ├── test_fetcher.py
 ├── test_forecast.py
 ├── test_login.py
+├── test_min_daily_change.py
 ├── test_notifier.py
 ├── test_predictor.py
 ├── test_run_daily.py
