@@ -151,7 +151,8 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
                         变化为 0 时沿自然趋势方向，再按上下界夹取  # 0 时关闭
               相邻两天最大变动（max_daily_change > 0 时）：
                         不足 min 时在 [min_daily_change, max_daily_change] 内随机补足，
-                        超过 max 时压到 max；区间过窄/倒置会告警
+                        超过 max 时压到 max
+              target_volatility 与日间变化区间量级不匹配时告警（见 7.6）
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
@@ -296,12 +297,19 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 `target_min` / `target_max` 夹取，因此撞边界时实际变化可能超出或不足该区间。
 参照优先取 `daily_plan` 中上一逻辑日的最终目标（含抖动），没有定档时用历史重算。
 
-为让随机补足真正有效，系统会校验区间：`min` 与 `max` 都 > 0 时，
-`max < 2 × min` 视为**区间过窄**（随机值难以拉开，曲线仍可能机械），
-`min > 2 × max` 视为**区间倒置**（根本抽不出合理的随机值）。两种情况都会在
-`run` / `daemon` 日志与每日简报、以及 `forecast` 的提示里给出警告（不拒绝执行）。
-它与 `volatility` / `target_volatility` 可叠加：后两者是逐日随机抖动，本项约束
-的是相邻两天之间的净变化幅度。
+为让随机补足真正有效，系统会校验**目标抖动与日间变化区间是否兼容**：
+
+- `target_volatility < 2 × min_daily_change`（抖动太小）：抖动跨不过最小日间变动，
+  日间变化会长期由 `min` 补足 → **抽不出真正落在波动区间内的目标**，
+  `target_volatility` 形同虚设；
+- `target_volatility_min > 2 × max_daily_change`（最小抖动太大）：每天的最小抖动
+  就超过允许的最大日间变动，日间变化持续被压到 `max` 边界 → 目标**持续偏在下半区
+  或上半区**（贴边），抖动的幅度信息被丢弃、只剩方向。
+
+两种情况都只在 `run` / `daemon` 日志与每日简报、以及 `forecast` 的提示里给出
+警告，不拒绝执行；相关参数为 `0`（关闭）时不检查。`target_volatility` /
+`target_volatility_min` 是逐日随机抖动，本项约束的是相邻两天之间的净变化幅度，
+二者需要匹配才能既保留随机性、又不被约束完全覆盖。
 
 **行为细节：**
 
@@ -829,10 +837,12 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
   取 `daily_plan` 里昨日定档的最终目标，没有定档时用历史重算；调整后仍按
   `target_min` / `target_max` 夹取，因此撞边界时实际变化可能不在区间内。
   `max` 为 `0` 表示不设上限（退化为固定补到 `min`）。
-- 变化区间校验（仅当两者都 > 0）：`max < 2 × min` 时提示**区间过窄**（随机值
-  难以拉开），`min > 2 × max` 时提示**区间倒置**（抽不出合理随机值）。警告只提示
-  不拒绝执行：`run` / `daemon` 写入日志并把每日简报升级为 warning；`forecast`
-  输出 `min_change_range` 提示。`min_daily_change` / `max_daily_change` 已计入波动
+- 抖动/日间变化兼容性校验：`target_volatility < 2 × min_daily_change` 时提示
+  **抖动太小**（日间变化长期由 `min` 补足，抽不出落在波动区间内的目标）；
+  `target_volatility_min > 2 × max_daily_change` 时提示**最小抖动太大**（日间变化
+  持续被压到 `max` 边界，目标持续偏在下半区或上半区）。警告只提示不拒绝执行：
+  `run` / `daemon` 写入日志并把每日简报升级为 warning；`forecast` 输出
+  `volatility_daily_change` 提示。`min_daily_change` / `max_daily_change` 已计入波动
   配置签名，改动后会丢弃旧定档并重新计算。
 
 ### 7.7 刷量列表
@@ -1243,7 +1253,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `plan_signature_mismatch` | 数据库里的首日定档是在不同波动率/基线配置下计算的，已丢弃并重新抽样（`run` 当天也会重新抽） |
 | `volatility_not_modeled` | 使用了 `--no-volatility` 且配置了波动率：表格为未抖动基准（`target_low` / `target_high` 仍给出目标区间） |
 | `target_bound_hit` | 有日期的刷量缺口被 `target_min` / `target_max` 改变（上限=自然+刷量）；消息列出命中方向与改动前后值（最多 5 天，其余省略） |
-| `min_change_range` | 相邻两天变化区间过窄（`max < 2×min`）或倒置（`min > 2×max`），随机补足难以生效或无法抽取，建议修正 `min_daily_change` / `max_daily_change` |
+| `volatility_daily_change` | 目标抖动与日间变化区间不兼容：`target_volatility < 2×min_daily_change`（抖动太小、抽不出目标）或 `target_volatility_min > 2×max_daily_change`（最小抖动太大、目标持续贴边），建议调整 `target_volatility` / `target_volatility_min` 与 `min_daily_change` / `max_daily_change` 的相对量级 |
 
 ### 8.5.1 forecast 折线图（控制台 + HTML）
 
@@ -2158,8 +2168,8 @@ python -m pytest tests/ -v
 - 目标波动率、最小波动幅度、同日抖动复用（重跑/多时段/配置变更）、
   缺口配额跨时段续刷、抖动日不被误判为溢出；
 - 相邻两天变化约束：纯函数方向/阈值/零变化/上下界夹取、min~max 随机补足与
-  封顶、区间过窄/倒置告警、run_daily 从 daily_plan 取昨日目标（无定档时历史
-  重算）、forecast 逐行套用与首日参照；
+  封顶、抖动与日间变化兼容性告警（抖动太小/最小抖动太大）、run_daily 从
+  daily_plan 取昨日目标（无定档时历史重算）、forecast 逐行套用与首日参照；
 - 每日分界点：`day_boundary` 解析、逻辑日/凌晨归属、run_daily 的昨日基准与
   台账日期、Booster 记账日期、forecast 今天/明天起算、配置与 info 透传；
 - 调度器子进程执行器、时区工具；

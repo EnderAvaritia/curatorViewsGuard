@@ -18,8 +18,8 @@ from curator_views.core.forecast import forecast_days
 from curator_views.core.scheduler import (
     _TZ,
     _apply_min_daily_change,
-    _daily_change_range_warnings,
     _date_to_epoch,
+    _volatility_daily_change_warnings,
     run_daily,
 )
 
@@ -133,25 +133,33 @@ class TestApplyMinDailyChange:
         assert applied is True
 
 
-class TestDailyChangeRangeWarnings:
-    def test_valid_range_has_no_warning(self):
-        assert _daily_change_range_warnings(0.02, 0.05) == []
-        assert _daily_change_range_warnings(0.02, 0.04) == []
+class TestVolatilityDailyChangeWarnings:
+    def test_compatible_config_has_no_warning(self):
+        # tv=10% 足够跨过 2×min(5%)=10%；tv_min=3% 不超过 2×max=10%
+        assert _volatility_daily_change_warnings(
+            0.05, 0.10, 0.10, 0.03
+        ) == []
 
-    def test_narrow_range_warns(self):
-        messages = _daily_change_range_warnings(0.02, 0.03)
+    def test_too_small_target_volatility_warns(self):
+        messages = _volatility_daily_change_warnings(
+            0.05, 0.10, 0.06, 0.0
+        )
         assert len(messages) == 1
-        assert "2×" in messages[0] or "过窄" in messages[0]
+        assert "2×min_daily_change" in messages[0]
+        assert "抽不出" in messages[0]
 
-    def test_inverted_range_warns(self):
-        messages = _daily_change_range_warnings(0.05, 0.02)
+    def test_too_large_target_volatility_min_warns(self):
+        messages = _volatility_daily_change_warnings(
+            0.0, 0.02, 0.10, 0.06
+        )
         assert len(messages) == 1
-        assert "无效" in messages[0]
+        assert "2×max_daily_change" in messages[0]
+        assert "下半区" in messages[0]
 
-    def test_disabled_range_has_no_warning(self):
-        assert _daily_change_range_warnings(0, 0.05) == []
-        assert _daily_change_range_warnings(0.02, 0) == []
-        assert _daily_change_range_warnings(0, 0) == []
+    def test_disabled_inputs_have_no_warning(self):
+        assert _volatility_daily_change_warnings(0.02, 0.05, 0, 0) == []
+        assert _volatility_daily_change_warnings(0, 0, 0.5, 0.5) == []
+        assert _volatility_daily_change_warnings(0, 0, 0, 0) == []
 
 
 # ── run_daily 集成 ───────────────────────────────────────────────────────
@@ -366,7 +374,7 @@ class TestRunDailyMinChange:
         )
         assert summary["min_change_applied"] is True
         assert summary["max_daily_change"] == pytest.approx(0.05)
-        assert summary["min_change_warnings"] == []
+        assert summary["daily_change_warnings"] == []
 
     def test_above_max_is_capped(self):
         storage = FakeStorage(
@@ -383,17 +391,21 @@ class TestRunDailyMinChange:
         assert summary["today_expected"] == pytest.approx(10500.0)
         assert summary["min_change_applied"] is True
 
-    def test_invalid_range_warns(self):
+    def test_volatility_mismatch_warns(self):
         storage = FakeStorage(
             PROGRAM_START,
             plans={YESTERDAY_ISO: {"date": YESTERDAY_ISO, "target": 10000}},
         )
+        # target_volatility=6% < 2×min(5%)=10% → 抖动会被日间补足覆盖
         summary = _run(
-            storage, min_daily_change=0.05, max_daily_change=0.02
+            storage,
+            min_daily_change=0.05,
+            max_daily_change=0.10,
+            target_volatility=0.06,
         )
 
-        assert summary["min_change_warnings"]
-        assert "无效" in summary["min_change_warnings"][0]
+        assert summary["daily_change_warnings"]
+        assert "抽不出" in summary["daily_change_warnings"][0]
 
 
 # ── forecast 集成 ────────────────────────────────────────────────────────
@@ -464,11 +476,17 @@ class TestForecastMinChange:
             # 行内 target 保留 1 位小数，允许极小的显示取整误差
             assert 0.02 - 1e-3 <= ratio <= 0.05 + 1e-3
 
-    def test_invalid_range_adds_warning(self):
-        result = _forecast(min_daily_change=0.05, max_daily_change=0.02)
+    def test_volatility_mismatch_adds_warning(self):
+        # tv_min=10% > 2×max(2%)=4% → 抖动每天都撞上限，目标持续贴边
+        result = _forecast(
+            min_daily_change=0.0,
+            max_daily_change=0.02,
+            target_volatility=0.10,
+            target_volatility_min=0.10,
+        )
         codes = [warning["code"] for warning in result["warnings"]]
 
-        assert "min_change_range" in codes
+        assert "volatility_daily_change" in codes
 
 # ── 配置接线 ─────────────────────────────────────────────────────────────
 

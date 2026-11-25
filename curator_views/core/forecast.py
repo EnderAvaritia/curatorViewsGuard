@@ -32,7 +32,6 @@ from .scheduler import (
     _bound_boost,
     _ceiling_boost,
     _clamp_target,
-    _daily_change_range_warnings,
     _daily_throughput_capacity,
     _effective_threads,
     _floor_boost,
@@ -41,6 +40,7 @@ from .scheduler import (
     _normalize_target_bounds,
     _sample_signed_jitter,
     _target_multiplier,
+    _volatility_daily_change_warnings,
 )
 
 
@@ -105,7 +105,8 @@ def forecast_days(
           （未抖动目标 × (1 ± ``target_volatility``) 后再夹取）；
         - ``min_daily_change`` / ``max_daily_change``：再把目标相对上一逻辑日
           的变化幅度约束到 ``[min, max]``（不足 min 时在该区间内随机补足，
-          超过 max 时封顶）；区间过窄/倒置会追加 ``min_change_range`` 警告；
+          超过 max 时封顶）；抖动与日间变化量级不匹配会追加
+          ``volatility_daily_change`` 警告；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
         - ``gross_need = max(0, round(target - assumed_natural))``，
@@ -458,10 +459,13 @@ def forecast_days(
     )
     if plan_warning is not None:
         warnings.append(plan_warning)
-    for message in _daily_change_range_warnings(
-        min_daily_change, max_daily_change
+    for message in _volatility_daily_change_warnings(
+        min_daily_change,
+        max_daily_change,
+        target_volatility,
+        target_volatility_min,
     ):
-        warnings.append({"code": "min_change_range", "message": message})
+        warnings.append({"code": "volatility_daily_change", "message": message})
     if (target_jitter_high > 0 or gap_jitter_high > 0) and not model_volatility:
         parts: List[str] = []
         if target_jitter_high > 0:

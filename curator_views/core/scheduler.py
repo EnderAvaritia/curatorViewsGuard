@@ -396,8 +396,8 @@ def _apply_min_daily_change(
 
     调整结果仍按 ``target_min`` / ``target_max`` 夹取：边界优先，夹取后仍可能
     不满足区间约束（例如撞上下限），此时按边界值执行并视为已应用。
-    区间倒置（``max < min``）时忽略上限、只保留下限，避免把目标压到下限以下；
-    这种配置由 ``_daily_change_range_warnings`` 给出修正提示。
+    ``max < min``（区间倒置）时忽略上限、只保留下限，避免把目标压到下限以下；
+    抖动与日间变化量级不匹配的情况由 ``_volatility_daily_change_warnings`` 提示。
 
     Args:
         target: 按预测/抖动/边界算出的今日目标。
@@ -455,34 +455,59 @@ def _apply_min_daily_change(
     return float(target), False
 
 
-def _daily_change_range_warnings(
-    min_daily_change: float, max_daily_change: float
+def _volatility_daily_change_warnings(
+    min_daily_change: float,
+    max_daily_change: float,
+    target_volatility: float,
+    target_volatility_min: float,
 ) -> list[str]:
-    """校验相邻两天变化区间，返回需要提示的警告文案（无问题时为空）。
+    """校验「目标随机抖动」与「相邻两天变化区间」是否兼容。
 
-    只有 ``min`` 与 ``max`` 都 > 0 时才检查；任一为 0（关闭）不提示。
+    ``target_volatility`` 决定今日目标的随机偏离幅度（±tv，再受日间变化约束），
+    ``min_daily_change`` / ``max_daily_change`` 决定相邻两天目标允许的净变化。
+    两者量级差太多时，随机抖动会被日间约束完全覆盖，出现两种退化：
 
-    - ``min > 2 × max``：区间倒置，抽样范围无效，根本无法抽取合理的随机值；
-    - ``max < 2 × min``：区间过窄，随机值难以在区间内拉开（无法“跳跃”），
-      曲线仍可能显得机械。
+    - ``target_volatility < 2 × min_daily_change``（抖动太小）：
+      抖动跨不过最小日间变动，每天都被 ``min_daily_change`` 补足，
+      **抽不出真正落在波动区间内的目标**，``target_volatility`` 形同虚设。
+    - ``target_volatility_min > 2 × max_daily_change``（抖动太大）：
+      每天的最小抖动就超过允许的最大日间变动，日间变化持续被压到
+      ``max_daily_change`` 边界，目标**持续偏在下半区或上半区**（贴边），
+      抖动的幅度信息被丢弃、只剩方向。
+
+    只提示、不中断执行；两条都要求相关参数已启用（> 0）才检查。
     """
-    p_min = abs(float(min_daily_change or 0))
-    p_max = abs(float(max_daily_change or 0))
-    if p_min <= 0 or p_max <= 0:
-        return []
-    if p_min > 2.0 * p_max:
-        return [
-            f"min_daily_change ({p_min:g}) 大于 2×max_daily_change ({p_max:g})："
-            "变化区间无效（下限已超过上限的两倍），无法抽取合理的随机值；"
-            "请确保 min_daily_change ≤ max_daily_change（建议 max ≥ 2×min）。"
-        ]
-    if p_max < 2.0 * p_min:
-        return [
-            f"max_daily_change ({p_max:g}) 小于 2×min_daily_change ({p_min:g})："
-            "变化区间过窄，随机值难以在区间内拉开，曲线仍可能显得机械；"
-            "建议设置 max_daily_change ≥ 2×min_daily_change。"
-        ]
-    return []
+    warnings: list[str] = []
+    dc_min = abs(float(min_daily_change or 0))
+    dc_max = abs(float(max_daily_change or 0))
+    tv = abs(float(target_volatility or 0))
+    tv_min = abs(float(target_volatility_min or 0))
+
+    if tv > 0 and dc_min > 0 and tv < 2.0 * dc_min:
+        if dc_max > 0:
+            band = f"{dc_min:.2%}~{dc_max:.2%}"
+        else:
+            band = f"≥{dc_min:.2%}"
+        warnings.append(
+            f"target_volatility ({tv:.2%}) 小于 2×min_daily_change "
+            f"({2.0 * dc_min:.2%})：目标随机抖动幅度不足以跨过最小日间变动，"
+            f"日间变化会长期由 min_daily_change 补足（相当于抽不出落在波动区间"
+            f"内的目标）。执行：不中断；预期结果：每天目标基本按 {band} 变化，"
+            f"target_volatility 的随机性被覆盖。"
+            f"建议 target_volatility ≥ 2×min_daily_change 或调低 min_daily_change。"
+        )
+
+    if tv_min > 0 and dc_max > 0 and tv_min > 2.0 * dc_max:
+        warnings.append(
+            f"target_volatility_min ({tv_min:.2%}) 大于 2×max_daily_change "
+            f"({2.0 * dc_max:.2%})：目标每天的最小抖动已超过允许的最大日间变动，"
+            f"日间变化会持续被压到 max_daily_change 边界（目标持续偏在下半区或"
+            f"上半区）。执行：不中断；预期结果：每天目标基本贴着 ±{dc_max:.2%} 走，"
+            f"target_volatility 的幅度信息被丢弃、只剩方向。"
+            f"建议 target_volatility_min ≤ max_daily_change/2 或调高 max_daily_change。"
+        )
+
+    return warnings
 
 
 def _floor_boost(natural: float, target_min: float) -> int:
@@ -631,7 +656,7 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
             f"（昨日目标 {summary.get('prev_target')} → "
             f"今日目标 {summary['today_expected']:.0f}）"
         )
-    for message in summary.get("min_change_warnings") or []:
+    for message in summary.get("daily_change_warnings") or []:
         lines.append(f"注意: {message}")
     lines.extend([
         f"今日预期浏览量: {summary['today_expected']:.0f}",
@@ -1297,11 +1322,14 @@ boost_mode / growth_factor / growth_rate：
                         min_change_before, today_expected,
                     )
 
-    # 4.6 变化区间校验：区间过窄或倒置时告警（只提示，不拒绝执行）。
-    min_change_warnings = _daily_change_range_warnings(
-        min_daily_change, max_daily_change
+    # 4.6 抖动与日间变化兼容性校验：防止抖动被完全覆盖或持续贴边（只提示）。
+    daily_change_warnings = _volatility_daily_change_warnings(
+        min_daily_change,
+        max_daily_change,
+        target_volatility,
+        target_volatility_min,
     )
-    for message in min_change_warnings:
+    for message in daily_change_warnings:
         logger.warning("%s", message)
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
@@ -1586,7 +1614,7 @@ boost_mode / growth_factor / growth_rate：
         "target_before_min_change": round(min_change_before, 1),
         "min_change_applied": min_change_applied,
         "min_change_fill": round(min_change_fill, 6),
-        "min_change_warnings": min_change_warnings,
+        "daily_change_warnings": daily_change_warnings,
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,
         "boost_list_status": list_status,
@@ -1670,7 +1698,7 @@ boost_mode / growth_factor / growth_rate：
         or "executor_error" in summary
         or summary["boost_list_status"] in ("missing", "error", "consume_error")
         # 相邻两天变化区间配置有误（过窄/倒置）→ 升级为 warning
-        or bool(summary.get("min_change_warnings"))
+        or bool(summary.get("daily_change_warnings"))
         # 列表耗尽已回退基线，且当日确有缺口 → 提示"已自动切回基线模式"
         or (
             summary["boost_list_status"] == "fallback"
