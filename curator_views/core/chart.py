@@ -452,6 +452,7 @@ def render_forecast_html(
     rows = list(result.get("rows") or [])
     summary = result.get("summary") or {}
     source = source or {}
+    warnings = list(result.get("warnings") or [])
 
     first_date = summary.get("first_date") or (rows[0]["date"] if rows else "-")
     last_date = summary.get("last_date") or (rows[-1]["date"] if rows else "-")
@@ -535,6 +536,21 @@ def render_forecast_html(
         else "随机波动未纳入：曲线为未抖动基准，适合对照配置本身。"
     )
 
+    if warnings:
+        warn_items = "".join(
+            f'<li><code>{_esc(str(item.get("code", "")))}</code> '
+            f'{_esc(str(item.get("message", "")))}</li>'
+            for item in warnings
+        )
+        warnings_html = f"""
+  <section class="card warn-card">
+    <h2>提示（{len(warnings)}）</h2>
+    <ul class="warn">{warn_items}</ul>
+  </section>
+"""
+    else:
+        warnings_html = ""
+
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -561,6 +577,13 @@ def render_forecast_html(
   h2 {{ font-size: 16px; margin: 0 0 10px; }}
   .meta, .note {{ color: var(--muted); font-size: 13px; margin: 4px 0; }}
   .note {{ margin-bottom: 18px; }}
+  .warn-card {{ border-color: #fde68a; background: #fffbeb; }}
+  .warn {{ margin: 0; padding-left: 18px; font-size: 13px; line-height: 1.6; }}
+  .warn li {{ margin: 4px 0; }}
+  .warn code {{
+    background: #f3f4f6; border-radius: 4px; padding: 1px 5px;
+    font-size: 12px; color: var(--ink);
+  }}
   .card {{
     background: var(--card); border: 1px solid var(--line);
     border-radius: 12px; padding: 16px 18px; margin: 0 0 18px;
@@ -585,6 +608,7 @@ def render_forecast_html(
   <p class="meta">模式：{_esc(mode)} · 基线：{_esc(baseline_text)} · 数据来源：{_esc(source_text)}</p>
   <p class="meta">波动率：{_esc(vol_text)} · {_esc(vol_detail)}{_esc(bounds_text)}</p>{step_meta}
   <p class="note">{_esc(note)}</p>
+{warnings_html}
 
   <section class="card">
     <h2>浏览量：目标 vs 假设自然流量</h2>

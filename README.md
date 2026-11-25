@@ -1307,7 +1307,8 @@ python curator_views/cli.py forecast --config config.yaml --chart-only
 - 两条线落在同一字符格时显示 `*`，图例里标注「重叠」。
 
 带 PATH 时生成**自包含 HTML**（内联 SVG，无外部 JS/CSS/图片），直接双击用
-浏览器打开；页面额外显示目标抖动区间带。
+浏览器打开；页面额外显示目标抖动区间带，并在顶部列出 `warnings` 提示卡片
+（配置校验、区间倒置、抖动/日间变化不兼容等，与控制台「提示」、`--json` 一致）。
 
 默认纳入随机波动时，图中曲线是**本次抽样**的结果，重新运行会变化；加
 `--no-volatility` 可输出未抖动基准图。图表只读取 forecast 结果，不写数据库、
@@ -2190,8 +2191,8 @@ python -m pytest tests/ -v
   表格对齐与容量备注、按 `threads` / 等待间隔估算的吞吐上限；默认纳入波动率
   随机抽样、`--no-volatility` 关闭、目标区间与抖动字段；
 - forecast 折线图：控制台点状字符渲染、宽度适配、日期标签间隔、只输出图、
-  空数据、HTML/SVG 渲染、目标区间带、`--chart` 控制台/写文件、`--day-step`
-  首尾保留、`--json` 兼容与写失败报错；
+  空数据、HTML/SVG 渲染、目标区间带、HTML 提示卡片、`--chart` 控制台/写文件、
+  `--day-step` 首尾保留、`--json` 兼容与写失败报错；
 - `check` 写库（幂等覆盖、不写 run 状态）、`--no-write` 只读、库不可写时报错；
 - 当日已刷：只扣首日缺口、`forecast` 表格与 JSON、同日续刷、列表模式不误消费；
 - `StatsAuthError` 的判定（重定向 / 401 / 403）与 `run` / `check` / `forecast --fetch`

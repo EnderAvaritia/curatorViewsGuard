@@ -142,6 +142,24 @@ class TestRenderForecastHtml:
         assert "<polygon" not in page
         assert "目标区间 ±" not in page
 
+    def test_renders_warnings_card(self):
+        result = make_result()
+        result["warnings"] = [
+            {"code": "band_order", "message": "min>max 区间倒置"}
+        ]
+        page = render_forecast_html(result, make_config())
+
+        assert "提示（1）" in page
+        assert "band_order" in page
+        assert "min&gt;max 区间倒置" in page
+
+    def test_no_warnings_card_without_warnings(self):
+        result = make_result()
+        result["warnings"] = []
+        page = render_forecast_html(result, make_config())
+
+        assert "提示（" not in page
+
     def test_empty_rows_do_not_crash(self):
         page = render_forecast_html(
             {"rows": [], "summary": {}, "warnings": []}, make_config()
