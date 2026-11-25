@@ -18,6 +18,7 @@ from curator_views.core.forecast import forecast_days
 from curator_views.core.scheduler import (
     _TZ,
     _apply_min_daily_change,
+    _band_order_warnings,
     _date_to_epoch,
     _volatility_daily_change_warnings,
     run_daily,
@@ -124,12 +125,17 @@ class TestApplyMinDailyChange:
             assert 10200.0 <= adjusted <= 10500.0
             assert applied is True
 
-    def test_inverted_range_falls_back_to_min(self):
-        # max < min：忽略上限、只保留下限（并由检测告警提示修正）
+    def test_inverted_range_swaps_to_valid_band(self):
+        # max < min：交换为 [0.02, 0.05]，仍保留随机补足（由检测告警提示修正）
         adjusted, applied = _apply_min_daily_change(
-            10000, 10000, 0.05, max_daily_change=0.02, direction_hint=1
+            10000,
+            10000,
+            0.05,
+            max_daily_change=0.02,
+            direction_hint=1,
+            fill_magnitude=0.03,
         )
-        assert adjusted == pytest.approx(10500.0)
+        assert adjusted == pytest.approx(10300.0)
         assert applied is True
 
 
@@ -160,6 +166,31 @@ class TestVolatilityDailyChangeWarnings:
         assert _volatility_daily_change_warnings(0.02, 0.05, 0, 0) == []
         assert _volatility_daily_change_warnings(0, 0, 0.5, 0.5) == []
         assert _volatility_daily_change_warnings(0, 0, 0, 0) == []
+
+
+class TestBandOrderWarnings:
+    def test_valid_order_has_no_warning(self):
+        assert _band_order_warnings(0.02, 0.05, 0.01, 0.04) == []
+
+    def test_inverted_daily_change_warns(self):
+        messages = _band_order_warnings(0.05, 0.02, 0.0, 0.0)
+        assert len(messages) == 1
+        assert "倒置" in messages[0]
+        assert "交换" in messages[0]
+
+    def test_inverted_volatility_warns(self):
+        messages = _band_order_warnings(0.0, 0.0, 0.05, 0.02)
+        assert len(messages) == 1
+        assert "抖动区间倒置" in messages[0]
+
+    def test_both_inverted_warn_twice(self):
+        messages = _band_order_warnings(0.05, 0.02, 0.06, 0.03)
+        assert len(messages) == 2
+
+    def test_disabled_pairs_have_no_warning(self):
+        # max / target_volatility 为 0（关闭）时不做比较
+        assert _band_order_warnings(0.05, 0.0, 0.05, 0.0) == []
+        assert _band_order_warnings(0.0, 0.0, 0.05, 0.0) == []
 
 
 # ── run_daily 集成 ───────────────────────────────────────────────────────
@@ -487,6 +518,12 @@ class TestForecastMinChange:
         codes = [warning["code"] for warning in result["warnings"]]
 
         assert "volatility_daily_change" in codes
+
+    def test_inverted_daily_change_adds_warning(self):
+        result = _forecast(min_daily_change=0.05, max_daily_change=0.02)
+        codes = [warning["code"] for warning in result["warnings"]]
+
+        assert "band_order" in codes
 
 # ── 配置接线 ─────────────────────────────────────────────────────────────
 

@@ -396,8 +396,10 @@ def _apply_min_daily_change(
 
     调整结果仍按 ``target_min`` / ``target_max`` 夹取：边界优先，夹取后仍可能
     不满足区间约束（例如撞上下限），此时按边界值执行并视为已应用。
-    ``max < min``（区间倒置）时忽略上限、只保留下限，避免把目标压到下限以下；
-    抖动与日间变化量级不匹配的情况由 ``_volatility_daily_change_warnings`` 提示。
+    ``max < min``（区间倒置）时按较小值为下限、较大值为上限交换后执行，
+    仍保留随机补足（配置写反不会让曲线退化成固定步长）；
+    该情况与抖动/日间变化量级不匹配由 ``_band_order_warnings`` /
+    ``_volatility_daily_change_warnings`` 提示。
 
     Args:
         target: 按预测/抖动/边界算出的今日目标。
@@ -422,8 +424,8 @@ def _apply_min_daily_change(
     if p_max > 0:
         p_max = min(p_max, 1.0)
         if p_max < p_min:
-            # 区间倒置：忽略上限，只保留下限，避免封顶反而把目标压到下限以下。
-            p_max = 0.0
+            # 区间倒置：交换为合法区间，保留随机补足（配置写反不退化）。
+            p_min, p_max = p_max, p_min
 
     ratio = (float(target) - prev) / prev
     abs_ratio = abs(ratio)
@@ -505,6 +507,49 @@ def _volatility_daily_change_warnings(
             f"上半区）。执行：不中断；预期结果：每天目标基本贴着 ±{dc_max:.2%} 走，"
             f"target_volatility 的幅度信息被丢弃、只剩方向。"
             f"建议 target_volatility_min ≤ max_daily_change/2 或调高 max_daily_change。"
+        )
+
+    return warnings
+
+
+def _band_order_warnings(
+    min_daily_change: float,
+    max_daily_change: float,
+    target_volatility_min: float,
+    target_volatility: float,
+) -> list[str]:
+    """校验「最小值 > 最大值」的配置倒置，防止区间无效或抽样退化。
+
+    - ``min_daily_change > max_daily_change``（两者都 > 0）：随机补足区间
+      ``[min, max]`` 倒置，直接抽样会抽到区间之外或抽不出合理值；运行时按
+      **较小值为下限、较大值为上限** 交换后执行（等价于把写反的两个值纠正
+      过来），仍保留随机性。
+    - ``target_volatility_min > target_volatility``（两者都 > 0）：目标抖动
+      下限大于上限，``_jitter_bounds`` 会把下限夹到上限（抖动幅度恒为上限）；
+      运行时按夹取后的固定上限执行。
+
+    只提示、不中断执行；任一参数为 0（关闭）不检查。
+    """
+    warnings: list[str] = []
+    dc_min = abs(float(min_daily_change or 0))
+    dc_max = abs(float(max_daily_change or 0))
+    tv = abs(float(target_volatility or 0))
+    tv_min = abs(float(target_volatility_min or 0))
+
+    if dc_max > 0 and dc_min > dc_max:
+        warnings.append(
+            f"min_daily_change ({dc_min:.2%}) 大于 max_daily_change "
+            f"({dc_max:.2%})：变化区间倒置，直接抽样会抽不出合理的随机补足值。"
+            f"执行：按 {dc_max:.2%}~{dc_min:.2%} 交换后执行（仍保留随机性）；"
+            f"建议修正配置，确保 min_daily_change ≤ max_daily_change。"
+        )
+
+    if tv > 0 and tv_min > tv:
+        warnings.append(
+            f"target_volatility_min ({tv_min:.2%}) 大于 target_volatility "
+            f"({tv:.2%})：抖动区间倒置，下限会被夹到上限。"
+            f"执行：抖动幅度恒为 {tv:.2%}；"
+            f"建议确保 target_volatility_min ≤ target_volatility。"
         )
 
     return warnings
@@ -1328,6 +1373,14 @@ boost_mode / growth_factor / growth_rate：
         max_daily_change,
         target_volatility,
         target_volatility_min,
+    )
+    daily_change_warnings.extend(
+        _band_order_warnings(
+            min_daily_change,
+            max_daily_change,
+            target_volatility_min,
+            target_volatility,
+        )
     )
     for message in daily_change_warnings:
         logger.warning("%s", message)

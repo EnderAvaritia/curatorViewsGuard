@@ -29,6 +29,7 @@ from .predictor import predict_expected
 from .scheduler import (
     _TZ,
     _apply_min_daily_change,
+    _band_order_warnings,
     _bound_boost,
     _ceiling_boost,
     _clamp_target,
@@ -466,6 +467,13 @@ def forecast_days(
         target_volatility_min,
     ):
         warnings.append({"code": "volatility_daily_change", "message": message})
+    for message in _band_order_warnings(
+        min_daily_change,
+        max_daily_change,
+        target_volatility_min,
+        target_volatility,
+    ):
+        warnings.append({"code": "band_order", "message": message})
     if (target_jitter_high > 0 or gap_jitter_high > 0) and not model_volatility:
         parts: List[str] = []
         if target_jitter_high > 0:

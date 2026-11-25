@@ -355,8 +355,9 @@ min_daily_change: 0.0
 # 与 min_daily_change 组成「日间变化幅度」的随机区间：幅度不足 min 时在
 # [min, max] 内随机取一个幅度补足（避免每天都套同一个固定值），超过 max 时
 # 压到 max，防止单日跳变过大。只在 max > 0 时启用随机补足与封顶。
-# 校验：两者都 > 0 且 max < 2×min（区间过窄，随机值难以拉开）或
-# min > 2×max（区间倒置，抽不出合理随机值）时，run / daemon / forecast 会告警。
+# 校验（只提示不中断）：target_volatility < 2×min（抖动太小、日间变化长期被
+# min 补足）或 target_volatility_min > 2×max（最小抖动太大、持续被压到 max 边界）
+# 时告警；min > max（最小值大于最大值）时交换为 [较小值, 较大值] 后执行并告警。
 # 白话：想给每天的波动幅度封顶就填 max，例如 min=0.02、max=0.05。
 max_daily_change: 0.0
 
