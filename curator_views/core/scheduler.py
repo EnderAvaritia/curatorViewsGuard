@@ -197,12 +197,14 @@ def _jitter_signature(
     target_volatility: float,
     target_volatility_min: float,
     min_daily_change: float = 0.0,
+    max_daily_change: float = 0.0,
 ) -> str:
     """生成当日抖动配置签名：配置未变时同一天复用同一组抖动值。
 
-    ``min_daily_change`` 也计入签名：它会在抖动之后改写今日目标，配置变更后
-    旧定档的目标不再适用，``forecast`` 应重新抽样并重新套用最小变动约束。
-    ``0.0`` 为默认值，保证旧调用方（含测试）不传该参数时签名口径不变。
+    ``min_daily_change`` / ``max_daily_change`` 也计入签名：它们会在抖动之后
+    改写今日目标（或在区间内随机补足），配置变更后旧定档的目标不再适用，
+    ``forecast`` 应重新抽样并重新套用约束。默认 ``0.0`` 保证旧调用方（含测试）
+    不传这两个参数时签名口径不变。
     """
     return json.dumps(
         [
@@ -217,6 +219,7 @@ def _jitter_signature(
             round(float(target_volatility), 6),
             round(float(target_volatility_min), 6),
             round(float(min_daily_change), 6),
+            round(float(max_daily_change), 6),
         ],
         ensure_ascii=False,
         separators=(",", ":"),
@@ -282,6 +285,70 @@ def _resolve_daily_jitters(
     return target_jitter, gap_jitter
 
 
+_DAILY_CHANGE_KEY = "daily_change_fill"
+
+
+def _resolve_daily_change_fill(
+    storage: Storage,
+    today_iso: str,
+    signature: str,
+    low: float,
+    high: float,
+    persist: bool = True,
+) -> float:
+    """取当日「相邻两天变化幅度不足时」的随机补足幅度。
+
+    当 ``max_daily_change > min_daily_change`` 时，幅度不足会从
+    ``[min, max]`` 内随机抽取；为避免同一天重跑 / daemon 多时段把目标改来
+    改去，这里按「日期 + 配置签名」把抽到的幅度持久化在 ``kv_store`` 的
+    ``daily_change_fill`` 键：
+
+    - 同一天复用同一幅度；改动 ``min_daily_change`` / ``max_daily_change``
+      等配置后签名变化，重新抽取；
+    - ``persist=False``（dry_run）只读已有值，没有时临时抽取。
+
+    区间非法（``high <= low``）时返回 ``low``（退化为固定补到下限）。
+    """
+    if low <= 0 or high <= 0:
+        return 0.0
+    if high < low:
+        low, high = high, low
+    if high <= low:
+        return low
+
+    raw = storage.load_state(_DAILY_CHANGE_KEY, default="")
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and payload.get("date") == today_iso
+            and payload.get("signature") == signature
+        ):
+            try:
+                return float(payload["value"])
+            except (KeyError, TypeError, ValueError):
+                pass
+
+    value = random.uniform(low, high)
+    if persist:
+        storage.save_state(
+            _DAILY_CHANGE_KEY,
+            json.dumps(
+                {
+                    "date": today_iso,
+                    "signature": signature,
+                    "value": value,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+    return value
+
+
 def _clamp_target(
     target: float, target_min: float = 0.0, target_max: float = 0.0
 ) -> tuple[float, str]:
@@ -308,45 +375,58 @@ def _apply_min_daily_change(
     target: float,
     prev_target: float,
     min_daily_change: float,
+    max_daily_change: float = 0.0,
     direction_hint: float = 0.0,
     target_min: float = 0.0,
     target_max: float = 0.0,
+    fill_magnitude: Optional[float] = None,
 ) -> tuple[float, bool]:
-    """保证相邻两天目标至少变动 ``min_daily_change``（比例）。
+    """把相邻两天的目标变化幅度约束到 ``[min_daily_change, max_daily_change]``。
 
     背景：中位数 + 封顶趋势预测出的目标可能连续几天几乎相同，浏览曲线会
-    平得像一条直线，反而更像机器行为。本函数给「今日目标相对上一逻辑日目标」
-    的相对变动设一个下限：
+    平得像一条直线，反而更像机器行为；反之单日跳变过大也不自然。本函数把
+    「今日目标相对上一逻辑日目标」的相对变化幅度约束到一个区间：
 
-    - ``ratio = (target - prev_target) / prev_target``；
-    - ``|ratio| >= min_daily_change`` 时原样返回（不干预自然变化）；
-    - 否则沿原变化方向补足到 ``prev_target × (1 ± min_daily_change)``；
-      变化正好为 0 时用 ``direction_hint`` 决定方向（通常传自然趋势），
-      hint 也为 0 时默认向上，避免反复卡在同一水平。
+    - 幅度在 ``[min, max]`` 内：原样返回（不干预自然变化）；
+    - 幅度小于 ``min``：从 ``[min, max]`` 内随机取一个幅度补足（方向沿用原
+      变化方向；变化为 0 时用 ``direction_hint``，再为 0 时向上）。``max``
+      为 0 时退化为固定补到 ``min``（兼容旧行为）；
+    - 幅度大于 ``max``：压到 ``max``，避免曲线单日跳变过大；
+    - ``min`` 为 0 时不做下限补足，只在上限生效时做封顶。
 
     调整结果仍按 ``target_min`` / ``target_max`` 夹取：边界优先，夹取后仍可能
-    小于最小变动（例如撞上下限），此时按边界值执行并视为已应用。
+    不满足区间约束（例如撞上下限），此时按边界值执行并视为已应用。
+    区间倒置（``max < min``）时忽略上限、只保留下限，避免把目标压到下限以下；
+    这种配置由 ``_daily_change_range_warnings`` 给出修正提示。
 
     Args:
         target: 按预测/抖动/边界算出的今日目标。
         prev_target: 上一逻辑日的最终目标；``<= 0`` 时无法比较，直接返回。
-        min_daily_change: 最小相对变动（0~1）。``<= 0`` 表示关闭，直接返回。
+        min_daily_change: 变化幅度的下限（0~1）。与 ``max`` 同为 0 时关闭。
+        max_daily_change: 变化幅度的上限（0~1）；0 表示不设上限。
         direction_hint: 变化为 0 时的方向提示：``>= 0`` 向上，``< 0`` 向下。
         target_min / target_max: 目标上下界（0 表示该方向不设界）。
+        fill_magnitude: 幅度不足时使用的补足幅度；``None`` 时在
+            ``[min, max]`` 内随机抽取（``run`` 会传入按日持久化的值以保证
+            同一天重跑复用同一幅度）。
 
     Returns:
         ``(调整后的目标, 是否发生了调整)``。
     """
     prev = float(prev_target or 0)
-    p = abs(float(min_daily_change or 0))
-    if p <= 0 or prev <= 0:
+    p_min = abs(float(min_daily_change or 0))
+    p_max = abs(float(max_daily_change or 0))
+    if prev <= 0 or (p_min <= 0 and p_max <= 0):
         return float(target), False
-    p = min(p, 1.0)
+    p_min = min(p_min, 1.0)
+    if p_max > 0:
+        p_max = min(p_max, 1.0)
+        if p_max < p_min:
+            # 区间倒置：忽略上限，只保留下限，避免封顶反而把目标压到下限以下。
+            p_max = 0.0
 
     ratio = (float(target) - prev) / prev
-    if abs(ratio) >= p:
-        return float(target), False
-
+    abs_ratio = abs(ratio)
     if ratio > 0:
         direction = 1.0
     elif ratio < 0:
@@ -354,9 +434,55 @@ def _apply_min_daily_change(
     else:
         direction = 1.0 if direction_hint >= 0 else -1.0
 
-    adjusted = max(0.0, prev * (1.0 + direction * p))
-    adjusted, _ = _clamp_target(adjusted, target_min, target_max)
-    return adjusted, abs(adjusted - float(target)) > 1e-9
+    if p_min > 0 and abs_ratio < p_min:
+        if p_max > 0:
+            low, high = p_min, p_max
+            if fill_magnitude is None:
+                magnitude = random.uniform(low, high)
+            else:
+                magnitude = min(max(float(fill_magnitude), low), high)
+        else:
+            magnitude = p_min
+        adjusted = max(0.0, prev * (1.0 + direction * magnitude))
+        adjusted, _ = _clamp_target(adjusted, target_min, target_max)
+        return adjusted, abs(adjusted - float(target)) > 1e-9
+
+    if p_max > 0 and abs_ratio > p_max:
+        adjusted = max(0.0, prev * (1.0 + direction * p_max))
+        adjusted, _ = _clamp_target(adjusted, target_min, target_max)
+        return adjusted, abs(adjusted - float(target)) > 1e-9
+
+    return float(target), False
+
+
+def _daily_change_range_warnings(
+    min_daily_change: float, max_daily_change: float
+) -> list[str]:
+    """校验相邻两天变化区间，返回需要提示的警告文案（无问题时为空）。
+
+    只有 ``min`` 与 ``max`` 都 > 0 时才检查；任一为 0（关闭）不提示。
+
+    - ``min > 2 × max``：区间倒置，抽样范围无效，根本无法抽取合理的随机值；
+    - ``max < 2 × min``：区间过窄，随机值难以在区间内拉开（无法“跳跃”），
+      曲线仍可能显得机械。
+    """
+    p_min = abs(float(min_daily_change or 0))
+    p_max = abs(float(max_daily_change or 0))
+    if p_min <= 0 or p_max <= 0:
+        return []
+    if p_min > 2.0 * p_max:
+        return [
+            f"min_daily_change ({p_min:g}) 大于 2×max_daily_change ({p_max:g})："
+            "变化区间无效（下限已超过上限的两倍），无法抽取合理的随机值；"
+            "请确保 min_daily_change ≤ max_daily_change（建议 max ≥ 2×min）。"
+        ]
+    if p_max < 2.0 * p_min:
+        return [
+            f"max_daily_change ({p_max:g}) 小于 2×min_daily_change ({p_min:g})："
+            "变化区间过窄，随机值难以在区间内拉开，曲线仍可能显得机械；"
+            "建议设置 max_daily_change ≥ 2×min_daily_change。"
+        ]
+    return []
 
 
 def _floor_boost(natural: float, target_min: float) -> int:
@@ -494,11 +620,19 @@ def _format_summary(summary: Dict[str, Any], dry_run: bool) -> str:
             f"（当日配额 {summary.get('boost_quota', 0):,}）"
         )
     if summary.get("min_change_applied"):
+        min_change = summary.get("min_daily_change", 0)
+        max_change = summary.get("max_daily_change", 0) or 0
+        if max_change > 0:
+            change_text = f"{min_change:.2%}~{max_change:.2%}"
+        else:
+            change_text = f"≥{min_change:.2%}"
         lines.append(
-            f"相邻两天最小变动: {summary.get('min_daily_change', 0):.2%}"
+            f"相邻两天变化约束: {change_text}"
             f"（昨日目标 {summary.get('prev_target')} → "
             f"今日目标 {summary['today_expected']:.0f}）"
         )
+    for message in summary.get("min_change_warnings") or []:
+        lines.append(f"注意: {message}")
     lines.extend([
         f"今日预期浏览量: {summary['today_expected']:.0f}",
         f"昨日实际浏览量: {summary['yesterday_actual']}",
@@ -823,6 +957,8 @@ boost_mode / growth_factor / growth_rate：
     target_volatility_min = float(config.get("target_volatility_min", 0) or 0)
     # 相邻两天最小变动（比例）：保证今日目标相对上一逻辑日目标至少变动该值。
     min_daily_change = abs(float(config.get("min_daily_change", 0) or 0))
+    # 相邻两天最大变动（比例）：0 表示不设上限；与 min 组成随机补足区间。
+    max_daily_change = abs(float(config.get("max_daily_change", 0) or 0))
     gap_low, gap_high = _jitter_bounds(volatility, volatility_min)
     target_jitter_low, target_jitter_high = _jitter_bounds(
         target_volatility, target_volatility_min
@@ -1045,6 +1181,7 @@ boost_mode / growth_factor / growth_rate：
         target_volatility,
         target_volatility_min,
         min_daily_change,
+        max_daily_change,
     )
     target_jitter, gap_jitter = _resolve_daily_jitters(
         storage,
@@ -1089,7 +1226,17 @@ boost_mode / growth_factor / growth_rate：
     prev_target = 0.0
     min_change_before = today_expected
     min_change_applied = False
-    if min_daily_change > 0:
+    min_change_fill = 0.0
+    if min_daily_change > 0 or max_daily_change > 0:
+        if max_daily_change > min_daily_change:
+            min_change_fill = _resolve_daily_change_fill(
+                storage,
+                today_iso,
+                jitter_signature,
+                min_daily_change,
+                max_daily_change,
+                persist=not dry_run,
+            )
         yesterday_iso = day_label_from_ts(today_ts - 86400)
         get_plan = getattr(storage, "get_daily_plan", None)
         if callable(get_plan):
@@ -1124,21 +1271,38 @@ boost_mode / growth_factor / growth_rate：
                 today_expected,
                 prev_target,
                 min_daily_change,
+                max_daily_change=max_daily_change,
                 direction_hint=base_expected - prev_target,
                 target_min=target_floor,
                 target_max=target_ceiling,
+                fill_magnitude=min_change_fill,
             )
             if min_change_applied:
                 today_expected = adjusted
                 _, target_bound = _clamp_target(
                     today_expected, target_floor, target_ceiling
                 )
-                logger.info(
-                    "相邻两天最小变动 %.2f%%：昨日目标 %.0f，原今日目标 %.0f"
-                    " → %.0f（避免曲线过平）。",
-                    min_daily_change * 100.0, prev_target,
-                    min_change_before, today_expected,
-                )
+                if max_daily_change > 0:
+                    logger.info(
+                        "相邻两天变化约束 %.2f%%~%.2f%%：昨日目标 %.0f，"
+                        "原今日目标 %.0f → %.0f（避免曲线过平或跳变）。",
+                        min_daily_change * 100.0, max_daily_change * 100.0,
+                        prev_target, min_change_before, today_expected,
+                    )
+                else:
+                    logger.info(
+                        "相邻两天最小变动 %.2f%%：昨日目标 %.0f，原今日目标 %.0f"
+                        " → %.0f（避免曲线过平）。",
+                        min_daily_change * 100.0, prev_target,
+                        min_change_before, today_expected,
+                    )
+
+    # 4.6 变化区间校验：区间过窄或倒置时告警（只提示，不拒绝执行）。
+    min_change_warnings = _daily_change_range_warnings(
+        min_daily_change, max_daily_change
+    )
+    for message in min_change_warnings:
+        logger.warning("%s", message)
 
     # 5. 溢出扣减：只对被标记日产生的溢出量分摊到后续日期。
     #    检测事实以第一轮结果为准（攻击发生与否不随剔除而改变）；
@@ -1417,9 +1581,12 @@ boost_mode / growth_factor / growth_rate：
         "target_jitter": round(target_jitter, 6),
         "gap_jitter": round(gap_jitter, 6),
         "min_daily_change": min_daily_change,
+        "max_daily_change": max_daily_change,
         "prev_target": round(prev_target, 1) if prev_target > 0 else None,
         "target_before_min_change": round(min_change_before, 1),
         "min_change_applied": min_change_applied,
+        "min_change_fill": round(min_change_fill, 6),
+        "min_change_warnings": min_change_warnings,
         "in_cooldown": in_cooldown,
         "cooldown_days": cooldown_days,
         "boost_list_status": list_status,
@@ -1502,6 +1669,8 @@ boost_mode / growth_factor / growth_rate：
         or getattr(booster, "aborted", False)
         or "executor_error" in summary
         or summary["boost_list_status"] in ("missing", "error", "consume_error")
+        # 相邻两天变化区间配置有误（过窄/倒置）→ 升级为 warning
+        or bool(summary.get("min_change_warnings"))
         # 列表耗尽已回退基线，且当日确有缺口 → 提示"已自动切回基线模式"
         or (
             summary["boost_list_status"] == "fallback"

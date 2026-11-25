@@ -7,14 +7,18 @@
 """
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
+
+from curator_views import cli
 
 from curator_views.core.daytime import logical_date
 from curator_views.core.forecast import forecast_days
 from curator_views.core.scheduler import (
     _TZ,
     _apply_min_daily_change,
+    _daily_change_range_warnings,
     _date_to_epoch,
     run_daily,
 )
@@ -89,6 +93,65 @@ class TestApplyMinDailyChange:
         )
         assert adjusted == pytest.approx(0.0)
         assert applied is True
+
+    def test_in_band_untouched(self):
+        adjusted, applied = _apply_min_daily_change(
+            10300, 10000, 0.02, max_daily_change=0.05
+        )
+        assert adjusted == pytest.approx(10300.0)
+        assert applied is False
+
+    def test_above_max_is_capped(self):
+        adjusted, applied = _apply_min_daily_change(
+            11000, 10000, 0.02, max_daily_change=0.05
+        )
+        assert adjusted == pytest.approx(10500.0)
+        assert applied is True
+
+    def test_below_min_uses_provided_fill_in_band(self):
+        adjusted, applied = _apply_min_daily_change(
+            10000, 10000, 0.02, max_daily_change=0.05,
+            direction_hint=1, fill_magnitude=0.035,
+        )
+        assert adjusted == pytest.approx(10350.0)
+        assert applied is True
+
+    def test_below_min_random_fill_stays_in_band(self):
+        for _ in range(50):
+            adjusted, applied = _apply_min_daily_change(
+                10000, 10000, 0.02, max_daily_change=0.05, direction_hint=1
+            )
+            assert 10200.0 <= adjusted <= 10500.0
+            assert applied is True
+
+    def test_inverted_range_falls_back_to_min(self):
+        # max < min：忽略上限、只保留下限（并由检测告警提示修正）
+        adjusted, applied = _apply_min_daily_change(
+            10000, 10000, 0.05, max_daily_change=0.02, direction_hint=1
+        )
+        assert adjusted == pytest.approx(10500.0)
+        assert applied is True
+
+
+class TestDailyChangeRangeWarnings:
+    def test_valid_range_has_no_warning(self):
+        assert _daily_change_range_warnings(0.02, 0.05) == []
+        assert _daily_change_range_warnings(0.02, 0.04) == []
+
+    def test_narrow_range_warns(self):
+        messages = _daily_change_range_warnings(0.02, 0.03)
+        assert len(messages) == 1
+        assert "2×" in messages[0] or "过窄" in messages[0]
+
+    def test_inverted_range_warns(self):
+        messages = _daily_change_range_warnings(0.05, 0.02)
+        assert len(messages) == 1
+        assert "无效" in messages[0]
+
+    def test_disabled_range_has_no_warning(self):
+        assert _daily_change_range_warnings(0, 0.05) == []
+        assert _daily_change_range_warnings(0.02, 0) == []
+        assert _daily_change_range_warnings(0, 0) == []
 
 
 # ── run_daily 集成 ───────────────────────────────────────────────────────
@@ -195,6 +258,7 @@ def _config(**overrides) -> dict:
         "target_volatility": 0.0,
         "target_volatility_min": 0.0,
         "min_daily_change": 0.02,
+        "max_daily_change": 0.0,
         "boost_enabled": False,
         "dry_run": True,
         "boost_list_file": "",
@@ -287,6 +351,50 @@ class TestRunDailyMinChange:
         assert summary["min_change_applied"] is False
         assert summary["prev_target"] is None
 
+    def test_random_fill_stays_within_range(self):
+        storage = FakeStorage(
+            PROGRAM_START,
+            plans={YESTERDAY_ISO: {"date": YESTERDAY_ISO, "target": 10000}},
+        )
+        summary = _run(
+            storage, min_daily_change=0.02, max_daily_change=0.05
+        )
+
+        assert 10200.0 <= summary["today_expected"] <= 10500.0
+        assert summary["today_expected"] == pytest.approx(
+            10000.0 * (1.0 + summary["min_change_fill"]), rel=1e-6
+        )
+        assert summary["min_change_applied"] is True
+        assert summary["max_daily_change"] == pytest.approx(0.05)
+        assert summary["min_change_warnings"] == []
+
+    def test_above_max_is_capped(self):
+        storage = FakeStorage(
+            PROGRAM_START,
+            plans={YESTERDAY_ISO: {"date": YESTERDAY_ISO, "target": 10000}},
+        )
+        summary = _run(
+            storage,
+            baseline_views=11000,
+            min_daily_change=0.02,
+            max_daily_change=0.05,
+        )
+
+        assert summary["today_expected"] == pytest.approx(10500.0)
+        assert summary["min_change_applied"] is True
+
+    def test_invalid_range_warns(self):
+        storage = FakeStorage(
+            PROGRAM_START,
+            plans={YESTERDAY_ISO: {"date": YESTERDAY_ISO, "target": 10000}},
+        )
+        summary = _run(
+            storage, min_daily_change=0.05, max_daily_change=0.02
+        )
+
+        assert summary["min_change_warnings"]
+        assert "无效" in summary["min_change_warnings"][0]
+
 
 # ── forecast 集成 ────────────────────────────────────────────────────────
 
@@ -345,3 +453,35 @@ class TestForecastMinChange:
 
         assert targets == pytest.approx([10000.0, 10000.0, 10000.0])
         assert not any(row["min_change_applied"] for row in result["rows"])
+
+    def test_random_band_keeps_adjacent_change_in_range(self):
+        result = _forecast(min_daily_change=0.02, max_daily_change=0.05)
+        rows = result["rows"]
+
+        assert result["summary"]["max_daily_change"] == pytest.approx(0.05)
+        for prev, cur in zip(rows, rows[1:]):
+            ratio = abs(cur["target"] - prev["target"]) / prev["target"]
+            # 行内 target 保留 1 位小数，允许极小的显示取整误差
+            assert 0.02 - 1e-3 <= ratio <= 0.05 + 1e-3
+
+    def test_invalid_range_adds_warning(self):
+        result = _forecast(min_daily_change=0.05, max_daily_change=0.02)
+        codes = [warning["code"] for warning in result["warnings"]]
+
+        assert "min_change_range" in codes
+
+# ── 配置接线 ─────────────────────────────────────────────────────────────
+
+
+def test_scheduler_config_maps_daily_change_bounds():
+    cfg = cli._with_defaults(
+        {"min_daily_change": 0.02, "max_daily_change": 0.05}
+    )
+    sched = cli._scheduler_config(cfg, True, False, Path("."))
+
+    assert sched["min_daily_change"] == pytest.approx(0.02)
+    assert sched["max_daily_change"] == pytest.approx(0.05)
+
+
+def test_default_template_includes_max_daily_change():
+    assert cli.DEFAULT_CONFIG_VALUES["max_daily_change"] == 0.0

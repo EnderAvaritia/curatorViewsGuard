@@ -351,6 +351,15 @@ target_volatility_min: 0.0
 # 白话：怕每天的目标几乎一样、曲线太假，就填 0.02（相邻两天至少差 2%）。
 min_daily_change: 0.0
 
+# 相邻两天最大变动（比例，0~1，0 = 不设上限）。
+# 与 min_daily_change 组成「日间变化幅度」的随机区间：幅度不足 min 时在
+# [min, max] 内随机取一个幅度补足（避免每天都套同一个固定值），超过 max 时
+# 压到 max，防止单日跳变过大。只在 max > 0 时启用随机补足与封顶。
+# 校验：两者都 > 0 且 max < 2×min（区间过窄，随机值难以拉开）或
+# min > 2×max（区间倒置，抽不出合理随机值）时，run / daemon / forecast 会告警。
+# 白话：想给每天的波动幅度封顶就填 max，例如 min=0.02、max=0.05。
+max_daily_change: 0.0
+
 # ── 每日刷量列表（可选）──────────────────────────────────────────────────
 
 # 刷量列表文件路径（相对本文件所在目录），留空表示不使用列表模式。
@@ -656,6 +665,7 @@ def _scheduler_config(
         "target_volatility": float(cfg["target_volatility"] or 0),
         "target_volatility_min": float(cfg["target_volatility_min"] or 0),
         "min_daily_change": float(cfg["min_daily_change"] or 0),
+        "max_daily_change": float(cfg["max_daily_change"] or 0),
         "boost_n": int(cfg["boost_n"]),
         "single_cap": int(cfg["single_cap"]),
         "batch_size": int(cfg["batch_size"]),
@@ -1897,10 +1907,15 @@ def _print_forecast_report(
                 "上限=自然流量+刷量）"
             )
     min_change = float(config.get("min_daily_change", 0) or 0)
-    if min_change > 0:
+    max_change = float(config.get("max_daily_change", 0) or 0)
+    if min_change > 0 or max_change > 0:
+        if max_change > 0:
+            change_text = f"{min_change:.0%}~{max_change:.0%}（区间内随机补足/封顶）"
+        else:
+            change_text = f"≥{min_change:.0%}（不足时补足）"
         print(
-            f"相邻两天最小变动: ≥{min_change:.0%}"
-            "（今日目标相对上一逻辑日目标至少变动该比例；仍受上下界夹取）"
+            f"相邻两天变化约束: {change_text}"
+            "（今日目标相对上一逻辑日目标；仍受上下界夹取）"
         )
     print(
         f"单日容量: {capacity:,} 次"

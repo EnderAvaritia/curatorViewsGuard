@@ -32,6 +32,7 @@ from .scheduler import (
     _bound_boost,
     _ceiling_boost,
     _clamp_target,
+    _daily_change_range_warnings,
     _daily_throughput_capacity,
     _effective_threads,
     _floor_boost,
@@ -102,6 +103,9 @@ def forecast_days(
           ``run_daily`` 一致；不纳入波动率时目标抖动为 0；
         - ``target_low`` / ``target_high``：目标抖动区间预览
           （未抖动目标 × (1 ± ``target_volatility``) 后再夹取）；
+        - ``min_daily_change`` / ``max_daily_change``：再把目标相对上一逻辑日
+          的变化幅度约束到 ``[min, max]``（不足 min 时在该区间内随机补足，
+          超过 max 时封顶）；区间过窄/倒置会追加 ``min_change_range`` 警告；
         - ``assumed_natural``：``first_natural`` 非 None 时恒取该值，否则按
           ``natural_mode`` 推算；
         - ``gross_need = max(0, round(target - assumed_natural))``，
@@ -152,6 +156,8 @@ def forecast_days(
     volatility_min = float(config.get("volatility_min", 0) or 0)
     # 相邻两天最小变动（比例）：与 run_daily 同一口径，逐行套用到目标上。
     min_daily_change = abs(float(config.get("min_daily_change", 0) or 0))
+    # 相邻两天最大变动（比例）：0 表示不设上限；与 min 组成随机补足区间。
+    max_daily_change = abs(float(config.get("max_daily_change", 0) or 0))
     target_jitter_low, target_jitter_high = _jitter_bounds(
         target_volatility, target_volatility_min
     )
@@ -208,6 +214,7 @@ def forecast_days(
         target_volatility,
         target_volatility_min,
         min_daily_change,
+        max_daily_change,
     )
     first_date_iso = _iso_date(int(start_ts))
     plan = first_day_plan if isinstance(first_day_plan, dict) else None
@@ -271,7 +278,7 @@ def forecast_days(
         # 相邻两天最小变动：首日参照上一逻辑日目标（prev_target），之后参照
         # 上一行最终目标。首日复用定档时不再重复套用（run 写入的 target 已含）。
         min_change_applied = False
-        if not use_plan and min_daily_change > 0:
+        if not use_plan and (min_daily_change > 0 or max_daily_change > 0):
             reference_target = (
                 float(prev_target or 0.0) if index == 0
                 else float(previous_target)
@@ -281,6 +288,7 @@ def forecast_days(
                     target,
                     reference_target,
                     min_daily_change,
+                    max_daily_change=max_daily_change,
                     direction_hint=base - reference_target,
                     target_min=target_floor,
                     target_max=target_ceiling,
@@ -450,6 +458,10 @@ def forecast_days(
     )
     if plan_warning is not None:
         warnings.append(plan_warning)
+    for message in _daily_change_range_warnings(
+        min_daily_change, max_daily_change
+    ):
+        warnings.append({"code": "min_change_range", "message": message})
     if (target_jitter_high > 0 or gap_jitter_high > 0) and not model_volatility:
         parts: List[str] = []
         if target_jitter_high > 0:
@@ -506,6 +518,7 @@ def forecast_days(
     summary["target_volatility"] = target_volatility
     summary["volatility"] = volatility
     summary["min_daily_change"] = min_daily_change
+    summary["max_daily_change"] = max_daily_change
     summary["volatility_modeled"] = bool(model_volatility)
     summary["bound_hits"] = dict(bound_counts)
     # 边界对应的可刷量：仅在调用方给出 first_natural（今日视角）时计算，

@@ -149,6 +149,9 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
               相邻两天最小变动：若 |今日目标 − 昨日目标| / 昨日目标 < min_daily_change，
                         沿原变化方向补到 昨日目标 × (1 ± min_daily_change)，
                         变化为 0 时沿自然趋势方向，再按上下界夹取  # 0 时关闭
+              相邻两天最大变动（max_daily_change > 0 时）：
+                        不足 min 时在 [min_daily_change, max_daily_change] 内随机补足，
+                        超过 max 时压到 max；区间过窄/倒置会告警
 
 昨日自然流量 = max(0, 昨日实际 − 昨日刷量)
 
@@ -284,13 +287,21 @@ CuratorViewsGuard 是一个运行在本地的 Python 命令行工具，用于维
 缺口抖动 = ±uniform(volatility_min, volatility)
 ```
 
-**相邻两天最小变动（`min_daily_change`）** 是另一条独立的**确定性**约束，不是随机
-抖动：它保证「今日目标」相对「上一逻辑日目标」至少变动该比例，避免预测出的目标
-连续几天几乎不变、曲线平得像一条直线。变化不足时沿原方向补足（涨就补涨、跌就
-补跌），变化正好为 0 时沿自然趋势方向（趋势也为 0 则向上）；调整后仍受
-`target_min` / `target_max` 夹取，因此撞边界时实际变化可能小于该比例。参照优先
-取 `daily_plan` 中上一逻辑日的最终目标（含抖动），没有定档时用历史重算。它与
-`volatility` / `target_volatility` 可叠加：后两者是随机抖动，本项是确定性的下限。
+**相邻两天变化约束（`min_daily_change` / `max_daily_change`）** 是另一组独立的
+约束：它把「今日目标」相对「上一逻辑日目标」的变化幅度限制在
+`[min, max]` 区间内，避免预测出的目标连续几天几乎不变（曲线太平）或单日跳变
+过大。幅度不足 `min` 时，在 `[min, max]` 内**随机**取一个幅度补足（而不是每天
+都套同一个固定值；方向沿用原变化，变化为 0 时沿自然趋势方向），幅度超过 `max`
+时压到 `max`。`max` 为 `0` 表示不设上限（退化为固定补到 `min`）。调整后仍受
+`target_min` / `target_max` 夹取，因此撞边界时实际变化可能超出或不足该区间。
+参照优先取 `daily_plan` 中上一逻辑日的最终目标（含抖动），没有定档时用历史重算。
+
+为让随机补足真正有效，系统会校验区间：`min` 与 `max` 都 > 0 时，
+`max < 2 × min` 视为**区间过窄**（随机值难以拉开，曲线仍可能机械），
+`min > 2 × max` 视为**区间倒置**（根本抽不出合理的随机值）。两种情况都会在
+`run` / `daemon` 日志与每日简报、以及 `forecast` 的提示里给出警告（不拒绝执行）。
+它与 `volatility` / `target_volatility` 可叠加：后两者是逐日随机抖动，本项约束
+的是相邻两天之间的净变化幅度。
 
 **行为细节：**
 
@@ -761,7 +772,8 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
 | `volatility_min` | `0` | 缺口抖动的最小幅度，防止抽到接近 0 导致曲线过平；`0` 不设下限 |
 | `target_volatility` | `0` | 目标随机抖动幅度：目标 × (1 ± 波动率) 后再夹上下界；`0` 关闭 |
 | `target_volatility_min` | `0` | 目标抖动的最小幅度；`0` 不设下限 |
-| `min_daily_change` | `0` | 相邻两天目标的最小相对变动（0~1）；变化不足时沿原方向补足，`0` 关闭 |
+| `min_daily_change` | `0` | 相邻两天目标的最小相对变动（0~1）；变化不足时补足，`0` 关闭 |
+| `max_daily_change` | `0` | 相邻两天目标的最大相对变动（0~1）；超过时封顶，`0` 不设上限 |
 
 **说明：**
 
@@ -811,13 +823,17 @@ store 的 `/login/settoken`；失败时回退 `POST /jwt/ajaxrefresh` 再 settok
   `[min, max]` 内均匀取值、方向随机，避免曲线过于平缓。两者都没有硬性上限，
   但会按 `1 + target_volatility + volatility` 放大反作弊检测参照。详见
   [3.6](#36-波动率让曲线不那么机械)。
-- `min_daily_change` 作用于**今日目标**：保证它与上一逻辑日目标至少相差该比例，
-  防止连续多天目标几乎不变、曲线过于平直。参照优先取 `daily_plan` 里昨日
-  定档的最终目标，没有定档时用历史重算；变化不足时沿原方向补足（变化为 0 时
-  沿自然趋势方向），调整后仍按 `target_min` / `target_max` 夹取，因此撞边界时
-  实际变化可能小于该值。它与 `volatility` / `target_volatility` 不冲突：后者是
-  随机抖动，本项是确定性的日间变动下限。`run` / `daemon` 与 `forecast` 使用同一
-  口径；`min_daily_change` 已计入波动配置签名，改动后会丢弃旧定档并重新计算。
+- `min_daily_change` / `max_daily_change` 约束**今日目标相对上一逻辑日目标的变化
+  幅度**：幅度不足 `min` 时在 `[min, max]` 内随机补足（避免连续多天目标几乎
+  不变、曲线过于平直），超过 `max` 时压到 `max`（避免单日跳变过大）。参照优先
+  取 `daily_plan` 里昨日定档的最终目标，没有定档时用历史重算；调整后仍按
+  `target_min` / `target_max` 夹取，因此撞边界时实际变化可能不在区间内。
+  `max` 为 `0` 表示不设上限（退化为固定补到 `min`）。
+- 变化区间校验（仅当两者都 > 0）：`max < 2 × min` 时提示**区间过窄**（随机值
+  难以拉开），`min > 2 × max` 时提示**区间倒置**（抽不出合理随机值）。警告只提示
+  不拒绝执行：`run` / `daemon` 写入日志并把每日简报升级为 warning；`forecast`
+  输出 `min_change_range` 提示。`min_daily_change` / `max_daily_change` 已计入波动
+  配置签名，改动后会丢弃旧定档并重新计算。
 
 ### 7.7 刷量列表
 
@@ -925,6 +941,8 @@ target_volatility: 0.0
 target_volatility_min: 0.0
 # 相邻两天目标最小变动（0=关闭；0.02 表示至少差 2%）
 min_daily_change: 0.0
+# 相邻两天目标最大变动（0=不设上限；与 min 组成随机区间）
+max_daily_change: 0.0
 
 boost_list_file: ""
 boost_list_fallback: true
@@ -1225,6 +1243,7 @@ forecast 输出的是托底目标 `base × 目标系数（multiplier）`；`run`
 | `plan_signature_mismatch` | 数据库里的首日定档是在不同波动率/基线配置下计算的，已丢弃并重新抽样（`run` 当天也会重新抽） |
 | `volatility_not_modeled` | 使用了 `--no-volatility` 且配置了波动率：表格为未抖动基准（`target_low` / `target_high` 仍给出目标区间） |
 | `target_bound_hit` | 有日期的刷量缺口被 `target_min` / `target_max` 改变（上限=自然+刷量）；消息列出命中方向与改动前后值（最多 5 天，其余省略） |
+| `min_change_range` | 相邻两天变化区间过窄（`max < 2×min`）或倒置（`min > 2×max`），随机补足难以生效或无法抽取，建议修正 `min_daily_change` / `max_daily_change` |
 
 ### 8.5.1 forecast 折线图（控制台 + HTML）
 
@@ -2127,7 +2146,7 @@ daily_time: "10:00"    # 仅当 daily_times 为空时生效；旧配置无需修
 python -m pytest tests/ -v
 ```
 
-当前测试共 **538** 个，覆盖：
+当前测试共 **554** 个，覆盖：
 
 - 预测边界、趋势封顶、启动期系数；
 - 溢出检测连续段、长期基线、持续斜率；
@@ -2138,8 +2157,9 @@ python -m pytest tests/ -v
   forecast 逐日 `bound_hit` / `target_bound_hit` 与旧定档夹取；
 - 目标波动率、最小波动幅度、同日抖动复用（重跑/多时段/配置变更）、
   缺口配额跨时段续刷、抖动日不被误判为溢出；
-- 相邻两天最小变动：纯函数方向/阈值/零变化/上下界夹取、run_daily 从
-  daily_plan 取昨日目标（无定档时历史重算）、forecast 逐行套用与首日参照；
+- 相邻两天变化约束：纯函数方向/阈值/零变化/上下界夹取、min~max 随机补足与
+  封顶、区间过窄/倒置告警、run_daily 从 daily_plan 取昨日目标（无定档时历史
+  重算）、forecast 逐行套用与首日参照；
 - 每日分界点：`day_boundary` 解析、逻辑日/凌晨归属、run_daily 的昨日基准与
   台账日期、Booster 记账日期、forecast 今天/明天起算、配置与 info 透传；
 - 调度器子进程执行器、时区工具；
